@@ -1450,6 +1450,12 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         .route("/api/tabs", get(api_tabs))
         .route("/api/close", post(api_close))
         .route("/api/activate", post(api_activate))
+        // Live tool: nothing is cacheable (stale tabs/snapshots caused real
+        // confusion — the UI once needed a manual refresh to show new tabs).
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        ))
         .fallback_service(tower_http::services::ServeDir::new(dist_dir()))
         .with_state(state);
 
