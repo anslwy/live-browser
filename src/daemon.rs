@@ -591,8 +591,12 @@ async fn api_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> Json<s
     let sel = target_to_selector(&b.target);
     let (tab_id, page) = tab!(&s, b.tab);
     s.push_log("click", &format!("tab {tab_id} <- {sel}"));
-    // Ensure refs exist (snapshot tags elements). Best-effort.
-    let _ = page.evaluate(SNAPSHOT_JS).await;
+    // Ensure refs exist (snapshot tags elements) — but only for numeric refs.
+    // Raw `css=` selectors don't need DOM re-tagging; skipping the full
+    // SNAPSHOT_JS scan here saves a costly layout-forcing evaluate.
+    if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
+        let _ = page.evaluate(SNAPSHOT_JS).await;
+    }
     match page.find_element(&sel).await {
         Ok(el) => {
             // Report the click point for the UI's fake cursor.
@@ -609,7 +613,10 @@ async fn api_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> Json<s
             }
             match el.click().await {
                 Ok(_) => {
-                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    // Brief settle so SPAs commit DOM updates; the caller
+                    // (UI poll / next snapshot) observes the rest. Kept short
+                    // on purpose — this sleep is on the latency hot path.
+                    tokio::time::sleep(Duration::from_millis(150)).await;
                     ok(&format!("clicked {sel}"))
                 }
                 Err(e) => err(format!("click failed: {e:#}")),
@@ -633,7 +640,9 @@ async fn api_type(State(s): State<AppState>, Json(b): Json<TypeReq>) -> Json<ser
     let sel = target_to_selector(&b.target);
     let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("type", &format!("{sel} <- {:?}", b.text));
-    let _ = page.evaluate(SNAPSHOT_JS).await;
+    if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
+        let _ = page.evaluate(SNAPSHOT_JS).await;
+    }
     let el = match page.find_element(&sel).await {
         Ok(el) => el,
         Err(e) => return err(format!("element not found for `{sel}`: {e:#}")),
@@ -677,7 +686,7 @@ async fn api_type(State(s): State<AppState>, Json(b): Json<TypeReq>) -> Json<ser
         if let Err(e) = el.press_key("Enter").await {
             return err(format!("submit (Enter) failed: {e:#}"));
         }
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
     ok(&format!("typed into {sel}"))
 }
@@ -695,7 +704,7 @@ async fn api_press(State(s): State<AppState>, Json(b): Json<PressReq>) -> Json<s
     match page.find_element("body").await {
         Ok(el) => match el.press_key(b.key.as_str()).await {
             Ok(_) => {
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                tokio::time::sleep(Duration::from_millis(80)).await;
                 ok(&format!("pressed {}", b.key))
             }
             Err(e) => err(format!("press failed: {e:#}")),
@@ -764,7 +773,7 @@ async fn api_nav(State(s): State<AppState>, Json(b): Json<NavReq>) -> Json<serde
         other => return err(format!("unknown nav action: {other}")),
     };
     let _ = page.evaluate(js).await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
     let zoom = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.zoom).unwrap_or(1.0);
     apply_zoom(&page, zoom).await;
     ok(&format!("navigated {}", b.action))
@@ -792,7 +801,7 @@ async fn api_click_at(State(s): State<AppState>, Json(b): Json<ClickAtReq>) -> J
     let point = chromiumoxide::layout::Point::new(b.x, b.y);
     match page.click(point).await {
         Ok(_) => {
-            tokio::time::sleep(Duration::from_millis(700)).await;
+            tokio::time::sleep(Duration::from_millis(120)).await;
             ok("clicked")
         }
         Err(e) => err(format!("click failed: {e:#}")),
@@ -818,7 +827,7 @@ async fn api_scroll(State(s): State<AppState>, Json(b): Json<ScrollReq>) -> Json
     let js = format!("window.scrollBy({}, {})", b.dx, b.dy);
     match page.evaluate(js.as_str()).await {
         Ok(_) => {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
             ok("scrolled")
         }
         Err(e) => err(format!("scroll failed: {e:#}")),
@@ -866,7 +875,9 @@ async fn api_select(State(s): State<AppState>, Json(b): Json<SelectReq>) -> Json
     let sel = target_to_selector(&b.target);
     let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("select", &format!("{sel} <- {:?}", b.value));
-    let _ = page.evaluate(SNAPSHOT_JS).await;
+    if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
+        let _ = page.evaluate(SNAPSHOT_JS).await;
+    }
     const SET_JS: &str = r#"((sel, want) => {
       const el = document.querySelector(sel);
       if (!el || el.tagName !== 'SELECT') return { error: 'not a select element' };
@@ -891,7 +902,7 @@ async fn api_select(State(s): State<AppState>, Json(b): Json<SelectReq>) -> Json
                     // Fall back to keyboard-driving the native control.
                     return select_via_keyboard(&page, &sel, &b.value).await;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(120)).await;
                 Json(serde_json::json!({ "ok": true,
                     "message": format!("selected {:?}", v.get("text").and_then(|x| x.as_str()).unwrap_or(&b.value)) }))
             }
@@ -915,7 +926,7 @@ async fn select_via_keyboard(page: &Page, sel: &str, want: &str) -> Json<serde_j
         let _ = el.press_key(c.to_string()).await;
     }
     let _ = el.press_key("Enter").await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
     ok(&format!("selected (via keyboard) {want:?}"))
 }
 
@@ -988,7 +999,7 @@ async fn api_zoom(State(s): State<AppState>, Json(b): Json<ZoomReq>) -> Json<ser
     };
     s.push_log("zoom", &format!("tab {tab_id} -> {zoom}"));
     apply_zoom(&page, zoom).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
     Json(serde_json::json!({ "ok": true, "zoom": zoom, "message": format!("zoom {zoom}") }))
 }
 
@@ -1011,7 +1022,7 @@ async fn api_insert(State(s): State<AppState>, Json(b): Json<InsertReq>) -> Json
     s.push_log("insert", &format!("{} chars", b.text.chars().count()));
     match page.execute(InsertTextParams::new(b.text)).await {
         Ok(_) => {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
             ok("inserted")
         }
         Err(e) => err(format!("insert failed: {e:#}")),
@@ -1045,7 +1056,7 @@ async fn api_type_raw(State(s): State<AppState>, Json(b): Json<TypeRawReq>) -> J
             return err(format!("type-raw failed: {e:#}"));
         }
     }
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
     ok("typed")
 }
 
@@ -1107,7 +1118,7 @@ async fn api_wheel(State(s): State<AppState>, Json(b): Json<WheelReq>) -> Json<s
         .unwrap();
     match page.execute(params).await {
         Ok(_) => {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
             ok("wheeled")
         }
         Err(e) => err(format!("wheel failed: {e:#}")),
@@ -1211,7 +1222,7 @@ async fn api_drag(State(s): State<AppState>, Json(b): Json<DragReq>) -> Json<ser
     match run.await {
         Ok(()) => {
             s.set_cursor(tab_id, b.x2, b.y2, "drag", &b.by).await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(120)).await;
             ok("dragged")
         }
         Err(e) => err(format!("drag failed: {e:#}")),
