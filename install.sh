@@ -132,11 +132,18 @@ install_node() {
 # ----------------------------------------------------------------- release ---
 install_release() {
   msg "fetching latest live-browser release…"
+  # NOTE: fetch the whole body before parsing. Piping curl straight into
+  # `grep -m1` breaks under `set -o pipefail`: grep quits after the first
+  # match, curl gets SIGPIPE writing the rest (exit 23) once the JSON
+  # exceeds the pipe buffer — which it now does with 4 release assets.
   if have curl; then
-    TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+    REL_JSON="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")" \
+      || err "could not reach api.github.com (network? rate limit?)"
   else
-    TAG="$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+    REL_JSON="$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest")" \
+      || err "could not reach api.github.com (network? rate limit?)"
   fi
+  TAG="$(printf '%s' "$REL_JSON" | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
   [[ -n "${TAG:-}" ]] || err "could not determine latest release (network? rate limit?)"
   ASSET="live-browser-${TAG}-${PLATFORM}-${ASSET_ARCH}.tar.gz"
   msg "installing ${ASSET}…"
