@@ -228,9 +228,14 @@ pub struct DaemonArgs {
     /// Chrome executable (defaults to auto-detect)
     #[arg(long, env = "LB_CHROME")]
     pub chrome: Option<String>,
-    /// Run headless (no visible window). Default is headed so a human can take over.
-    #[arg(long)]
+    /// Run headless: no visible browser window (this is the default).
+    /// Kept for explicitness; see --headed for the opposite.
+    #[arg(long, overrides_with = "headed")]
     pub headless: bool,
+    /// Show the browser window so a human can watch and take over.
+    /// Overrides --headless.
+    #[arg(long, visible_alias = "no-headless", overrides_with = "headless")]
+    pub headed: bool,
     /// Persistent profile dir (keeps logins/cookies across restarts)
     #[arg(long, env = "LB_PROFILE")]
     pub profile: Option<String>,
@@ -240,4 +245,15 @@ pub struct DaemonArgs {
     /// URL to open on start
     #[arg(long)]
     pub url: Option<String>,
+    /// Don't auto-open the web UI in the default browser on start
+    #[arg(long)]
+    pub no_open: bool,
+}
+
+impl DaemonArgs {
+    /// Headless unless the user asked for a visible window with --headed.
+    /// (`--headless` is the default and only exists to override `--headed`.)
+    pub fn headless_mode(&self) -> bool {
+        !self.headed || self.headless
+    }
 }

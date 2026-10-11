@@ -84,11 +84,15 @@ cd web && npm install && npm run build   # builds the monitor UI into web/dist
 ## Run
 
 ```sh
-# Headed (default): visible browser window so a human can take over.
+# Headless (default): no visible browser window. The web UI auto-opens
+# in your default browser on start (unless --no-open).
 lb web --port 8765
 
-# Headless (servers, CI — no human takeover possible):
-lb web --port 8765 --headless --no-sandbox
+# Headed: visible browser window so a human can watch and take over.
+lb web --port 8765 --headed
+
+# Containers / servers without a GUI:
+lb web --port 8765 --no-sandbox --no-open
 
 # Stop / restart the server (port flag goes before the subcommand):
 lb web --port 8765 stop
