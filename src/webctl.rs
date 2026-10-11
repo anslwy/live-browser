@@ -60,11 +60,13 @@ fn terminate(pid: u32, force: bool) -> Result<()> {
         if force {
             cmd.arg("-9");
         }
-        let status = cmd
+        // `.output()` (not `.status()`): procps `kill` complains on stderr
+        // for already-exited pids, and that must not leak to our terminal.
+        let out = cmd
             .arg(pid.to_string())
-            .status()
+            .output()
             .context("failed to run `kill`")?;
-        if status.success() {
+        if out.status.success() {
             Ok(())
         } else {
             anyhow::bail!("`kill` reported failure for pid {pid}")
@@ -187,16 +189,107 @@ fn wait_gone(pid: u32, timeout: Duration) -> bool {
     !process_alive(pid)
 }
 
+/// Another recorded daemon (any port) that is currently alive, if any.
+/// Reaping profile browsers is skipped while one exists: it may own them.
+fn other_live_daemon(except_port: u16) -> Option<(u16, u32)> {
+    let base = crate::daemon::cache_base().join("live-browser");
+    let entries = std::fs::read_dir(&base).ok()?;
+    let mut found: Vec<(u16, u32)> = vec![];
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let port: u16 = name
+            .strip_prefix("daemon-")?
+            .strip_suffix(".pid")?
+            .parse()
+            .ok()?;
+        if port == except_port {
+            continue;
+        }
+        let pid: u32 = std::fs::read_to_string(entry.path())
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        if process_alive(pid) {
+            found.push((port, pid));
+        }
+    }
+    found.into_iter().next()
+}
+
+/// True when something accepts TCP connections on 127.0.0.1:`port`
+/// (a daemon that never wrote a pidfile, e.g. an older lb).
+fn port_serves(port: u16) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+/// Pid of the process listening on 127.0.0.1:`port`, if discoverable.
+/// Used only to name the process in messages — never killed blindly.
+fn listener_pid(port: u16) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // `lsof` ships by default on macOS and most Linux distros.
+        let out = Command::new("lsof")
+            .args(["-ti", &format!(":{port}")])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    }
+    #[cfg(windows)]
+    {
+        let out = Command::new("cmd")
+            .args(["/c", "netstat -ano | findstr LISTENING"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains(&format!(":{port}")))
+            .filter_map(|l| l.split_whitespace().last()?.parse().ok())
+            .next()
+    }
+}
+
+/// Reap orphaned profile browsers only when no live daemon could own them.
+fn reap_if_safe(port: u16, profile: &str) -> String {
+    if let Some((other_port, other_pid)) = other_live_daemon(port) {
+        return format!(
+            " (another daemon is running: pid {other_pid} on port {other_port} — left its browser alone)"
+        );
+    }
+    let reaped = reap_profile_browsers(profile);
+    if reaped > 0 {
+        format!("; freed profile by stopping {reaped} leftover browser process(es)")
+    } else {
+        String::new()
+    }
+}
+
 /// Stop the daemon serving `port`. Idempotent: a missing or stale pidfile
-/// is reported, not an error. Also reaps orphaned browser processes still
-/// holding the profile lock (e.g. daemons started before pidfiles existed,
-/// or killed with SIGKILL) so the next start succeeds.
+/// is reported, not an error.
+///
+/// Orphaned browsers (crashes, SIGKILLs, pre-pidfile daemons) holding the
+/// profile lock are reaped — but never while a live daemon could own them.
 pub fn stop(port: u16, profile: Option<&str>) -> Result<String> {
     let profile = resolve_profile(profile);
-    let mut note = String::new();
     match read_pid(port)? {
+        // Case 1: our daemon. Kill it, then clean up its leftovers —
+        // we just ended it, so nothing else can own them.
         Some(pid) if process_alive(pid) => {
             terminate(pid, false)?;
+            let mut note = String::new();
             if !wait_gone(pid, Duration::from_secs(5)) {
                 terminate(pid, true)?;
                 if !wait_gone(pid, Duration::from_secs(3)) {
@@ -211,25 +304,40 @@ pub fn stop(port: u16, profile: Option<&str>) -> Result<String> {
             } else {
                 String::new()
             };
-            return Ok(format!("stopped daemon on port {port} (pid {pid}{note}){extra}"));
+            Ok(format!("stopped daemon on port {port} (pid {pid}{note}){extra}"))
         }
+        // Case 2: stale pidfile — that daemon is dead.
         Some(pid) => {
             remove_pid_file(port);
-            note = format!("daemon for port {port} was not running (stale pid {pid} cleaned up)");
+            let mut msg =
+                format!("daemon for port {port} was not running (stale pid {pid} cleaned up)");
+            if port_serves(port) {
+                msg += &format!(
+                    " — but something still serves :{port} (a daemon without a pidfile?) — left it alone"
+                );
+            } else {
+                msg += &reap_if_safe(port, &profile);
+            }
+            Ok(msg)
         }
+        // Case 3: no pidfile at all.
         None => {
-            note = format!(
-                "no daemon recorded for port {port} (was it started by this lb version?)"
-            );
+            if port_serves(port) {
+                let hint = match listener_pid(port) {
+                    Some(pid) => format!(
+                        " — if that is an old lb daemon, stop it with `kill {pid}`, then retry"
+                    ),
+                    None => String::new(),
+                };
+                Ok(format!(
+                    "something is serving port {port} but left no pid record \
+                     (started by an older lb?) — not touching it{hint}"
+                ))
+            } else {
+                let extra = reap_if_safe(port, &profile);
+                Ok(format!("no daemon recorded for port {port}{extra} — nothing to stop"))
+            }
         }
-    }
-    // No live daemon (or none recorded): still free the profile lock from
-    // orphaned browsers so the next `lb web` starts clean.
-    let reaped = reap_profile_browsers(&profile);
-    if reaped > 0 {
-        Ok(format!("{note}; freed profile by stopping {reaped} leftover browser process(es)"))
-    } else {
-        Ok(format!("{note} — nothing to stop"))
     }
 }
 

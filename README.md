@@ -126,6 +126,7 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb web [--port N] [flags]` | Start the browser + web UI server (old `lb daemon` still works) |
 | `lb web --port N stop` | Stop the running server |
 | `lb web --port N restart` | Stop (if running) and start a new server |
+| `lb update [--force]` | Update to the latest release (reports when already current) |
 | `lb open <URL\|text>` | Navigate the tab (plain text searches Google) |
 | `lb status` | URL, title, handover state |
 | `lb snapshot` | Interactive elements as `[ref] tag "name"` (`--json` for full JSON) |
@@ -179,6 +180,7 @@ src/cli.rs     command definitions
 src/client.rs  thin HTTP client (each command → daemon API)
 src/daemon.rs  Chrome (chromiumoxide/CDP) + Axum API + static UI server
 src/webctl.rs  `lb web stop`/`restart` (pidfile lifecycle)
+src/update.rs  `lb update` + startup update reminder
 web/           Svelte 5 + TS + Vite monitor app (build → web/dist)
 ```
 

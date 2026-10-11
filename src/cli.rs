@@ -202,6 +202,12 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Update lb to the latest release (says so when already current)
+    Update {
+        /// Reinstall the latest release even when already current
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Args, Debug)]

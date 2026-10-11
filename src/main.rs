@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod daemon;
+mod update;
 mod webctl;
 
 use anyhow::Result;
@@ -39,6 +40,7 @@ async fn main() -> Result<()> {
         Commands::Web(w) => match w.action {
             None => {
                 webctl::ensure_not_running(w.daemon.port)?;
+                update::spawn_update_reminder();
                 daemon::run_daemon(w.daemon, passcode).await
             }
             Some(WebAction::Stop) => {
@@ -51,9 +53,11 @@ async fn main() -> Result<()> {
                     Err(e) => println!("stop skipped: {e:#}"),
                 }
                 webctl::ensure_not_running(w.daemon.port)?;
+                update::spawn_update_reminder();
                 daemon::run_daemon(w.daemon, passcode).await
             }
         },
+        Commands::Update { force } => update::update(force).await,
         Commands::Open { url, json } => client::open(&server, pass, &url, tab, json).await,
         Commands::Status { json } => client::status(&server, pass, tab, json).await,
         Commands::List { json } => client::list(&server, pass, json).await,
