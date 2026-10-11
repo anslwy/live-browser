@@ -11,6 +11,12 @@ pub struct Cli {
     #[arg(long, global = true, env = "LB_TAB")]
     pub tab: Option<u32>,
 
+    /// Passcode protecting the daemon (API + UI). Same value must be given
+    /// to `lb daemon` (to set it) and to every other command (to use it).
+    /// Prefer LB_PASSCODE env var over the flag (flags leak via `ps`).
+    #[arg(long, global = true, visible_alias = "password", env = "LB_PASSCODE", hide_env_values = true)]
+    pub passcode: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }

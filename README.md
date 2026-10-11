@@ -94,6 +94,19 @@ lb daemon --port 8765 --headless --no-sandbox
 #   --chrome /path/to/chrome   (auto-detects /usr/bin/google-chrome-stable)
 #   --profile DIR              (persistent profile; keeps logins)
 #   --url URL                  (page to open on start)
+#   --passcode CODE             (optional API+UI guard; env LB_PASSCODE)
+```
+
+Optional passcode (like `opencode web` + `OPENCODE_SERVER_PASSWORD`):
+without one the daemon prints `! LB_PASSCODE is not set; server is unsecured.`
+and anyone on the machine can drive the browser.
+
+```sh
+LB_PASSCODE=secret lb daemon --port 8765          # set it (env preferred over --passcode flag, which leaks via `ps`)
+LB_PASSCODE=secret lb status                      # every CLI command needs the same value
+# Web UI asks for the passcode once and remembers it in localStorage.
+# Raw HTTP also works:  curl -H "x-lb-passcode: secret" http://127.0.0.1:8765/api/status
+# (Bearer token, Basic-auth password, or ?passcode=secret are accepted too.)
 ```
 
 Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:8765`.

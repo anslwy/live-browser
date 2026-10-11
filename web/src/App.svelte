@@ -27,9 +27,69 @@
   let keysOn = true;
   let keyChain: Promise<void> = Promise.resolve();
 
+  // Optional daemon passcode (set via `lb daemon --passcode` / LB_PASSCODE).
+  // Persisted locally so a reload doesn't lock the UI out again.
+  let passcode: string =
+    typeof localStorage !== 'undefined' ? localStorage.getItem('lb-passcode') ?? '' : '';
+  let needAuth = false;
+  let authInput = '';
+  let authErr = '';
+
+  function authHeaders(): Record<string, string> {
+    return passcode ? { 'x-lb-passcode': passcode } : {};
+  }
+
+  function shotUrlWithAuth(): string {
+    const q = passcode
+      ? `passcode=${encodeURIComponent(passcode)}&t=${Date.now()}`
+      : `t=${Date.now()}`;
+    return `/api/screenshot?${q}`;
+  }
+
+  async function apiFetch(url: string, opts: RequestInit = {}): Promise<Response> {
+    const headers = { ...(opts.headers as Record<string, string> | undefined), ...authHeaders() };
+    const r = await fetch(url, { ...opts, headers });
+    if (r.status === 401) {
+      needAuth = true;
+      authErr = authErr || 'Wrong or missing passcode.';
+      throw new Error('unauthorized');
+    }
+    return r;
+  }
+
+  async function savePasscode() {
+    passcode = authInput.trim();
+    try {
+      if (passcode) localStorage.setItem('lb-passcode', passcode);
+      else localStorage.removeItem('lb-passcode');
+    } catch {}
+    authInput = '';
+    authErr = '';
+    needAuth = false;
+    // Re-probe: a wrong code flips needAuth back on via apiFetch.
+    try {
+      await refreshAll();
+    } catch {}
+    if (!needAuth) {
+      shotUrl = shotUrlWithAuth();
+      requestShot();
+    }
+  }
+
+  function clearPasscode() {
+    passcode = '';
+    authInput = '';
+    authErr = '';
+    try {
+      localStorage.removeItem('lb-passcode');
+    } catch {}
+    needAuth = false;
+    refreshAll().catch(() => {});
+  }
+
   async function fetchMetrics() {
     try {
-      const r = await fetch('/api/metrics');
+      const r = await apiFetch('/api/metrics');
       const j = await r.json();
       if (j.ok && j.metrics) {
         viewW = j.metrics.w ?? 0;
@@ -61,7 +121,7 @@
   async function clickAtPoint(p: { x: number; y: number }) {
     busy = 'shotclick';
     try {
-      await fetch('/api/click-at', {
+      await apiFetch('/api/click-at', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ x: p.x, y: p.y, by: 'human' })
@@ -98,7 +158,7 @@
     if (Math.hypot(p.x - lastHoverPos.x, p.y - lastHoverPos.y) < 4) return;
     lastHoverSent = now;
     lastHoverPos = p;
-    fetch('/api/hover', {
+    apiFetch('/api/hover', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ x: p.x, y: p.y })
@@ -147,7 +207,7 @@
       // content follows the finger). Mouse drags keep mouse-drag semantics.
       busy = 'shotscroll';
       try {
-        await fetch('/api/wheel', {
+        await apiFetch('/api/wheel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ x: start.x, y: start.y, dx: start.x - p.x, dy: start.y - p.y })
@@ -161,7 +221,7 @@
     }
     busy = 'shotdrag';
     try {
-      await fetch('/api/drag', {
+      await apiFetch('/api/drag', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ x1: start.x, y1: start.y, x2: p.x, y2: p.y, by: 'human' })
@@ -181,7 +241,7 @@
     if (!p) return;
     // deltaMode 1 = lines → px approximation
     const scale = e.deltaMode === 1 ? 16 : 1;
-    fetch('/api/wheel', {
+    apiFetch('/api/wheel', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ x: p.x, y: p.y, dx: e.deltaX * scale, dy: e.deltaY * scale })
@@ -192,7 +252,7 @@
   async function zoomPage(action: 'in' | 'out' | 'reset') {
     busy = 'zoom';
     try {
-      await fetch('/api/zoom', {
+      await apiFetch('/api/zoom', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action })
@@ -208,7 +268,7 @@
   async function elSelect(ref: number, value: string) {
     busy = `select${ref}`;
     try {
-      const r = await fetch('/api/select', {
+      const r = await apiFetch('/api/select', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ target: String(ref), value })
@@ -227,7 +287,7 @@
 
   async function elClick(ref: number) {
     busy = `click${ref}`;
-    await fetch('/api/click', {
+    await apiFetch('/api/click', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ target: String(ref), by: 'human' })
@@ -243,7 +303,7 @@
     busy = `type${ref}`;
     typeErr = '';
     try {
-      const r = await fetch('/api/type', {
+      const r = await apiFetch('/api/type', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ target: String(ref), text: typeText, submit })
@@ -291,7 +351,7 @@
     // Chain to preserve key order; fire-and-forget per keystroke.
     // Every completed keystroke queues a fresh frame so typing feels live.
     keyChain = keyChain
-      .then(() => fetch('/api/key', {
+      .then(() => apiFetch('/api/key', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -322,7 +382,7 @@
 
   async function fetchTabs() {
     try {
-      const r = await fetch('/api/tabs');
+      const r = await apiFetch('/api/tabs');
       const j = await r.json();
       if (j.ok) tabs = j.tabs ?? [];
     } catch {}
@@ -331,7 +391,7 @@
   async function activateTab(id: number) {
     busy = `tab${id}`;
     try {
-      await fetch('/api/activate', {
+      await apiFetch('/api/activate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tab: id })
@@ -345,7 +405,7 @@
   async function closeTab(id: number) {
     busy = `closetab${id}`;
     try {
-      await fetch('/api/close', {
+      await apiFetch('/api/close', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tab: id })
@@ -361,7 +421,7 @@
     try {
       // Always a blank tab (Chrome behavior) — the address bar holds the
       // current URL now, so it can't double as the new-tab source.
-      await fetch('/api/open', {
+      await apiFetch('/api/open', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: 'about:blank' })
@@ -385,23 +445,34 @@
 
   async function fetchStatus() {
     try {
-      const r = await fetch('/api/status');
+      const r = await apiFetch('/api/status');
       status = await r.json();
+      if ((status as unknown as { ok?: boolean }).ok === false) {
+        // Wrong passcode surfaced as JSON (should already be 401-caught).
+        needAuth = true;
+        connected = false;
+        return;
+      }
       connected = true;
+      needAuth = false;
       error = '';
       // Mirror the current URL into the address bar — unless the user is
       // actively typing in it.
       const ae = document.activeElement as HTMLElement | null;
       if (status?.url && ae?.id !== 'addr-bar') openUrl = status.url;
     } catch (e) {
-      connected = false;
-      error = 'daemon unreachable — is `lb daemon` running?';
+      if (needAuth) {
+        connected = false;
+      } else {
+        connected = false;
+        error = 'daemon unreachable — is `lb daemon` running?';
+      }
     }
   }
 
   async function fetchLog() {
     try {
-      const r = await fetch('/api/log');
+      const r = await apiFetch('/api/log');
       const j = await r.json();
       if (j.ok) log = j.entries ?? [];
     } catch {}
@@ -452,7 +523,8 @@
     if (shotLoading || !shotPending) return;
     shotPending = false;
     shotLoading = true;
-    const url = `/api/screenshot?t=${Date.now()}`;
+    // <img> can't set headers, so the passcode travels as a query param.
+    const url = shotUrlWithAuth();
     const pre = new Image();
     pre.onload = () => {
       shotUrl = url;
@@ -490,7 +562,7 @@
     // Navigate the CURRENT tab (Chrome behavior). `lb open` without --tab
     // still opens a new tab — that's the explicit CLI path.
     const activeId = tabs.find((t) => t.active)?.id;
-    await fetch('/api/open', {
+    await apiFetch('/api/open', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: openUrl.trim(), tab: activeId ?? null })
@@ -502,7 +574,7 @@
   async function loadSnapshot() {
     snapLoading = true;
     try {
-      const r = await fetch('/api/snapshot');
+      const r = await apiFetch('/api/snapshot');
       const j = await r.json();
       if (j.ok) {
         snapshot = j.elements ?? [];
@@ -515,7 +587,7 @@
 
   async function nav(action: string) {
     busy = action;
-    await fetch('/api/nav', {
+    await apiFetch('/api/nav', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action })
@@ -526,14 +598,14 @@
 
   async function handoverDone() {
     busy = 'done';
-    await fetch('/api/handover/done', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    await apiFetch('/api/handover/done', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     busy = '';
     await refreshAll();
   }
 
   async function claimControl() {
     busy = 'claim';
-    await fetch('/api/handover/claim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    await apiFetch('/api/handover/claim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     busy = '';
     await refreshAll();
   }
@@ -568,6 +640,22 @@
 </script>
 
 <div class="wrap">
+  {#if needAuth}
+    <div class="card constrain">
+      <strong><Icon name="warn" /> This server needs its passcode</strong>
+      <p class="muted">Started with <span class="mono">--passcode</span> / <span class="mono">LB_PASSCODE</span>. Enter it once — it stays in this browser.</p>
+      <div class="row">
+        <input
+          type="password"
+          placeholder="passcode…"
+          bind:value={authInput}
+          on:keydown={(e) => e.key === 'Enter' && savePasscode()} />
+        <button on:click={savePasscode}>Unlock</button>
+      </div>
+      {#if authErr}<p class="mono" style="color:var(--danger);margin:8px 0 0">{authErr}</p>{/if}
+    </div>
+  {/if}
+
   {#if error}
     <div class="card constrain">{error}</div>
   {/if}
@@ -645,6 +733,9 @@
 
   <div class="card constrain">
     <div class="row" style="justify-content:flex-end">
+      {#if passcode && !needAuth}
+        <button class="ghost" style="padding:2px 8px;font-size:12px" on:click={clearPasscode} title="Forget the saved passcode in this browser">Lock</button>
+      {/if}
       <span class="livepill" title="Streaming screenshots"><span class="livedot"></span>LIVE</span>
     </div>
         <!-- Single persistent <img>: src swaps only after the new frame decodes. -->

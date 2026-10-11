@@ -127,7 +127,8 @@ header .status {
 }
 .banner-head button { flex: none; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-input[type="text"] {
+input[type="text"],
+input[type="password"] {
   flex: 1;
   min-width: 260px;
   background: var(--input-bg);
