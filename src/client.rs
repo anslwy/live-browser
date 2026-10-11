@@ -261,6 +261,7 @@ pub async fn scroll(server: &str, passcode: Option<&str>, dx: f64, dy: f64, tab:
     check_ok(&v, json)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn wheel(
     server: &str,
     passcode: Option<&str>,
