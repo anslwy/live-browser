@@ -330,3 +330,86 @@ details.collapsible[open] summary::before { content: '▾'; }
 details.collapsible summary:hover strong { text-decoration: underline; }
 table.snap { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 4px 6px; text-align: left; }
+
+/* Chrome-style tab strip. */
+.tabstrip {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 6px 4px 0;
+  margin-bottom: 10px;
+  scrollbar-width: thin;
+}
+.tabstrip.constrain {
+  margin-left: auto;
+  margin-right: auto;
+}
+.tabpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 190px;
+  min-width: 0;
+  padding: 7px 8px 7px 12px;
+  background: transparent;
+  color: var(--fg);
+  opacity: 0.72;
+  border: 0;
+  border-radius: 10px 10px 0 0;
+  font-size: 13px;
+  cursor: pointer;
+  flex: none;
+}
+.tabpill:hover { background: var(--ghost-bg); opacity: 1; }
+.tabpill.active {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-bottom-color: transparent;
+  opacity: 1;
+}
+.tabpill .tabtitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tabpill .tabclose {
+  display: none;
+  border-radius: 50%;
+  width: 20px;
+  height: 20px;
+  line-height: 18px;
+  text-align: center;
+  font-size: 14px;
+  flex: none;
+}
+.tabpill:hover .tabclose, .tabpill.active .tabclose { display: inline-block; }
+.tabpill .tabclose:hover { background: var(--input-border); }
+.tabpill.needs-human { box-shadow: inset 0 -2px 0 #f59e0b; }
+.tabpill .tabflag {
+  background: #f59e0b;
+  color: #111;
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 50%;
+  width: 16px;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  flex: none;
+}
+.tabnew {
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  width: 30px;
+  height: 30px;
+  font-size: 18px;
+  line-height: 1;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
+  flex: none;
+  align-self: center;
+}
+.tabnew:hover { background: var(--ghost-bg); opacity: 1; }

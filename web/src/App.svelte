@@ -317,6 +317,69 @@
     img?.addEventListener('wheel', onShotWheel as EventListener, { passive: false });
   }
 
+  type TabInfo = { id: number; active: boolean; title: string; url: string; handover: boolean };
+  let tabs: TabInfo[] = [];
+
+  async function fetchTabs() {
+    try {
+      const r = await fetch('/api/tabs');
+      const j = await r.json();
+      if (j.ok) tabs = j.tabs ?? [];
+    } catch {}
+  }
+
+  async function activateTab(id: number) {
+    busy = `tab${id}`;
+    try {
+      await fetch('/api/activate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tab: id })
+      });
+    } finally {
+      busy = '';
+      await refreshAll();
+    }
+  }
+
+  async function closeTab(id: number) {
+    busy = `closetab${id}`;
+    try {
+      await fetch('/api/close', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tab: id })
+      });
+    } finally {
+      busy = '';
+      await refreshAll();
+    }
+  }
+
+  async function newTab() {
+    busy = 'newtab';
+    try {
+      await fetch('/api/open', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: openUrl.trim() || 'about:blank' })
+      });
+      openUrl = '';
+    } finally {
+      busy = '';
+      await refreshAll();
+    }
+  }
+
+  async function refreshAll() {
+    await fetchStatus();
+    await fetchMetrics();
+    await fetchTabs();
+    requestShot();
+    await loadSnapshot();
+    await fetchLog();
+  }
+
   let timer: ReturnType<typeof setInterval>;
 
   async function fetchStatus() {
@@ -421,10 +484,7 @@
       body: JSON.stringify({ url: openUrl.trim() })
     });
     busy = '';
-    await fetchStatus();
-    await fetchMetrics();
-    requestShot();
-    await loadSnapshot();
+    await refreshAll();
   }
 
   async function loadSnapshot() {
@@ -449,30 +509,28 @@
       body: JSON.stringify({ action })
     });
     busy = '';
-    await fetchStatus();
-    requestShot();
+    await refreshAll();
   }
 
   async function handoverDone() {
     busy = 'done';
     await fetch('/api/handover/done', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     busy = '';
-    await fetchStatus();
-    await fetchLog();
+    await refreshAll();
   }
 
   async function claimControl() {
     busy = 'claim';
     await fetch('/api/handover/claim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     busy = '';
-    await fetchStatus();
-    await fetchLog();
+    await refreshAll();
   }
 
   onMount(() => {
     fetchStatus();
     fetchLog();
     fetchMetrics();
+    fetchTabs();
     loadSnapshot();
     requestShot();
     window.addEventListener('keydown', onKeyDown);
@@ -485,6 +543,7 @@
       measureShot();
       requestShot();
       await fetchLog();
+      await fetchTabs();
     }, 2000);
   });
 
@@ -509,6 +568,31 @@
 
   {#if error}
     <div class="card constrain">{error}</div>
+  {/if}
+
+  {#if tabs.length > 0}
+    <div class="tabstrip constrain" role="tablist" aria-label="Browser tabs">
+      {#each tabs as t}
+        <button
+          role="tab"
+          aria-selected={t.active}
+          class="tabpill"
+          class:active={t.active}
+          class:needs-human={t.handover}
+          title={t.url}
+          on:click={() => !t.active && activateTab(t.id)}>
+          <span class="tabtitle">{t.title || t.url || `Tab ${t.id}`}</span>
+          {#if t.handover}<span class="tabflag" title="Needs human">!</span>{/if}
+          <span
+            class="tabclose"
+            role="button"
+            aria-label="Close tab {t.id}"
+            title="Close tab (agents lose control of it)"
+            on:click|stopPropagation={() => closeTab(t.id)}>×</span>
+        </button>
+      {/each}
+      <button class="tabnew" on:click={newTab} disabled={busy === 'newtab'} title="New tab (uses the address bar, or blank)" aria-label="New tab">+</button>
+    </div>
   {/if}
 
   {#if status?.handover?.active}
