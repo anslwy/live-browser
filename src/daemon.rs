@@ -533,9 +533,42 @@ async fn api_snapshot(
     }
 }
 
+/// Stable, dependency-free 64-bit FNV-1a hash of screenshot bytes.
+/// Used as the ETag / `?have=` value for conditional screenshot requests.
+/// (std's DefaultHasher is not stable across processes; FNV-1a is.)
+fn image_hash(bytes: &[u8]) -> String {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut h = OFFSET;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    format!("{h:016x}")
+}
+
+/// Strip `W/`, quotes and whitespace so `If-None-Match: "abc"` matches `abc`.
+fn normalize_etag_value(s: &str) -> &str {
+    let s = s.trim();
+    let s = s.strip_prefix("W/").unwrap_or(s);
+    s.trim_matches('"').trim()
+}
+
+#[derive(Deserialize)]
+struct ScreenshotQuery {
+    #[serde(default)]
+    tab: Option<u32>,
+    /// Client's last image hash (from `ETag` / `X-Image-Hash`). When it
+    /// matches the freshly captured frame the server replies `304` with no
+    /// body instead of re-sending ~47kB of JPEG.
+    #[serde(default)]
+    have: Option<String>,
+}
+
 async fn api_screenshot(
     State(s): State<AppState>,
-    Query(q): Query<TabQuery>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<ScreenshotQuery>,
 ) -> impl IntoResponse {
     let (_tab_id, page) = match tab_page(&s, q.tab).await {
         Ok(x) => x,
@@ -556,12 +589,39 @@ async fn api_screenshot(
         .build();
     let shot = tokio::time::timeout(Duration::from_secs(10), page.screenshot(params)).await;
     match shot {
-        Ok(Ok(bytes)) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "no-store")],
-            bytes,
-        )
-            .into_response(),
+        Ok(Ok(bytes)) => {
+            let hash = image_hash(&bytes);
+            let etag = format!("\"{hash}\"");
+            // Conditional request? `?have=` (fetch flow) or standard
+            // `If-None-Match` (browser / curl flow).
+            let client_have = q.have.as_deref().map(normalize_etag_value).unwrap_or("");
+            let inm_match = headers
+                .get(axum::http::header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| {
+                    v.split(',')
+                        .any(|tag| normalize_etag_value(tag) == hash || tag.trim() == "*")
+                })
+                .unwrap_or(false);
+            if client_have == hash || inm_match {
+                let mut hm = axum::http::HeaderMap::new();
+                if let Ok(v) = axum::http::HeaderValue::from_str(&etag) {
+                    hm.insert(header::ETAG, v);
+                }
+                hm.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+                return (StatusCode::NOT_MODIFIED, hm, Vec::new()).into_response();
+            }
+            let mut hm = axum::http::HeaderMap::new();
+            hm.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("image/jpeg"));
+            hm.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+            if let Ok(v) = axum::http::HeaderValue::from_str(&etag) {
+                hm.insert(header::ETAG, v);
+            }
+            if let Ok(v) = axum::http::HeaderValue::from_str(&hash) {
+                hm.insert(axum::http::HeaderName::from_static("x-image-hash"), v);
+            }
+            (StatusCode::OK, hm, bytes).into_response()
+        }
         Ok(Err(e)) => (
             StatusCode::BAD_GATEWAY,
             [(header::CONTENT_TYPE, "text/plain"), (header::CACHE_CONTROL, "no-store")],
