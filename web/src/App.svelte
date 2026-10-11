@@ -129,9 +129,11 @@
       });
     } finally {
       busy = '';
-      await fetchStatus();
+      // Screenshot first (starts preloading ASAP), metadata in parallel,
+      // then a second frame once the DOM has settled.
       requestShot();
-      await loadSnapshot();
+      await Promise.all([fetchStatus(), loadSnapshot()]);
+      requestShot();
     }
   }
 
@@ -147,6 +149,7 @@
   let dragIsTouch = false;
   let lastHoverSent = 0;
   let lastHoverPos = { x: -1e9, y: -1e9 };
+  let lastWheelShot = 0;
 
   function maybeHover(e: PointerEvent, img: HTMLImageElement) {
     // Plain mouse motion (no buttons) drives :hover states, tooltips, menus.
@@ -164,7 +167,10 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ x: p.x, y: p.y })
     }).catch(() => {});
-    requestShot();
+    // Deliberately no requestShot() here: hover fires continuously while the
+    // mouse moves, and each screenshot contends on the single CDP session —
+    // a hover frame in flight directly delays the click frame that follows.
+    // The 2s liveness poll picks up :hover visuals shortly.
   }
 
   function onShotPointerDown(e: PointerEvent) {
@@ -215,6 +221,7 @@
         });
       } finally {
         busy = '';
+        requestShot();
         await fetchStatus();
         requestShot();
       }
@@ -229,9 +236,9 @@
       });
     } finally {
       busy = '';
-      await fetchStatus();
       requestShot();
-      await loadSnapshot();
+      await Promise.all([fetchStatus(), loadSnapshot()]);
+      requestShot();
     }
   }
 
@@ -247,7 +254,13 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ x: p.x, y: p.y, dx: e.deltaX * scale, dy: e.deltaY * scale })
     }).catch(() => {});
-    requestShot();
+    // Throttled: wheel fires per tick and screenshots serialize on one CDP
+    // session, so an unthrottled frame per tick queues up behind scrolling.
+    const now = Date.now();
+    if (now - lastWheelShot > 500) {
+      lastWheelShot = now;
+      requestShot();
+    }
   }
 
   async function zoomPage(action: 'in' | 'out' | 'reset') {
@@ -260,9 +273,9 @@
       });
     } finally {
       busy = '';
-      await fetchStatus();
       requestShot();
-      await loadSnapshot();
+      await Promise.all([fetchStatus(), loadSnapshot()]);
+      requestShot();
     }
   }
 
@@ -294,9 +307,9 @@
       body: JSON.stringify({ target: String(ref), by: 'human' })
     });
     busy = '';
-    await fetchStatus();
     requestShot();
-    await loadSnapshot();
+    await Promise.all([fetchStatus(), loadSnapshot()]);
+    requestShot();
   }
 
   async function elType(ref: number, submit: boolean) {
@@ -476,12 +489,10 @@
   }
 
   async function refreshAll() {
-    await fetchStatus();
-    await fetchMetrics();
-    await fetchTabs();
+    // Screenshot preload starts first; metadata fetches run concurrently.
     requestShot();
-    await loadSnapshot();
-    await fetchLog();
+    await Promise.all([fetchStatus(), fetchMetrics(), fetchTabs(), loadSnapshot(), fetchLog()]);
+    requestShot();
   }
 
   let timer: ReturnType<typeof setInterval>;
@@ -686,11 +697,9 @@
     attachShotWheel();
     // Liveness tick — always on. Interactions queue their own frames on top.
     timer = setInterval(async () => {
-      await fetchStatus();
+      await Promise.all([fetchStatus(), fetchLog(), fetchTabs()]);
       measureShot();
       requestShot();
-      await fetchLog();
-      await fetchTabs();
     }, 2000);
   });
 

@@ -6,6 +6,21 @@ fn api(server: &str, path: &str) -> String {
     format!("{}{}", server.trim_end_matches('/'), path)
 }
 
+/// Shared HTTP client (connection reuse / keep-alive within a process).
+/// `reqwest::Client::new()` per request disables pooling and adds TLS/pool
+/// setup overhead to every CLI call — even against localhost.
+fn http() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
 /// `?tab=N` suffix for GET endpoints (empty for the active tab).
 fn tq(tab: Option<u32>) -> String {
     match tab {
@@ -36,8 +51,7 @@ fn unauthorized_value() -> Value {
 }
 
 async fn get(server: &str, passcode: Option<&str>, path: &str) -> Result<Value> {
-    let client = reqwest::Client::new();
-    let res = with_auth(client.get(api(server, path)), passcode)
+    let res = with_auth(http().get(api(server, path)), passcode)
         .send()
         .await
         .context("daemon not reachable — did you run `lb web`?")?;
@@ -49,8 +63,7 @@ async fn get(server: &str, passcode: Option<&str>, path: &str) -> Result<Value> 
 }
 
 async fn post(server: &str, passcode: Option<&str>, path: &str, body: Value) -> Result<Value> {
-    let client = reqwest::Client::new();
-    let res = with_auth(client.post(api(server, path)), passcode)
+    let res = with_auth(http().post(api(server, path)), passcode)
         .json(&body)
         .send()
         .await
@@ -171,8 +184,7 @@ pub async fn snapshot(server: &str, passcode: Option<&str>, tab: Option<u32>, js
 pub async fn shot(server: &str, passcode: Option<&str>, tab: Option<u32>, out: Option<&str>) -> Result<()> {
     let out = out.unwrap_or("screenshot.png");
     let url = api(server, &format!("/api/screenshot{}", tq(tab)));
-    let client = reqwest::Client::new();
-    let res = with_auth(client.get(&url), passcode)
+    let res = with_auth(http().get(&url), passcode)
         .send()
         .await
         .context("daemon not reachable")?;
@@ -427,7 +439,7 @@ pub async fn handover(server: &str, passcode: Option<&str>, message: &str, tab: 
     println!("then click \"Done — return to agent\" in the web UI.");
     println!("Waiting for human... (timeout: {})", if timeout == 0 { "none".into() } else { format!("{timeout}s") });
 
-    let client = reqwest::Client::new();
+    let client = http();
     let start = std::time::Instant::now();
     loop {
         if timeout != 0 && start.elapsed().as_secs() >= timeout {
