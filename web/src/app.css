@@ -1,23 +1,23 @@
 :root, :root[data-theme='dark'] {
   color-scheme: dark;
   font-family: ui-sans-serif, system-ui, sans-serif;
-  --bg: #111418;
-  --fg: #e8eaed;
-  --card: #1c2128;
-  --border: #2d333b;
-  --input-bg: #0d1117;
-  --input-border: #30363d;
-  --link: #8ab4f8;
-  --accent: #16a34a;
-  --accent-fg: white;
-  --ghost-bg: #30363d;
+  --bg: #3d3332;
+  --fg: #ece4e0;
+  --card: #4e4442;
+  --border: #665b58;
+  --input-bg: #4e4442;
+  --input-border: #756866;
+  --link: #7ed491;
+  --accent: #43a86a;
+  --accent-fg: #14201a;
+  --ghost-bg: #5d4f4d;
   --ghost-fg: inherit;
   --danger: #f87171;
-  --banner-warn-bg: #442304;
-  --banner-warn-border: #b45309;
-  --banner-ok-bg: #052e22;
-  --banner-ok-border: #059669;
-  --marker: #8b949e;
+  --banner-warn-bg: #543d1e;
+  --banner-warn-border: #b47a2f;
+  --banner-ok-bg: #1d4033;
+  --banner-ok-border: #2ea87a;
+  --marker: #b3a6a3;
   --shot-bg: #000;
 }
 :root[data-theme='light'] {
