@@ -1,6 +1,6 @@
 [package]
 name = "live-browser"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 description = "A remote browser that humans and agents control together, live"
 license = "MIT"
