@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Live Browser</title>
+    <link rel="icon" type="image/svg+xml" href="./globe.svg" />
+    <script>
+      // Apply saved theme before first paint (no flash). Defaults to dark.
+      try {
+        document.documentElement.dataset.theme = localStorage.getItem('lb-theme') || 'dark';
+      } catch (e) {
+        document.documentElement.dataset.theme = 'dark';
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - name: Build binary
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          OUT="live-browser-${TAG}-linux-x86_64"
+          mkdir -p "pkg/${OUT}/web"
+          cp target/release/lb "pkg/${OUT}/lb"
+          cp -r web/dist "pkg/${OUT}/web/dist"
+          cp README.md install.sh "pkg/${OUT}/"
+          tar -czf "${OUT}.tar.gz" -C pkg "${OUT}"
+          echo "ASSET=${OUT}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true

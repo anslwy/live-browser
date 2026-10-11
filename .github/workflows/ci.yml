@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: ["master", "main"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build web UI
+        run: |
+          cd web
+          npm ci
+          npm run build
