@@ -312,20 +312,25 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
                 Ok(p) => p,
                 Err(e) => return err(format!("new tab failed: {e:#}")),
             };
-            let mut t = s.tabs.lock().await;
-            let id = t.next_id;
-            t.next_id += 1;
-            t.map.insert(
-                id,
-                TabState {
-                    page: page.clone(),
-                    handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
-                    zoom: 1.0,
-                    cursor: CursorState::default(),
-                    last_url: url.clone(),
-                },
-            );
-            t.active = id;
+            // Scope the lock: it must be released before open_navigate,
+            // which locks again (holding it across the call deadlocks).
+            let id = {
+                let mut t = s.tabs.lock().await;
+                let id = t.next_id;
+                t.next_id += 1;
+                t.map.insert(
+                    id,
+                    TabState {
+                        page: page.clone(),
+                        handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
+                        zoom: 1.0,
+                        cursor: CursorState::default(),
+                        last_url: url.clone(),
+                    },
+                );
+                t.active = id;
+                id
+            };
             s.push_log("open/tab", &format!("tab {id} <- {url}"));
             return open_navigate(&s, id, page, &url).await;
         }
@@ -335,11 +340,27 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
 }
 
 /// Shared goto-with-retry used by open (new or existing tab).
+/// Never hangs: every CDP step is bounded so the UI/CLI always get a response.
 async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json<serde_json::Value> {
+    // about:blank needs no navigation at all — just confirm the tab.
+    if url == "about:blank" {
+        with_tab(s, tab_id, |ts| ts.last_url = "about:blank".into()).await;
+        return Json(serde_json::json!({ "ok": true, "tab": tab_id,
+            "message": format!("tab {tab_id}: blank tab ready") }));
+    }
     // The network here can flap (VPN/tailscale), so retry transient failures.
     let mut last_err = String::new();
     for attempt in 1..=3 {
-        let goto = page.goto(url).await;
+        let goto = tokio::time::timeout(Duration::from_secs(25), page.goto(url)).await;
+        let goto = match goto {
+            Ok(r) => r,
+            Err(_) => {
+                last_err = "goto timed out after 25s".into();
+                s.push_log("open/retry", &format!("attempt {attempt}: {last_err}"));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
         // goto may report transient network errors (e.g. ERR_NETWORK_CHANGED)
         // while the navigation still succeeds — verify by current URL.
         tokio::time::sleep(Duration::from_millis(1500)).await;

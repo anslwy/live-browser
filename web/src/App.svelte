@@ -483,10 +483,13 @@
   async function doOpen() {
     if (!openUrl.trim()) return;
     busy = 'open';
+    // Navigate the CURRENT tab (Chrome behavior). `lb open` without --tab
+    // still opens a new tab — that's the explicit CLI path.
+    const activeId = tabs.find((t) => t.active)?.id;
     await fetch('/api/open', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: openUrl.trim() })
+      body: JSON.stringify({ url: openUrl.trim(), tab: activeId ?? null })
     });
     busy = '';
     await refreshAll();
@@ -630,12 +633,12 @@
       <button class="iconplain" on:click={() => nav('back')} title="Back"><Icon name="arrow-left" /></button>
       <button class="iconplain" on:click={() => nav('reload')} title="Reload"><Icon name="reload" /></button>
       <button class="iconplain" on:click={() => nav('forward')} title="Forward"><Icon name="arrow-right" /></button>
-      <input id="addr-bar" class="omnibox" type="text" placeholder="Type a URL or search…" bind:value={openUrl} on:focus={(e) => (e.target as HTMLInputElement).select()} on:keydown={(e) => e.key === 'Enter' && doOpen()} />
       {#if status?.url && !status.url.startsWith('about:') && !status.url.startsWith('chrome-error')}
         <a class="iconplain" href={status.url} target="_blank" rel="noreferrer" title="Open this page in your own browser">
           <Icon name="external" />
         </a>
       {/if}
+      <input id="addr-bar" class="omnibox" type="text" placeholder="Type a URL or search…" bind:value={openUrl} on:focus={(e) => (e.target as HTMLInputElement).select()} on:keydown={(e) => e.key === 'Enter' && doOpen()} />
     </div>
   </div>
 
