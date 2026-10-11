@@ -209,8 +209,13 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Move `new_file` over `target`, tolerating a running binary: rename works
+/// Move `new_file` onto `target`, tolerating a running binary: renames work
 /// over running executables on Unix, and rename-away works on Windows too.
+///
+/// `new_file` and `target` must live on the same filesystem for the fast
+/// path; if the rename fails with EXDEV (e.g. a temp dir on another mount),
+/// fall back to copy+remove — safe here because `target` was already moved
+/// aside, so no running image is ever overwritten in place.
 fn replace_file(new_file: &Path, target: &Path) -> Result<()> {
     // Rename-away first so a half-written target is impossible; the backup
     // is removed afterwards (best-effort: a running Windows binary can't
@@ -221,33 +226,43 @@ fn replace_file(new_file: &Path, target: &Path) -> Result<()> {
         std::fs::rename(target, &backup)
             .with_context(|| format!("cannot move aside {}", target.display()))?;
     }
-    match std::fs::rename(new_file, target) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&backup);
-            Ok(())
-        }
-        Err(e) => {
-            // Roll back so the install is never left without a binary.
-            let _ = std::fs::rename(&backup, target);
-            Err(e).with_context(|| format!("cannot install {}", target.display()))
-        }
+    let moved = std::fs::rename(new_file, target).is_ok()
+        || (std::fs::copy(new_file, target).is_ok() && std::fs::remove_file(new_file).is_ok());
+    if moved {
+        let _ = std::fs::remove_file(&backup);
+        Ok(())
+    } else {
+        // Roll back so the install is never left without a binary.
+        let _ = std::fs::rename(&backup, target);
+        anyhow::bail!("cannot install {}", target.display())
     }
 }
 
 /// Download `tag` and install it over the running install dir.
 async fn install_tag(tag: &str) -> Result<Vec<String>> {
-    let mut log = vec![];
     let asset = asset_name(tag).context(
         "no prebuilt binary for this platform — update with the installer script instead \
          (or build with --from-source / -FromSource)",
     )?;
     let dir = install_dir()?;
-    let work = std::env::temp_dir().join(format!("lb-update-{}", std::process::id()));
+    // Work dir lives *inside* the install dir so every move below stays on
+    // one filesystem (`std::env::temp_dir()` is often a separate mount —
+    // tmpfs /tmp vs. /home — where rename fails with EXDEV).
+    let work = dir.join(format!(".lb-update-{}", std::process::id()));
     if work.exists() {
         std::fs::remove_dir_all(&work).ok();
     }
     std::fs::create_dir_all(&work)?;
-    let archive = work.join(&asset);
+    let result = install_tag_inner(tag, &asset, &dir, &work).await;
+    if result.is_err() {
+        std::fs::remove_dir_all(&work).ok();
+    }
+    result
+}
+
+async fn install_tag_inner(tag: &str, asset: &str, dir: &Path, work: &Path) -> Result<Vec<String>> {
+    let mut log = vec![];
+    let archive = work.join(asset);
     println!("downloading {asset}…");
     download(
         &format!("https://github.com/{REPO}/releases/download/{tag}/{asset}"),
@@ -255,9 +270,9 @@ async fn install_tag(tag: &str) -> Result<Vec<String>> {
     )
     .await?;
     println!("unpacking…");
-    unpack(&archive, &work)?;
+    unpack(&archive, work)?;
     // Archives wrap everything in one top-level `live-browser-<tag>-…/` dir.
-    let inner = std::fs::read_dir(&work)?
+    let inner = std::fs::read_dir(work)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| p.is_dir())
@@ -284,7 +299,7 @@ async fn install_tag(tag: &str) -> Result<Vec<String>> {
             std::fs::copy(inner.join(extra), dir.join(extra)).ok();
         }
     }
-    std::fs::remove_dir_all(&work).ok();
+    std::fs::remove_dir_all(work).ok();
     Ok(log)
 }
 
