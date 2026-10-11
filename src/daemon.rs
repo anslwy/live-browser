@@ -1439,20 +1439,36 @@ fn dist_dir() -> std::path::PathBuf {
         return cwd;
     }
     // Walk up from the executable location (covers target/debug/lb etc.).
+    // The exe path is canonicalized first: on macOS `current_exe()` returns
+    // the *symlink* path (`~/.local/bin/lb`), whose ancestors lead nowhere —
+    // only the resolved location (`~/.local/share/live-browser/lb`) sits
+    // next to `web/dist`. (On Linux /proc/self/exe is already resolved.)
     if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent().map(|p| p.to_path_buf());
-        while let Some(d) = dir {
-            let cand = d.join("web").join("dist");
-            if cand.join("index.html").exists() {
-                return cand;
+        let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+        for start in [resolved, exe] {
+            if let Some(found) = find_dist_from(&start) {
+                return found;
             }
-            if d.join("Cargo.toml").exists() {
-                return d.join("web").join("dist");
-            }
-            dir = d.parent().map(|p| p.to_path_buf());
         }
     }
     cwd
+}
+
+/// Walk up from `exe` looking for `web/dist` (or a crate root, whose
+/// `web/dist` is returned even when not built yet). Split out for testing.
+fn find_dist_from(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = exe.parent().map(|p| p.to_path_buf());
+    while let Some(d) = dir {
+        let cand = d.join("web").join("dist");
+        if cand.join("index.html").exists() {
+            return Some(cand);
+        }
+        if d.join("Cargo.toml").exists() {
+            return Some(d.join("web").join("dist"));
+        }
+        dir = d.parent().map(|p| p.to_path_buf());
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,8 +1657,8 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         cfg = cfg.chrome_executable(detected);
     }
 
-    if args.headless {
-        // default builder is headless already
+    if args.headless_mode() {
+        // Headless is the default (no visible window); --headed opts out.
     } else {
         cfg = cfg.with_head();
     }
@@ -1659,7 +1675,10 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         "--no-default-browser-check",
     ]);
 
-    tracing::info!("launching chrome (profile: {profile}) …");
+    tracing::info!(
+        "launching chrome (profile: {profile}, {}) …",
+        if args.headless_mode() { "headless" } else { "headed" }
+    );
     let (browser, mut handler) = Browser::launch(cfg.build().map_err(|e| anyhow::anyhow!(e))?)
         .await
         .context("failed to launch Chrome — try --chrome /path/to/chrome or --no-sandbox")?;
@@ -1800,6 +1819,9 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     println!("  lb --server http://{addr} snapshot");
     println!("  lb --server http://{addr} handover \"please log in, then click Done in the UI\"");
     println!("  (stop this server with: lb web --port {} stop)", args.port);
+    if !args.no_open {
+        open_in_default_browser(&format!("http://{addr}/"));
+    }
     // Ctrl-C / SIGTERM: shut down the HTTP server, then close the browser
     // (releasing the profile lock) and remove the pidfile, so `lb web stop`
     // / `restart` and the next start find a clean slate. SIGKILL can't be
@@ -1816,6 +1838,38 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     }
     std::fs::remove_file(pid_file(args.port)).ok();
     Ok(())
+}
+
+/// Open `url` in the OS default browser. Best-effort: headless servers,
+/// containers and SSH sessions have no browser to open — that must never
+/// fail the daemon startup.
+fn open_in_default_browser(url: &str) {
+    let attempt = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).status()
+    } else if cfg!(windows) {
+        // `start` is a cmd builtin; the empty title arg keeps quoted URLs working.
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .status()
+    } else if let Ok(browser) = std::env::var("BROWSER") {
+        // Respect $BROWSER when set (common on Linux).
+        let mut parts = browser.split_whitespace();
+        match parts.next() {
+            Some(bin) if !bin.is_empty() => {
+                let mut cmd = std::process::Command::new(bin);
+                cmd.args(parts).arg(url);
+                cmd.status()
+            }
+            _ => std::process::Command::new("xdg-open").arg(url).status(),
+        }
+    } else {
+        std::process::Command::new("xdg-open").arg(url).status()
+    };
+    match attempt {
+        Ok(s) if s.success() => tracing::info!("opened web UI in default browser"),
+        Ok(s) => tracing::warn!("default browser exited with {s} — open the UI manually"),
+        Err(e) => tracing::warn!("could not open a browser ({e:#}) — open the UI manually"),
+    }
 }
 
 /// Fires on Ctrl-C everywhere, and on SIGTERM on Unix (that's what
@@ -1835,5 +1889,39 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the macOS install: the daemon runs via a symlink
+    /// (`~/.local/bin/lb` → `~/.local/share/live-browser/lb`) and
+    /// `current_exe()` there returns the *unresolved* symlink path, whose
+    /// ancestors contain no `web/dist`. Only the canonicalized path does.
+    /// (Unix-only: Windows `current_exe()` already resolves symlinks.)
+    #[test]
+    #[cfg(unix)]
+    fn dist_dir_resolves_symlinked_install() {
+        let root = std::env::temp_dir().join(format!("lb-dist-test-{}", std::process::id()));
+        let home = root.join("share").join("live-browser");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(home.join("web").join("dist")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(home.join("web").join("dist").join("index.html"), "<html>").unwrap();
+        std::fs::write(home.join("lb"), "fake").unwrap();
+        std::os::unix::fs::symlink(home.join("lb"), bin.join("lb")).unwrap();
+
+        // Unresolved symlink path (what macOS `current_exe()` returns):
+        // ancestors (bin/, root/, tmp…) hold no UI.
+        assert_eq!(find_dist_from(&bin.join("lb")), None);
+        // Canonicalized (real) path: UI found next to the binary.
+        let resolved = std::fs::canonicalize(bin.join("lb")).unwrap();
+        assert_eq!(
+            find_dist_from(&resolved),
+            Some(home.join("web").join("dist"))
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
