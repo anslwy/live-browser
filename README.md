@@ -144,10 +144,29 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb handover "msg" [--timeout s]` | Request human takeover, block until Done |
 | `lb claim ["msg"]` | Claim control as human (same as UI "Take control") |
 | `lb handover-done` | End handover (human scripts/tests) |
+| `lb mcp` | MCP server on stdio (below) — same actions as the CLI, for agents |
 | `lb log` | Recent action log |
 
 Targets accept a snapshot ref (`lb click 12`) or a raw CSS selector
 (`lb click css=.login-button`).
+
+## MCP (`lb mcp`)
+
+The same actions as JSON-RPC tools on stdio — for opencode, Claude Code, etc.
+The daemon must be running (`lb web`); `lb mcp` is a stateless bridge to it
+(`handover_request` returns immediately — poll `handover_status` instead of
+blocking like `lb handover` does).
+
+```json
+"mcp": {
+  "live-browser": {
+    "type": "local",
+    "command": ["lb", "mcp"],
+    "environment": { "LB_SERVER": "http://127.0.0.1:8765" },
+    "enabled": true
+  }
+}
+```
 
 ## Web UI (http://127.0.0.1:8765/)
 

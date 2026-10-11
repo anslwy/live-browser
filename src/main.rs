@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod daemon;
+mod mcp;
 mod update;
 mod webctl;
 
@@ -9,18 +10,32 @@ use cli::{Cli, Commands, WebAction};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                // NOTE: the binary crate is named `lb` ([[bin]] in Cargo.toml),
-                // so `live_browser=…` alone would silence every tracing event.
-                .unwrap_or_else(|_| "lb=info,live_browser=info".into()),
-        )
-        .with_target(false)
-        .compact()
-        .init();
-
     let cli = <Cli as clap::Parser>::parse();
+    // MCP speaks JSON-RPC on stdout — logs must go to stderr there,
+    // otherwise the protocol stream gets corrupted.
+    let log_writer_is_stderr = matches!(cli.command, Commands::Mcp);
+    if log_writer_is_stderr {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "lb=info,live_browser=info".into()),
+            )
+            .with_target(false)
+            .compact()
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    // NOTE: the binary crate is named `lb` ([[bin]] in Cargo.toml),
+                    // so `live_browser=…` alone would silence every tracing event.
+                    .unwrap_or_else(|_| "lb=info,live_browser=info".into()),
+            )
+            .with_target(false)
+            .compact()
+            .init();
+    }
     // Server precedence: --server flag > LB_SERVER > SB_SERVER (legacy) > default.
     let server = cli
         .server
@@ -97,5 +112,6 @@ async fn main() -> Result<()> {
         Commands::HandoverDone { json } => client::handover_done(&server, pass, tab, json).await,
         Commands::Claim { message, json } => client::claim(&server, pass, &message, tab, json).await,
         Commands::Log { json } => client::log(&server, pass, json).await,
+        Commands::Mcp => mcp::run(server, passcode, tab).await,
     }
 }

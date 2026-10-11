@@ -202,6 +202,9 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Start an MCP server on stdio (for opencode / Claude Code / etc.).
+    /// Reads LB_SERVER / LB_PASSCODE like every other command.
+    Mcp,
     /// Update lb to the latest release (says so when already current)
     Update {
         /// Reinstall the latest release even when already current
