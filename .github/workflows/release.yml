@@ -9,7 +9,51 @@ permissions:
   contents: write
 
 jobs:
+  # Runs first: creates the release with a PR list since the previous tag,
+  # so the three asset jobs below only ever append files (previously each
+  # job regenerated GitHub's auto-notes, which listed no PRs and tripled
+  # the body).
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes (PRs since previous release)
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PREV="$(git tag --list 'v*' --sort=-v:refname | grep -vx "$TAG" | head -1)"
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}"
+          if [[ -n "$PREV" ]]; then RANGE="$PREV..$TAG"; else RANGE="$TAG"; fi
+          {
+            echo "## What's Changed"
+            echo
+            # One line per commit, oldest first. Squash-merges look like
+            # "Title (#12)" — link the PR number.
+            git log "$RANGE" --reverse --format='%s' \
+              | sed -E "s|\(#([0-9]+)\)|([#\1](${REPO_URL}/pull/\1))|" \
+              | sed 's/^/- /'
+            echo
+            if [[ -n "$PREV" ]]; then
+              echo "**Full Changelog**: ${REPO_URL}/compare/${PREV}...${TAG}"
+            fi
+          } > notes.md
+          cat notes.md
+
+      - name: Create release with notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md
+          fi
+
   linux-x86_64:
+    needs: [notes]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -48,9 +92,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET }}
-          generate_release_notes: true
 
   macos:
+    needs: [notes]
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -115,9 +159,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSETS }}
-          generate_release_notes: true
 
   windows-x86_64:
+    needs: [notes]
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -157,4 +201,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET }}
-          generate_release_notes: true

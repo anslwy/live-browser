@@ -1,9 +1,10 @@
 mod cli;
 mod client;
 mod daemon;
+mod webctl;
 
 use anyhow::Result;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, WebAction};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,7 +36,24 @@ async fn main() -> Result<()> {
     let pass = passcode.as_deref();
 
     match cli.command {
-        Commands::Daemon(args) => daemon::run_daemon(args, passcode).await,
+        Commands::Web(w) => match w.action {
+            None => {
+                webctl::ensure_not_running(w.daemon.port)?;
+                daemon::run_daemon(w.daemon, passcode).await
+            }
+            Some(WebAction::Stop) => {
+                println!("{}", webctl::stop(w.daemon.port, w.daemon.profile.as_deref())?);
+                Ok(())
+            }
+            Some(WebAction::Restart) => {
+                match webctl::stop(w.daemon.port, w.daemon.profile.as_deref()) {
+                    Ok(msg) => println!("{msg}"),
+                    Err(e) => println!("stop skipped: {e:#}"),
+                }
+                webctl::ensure_not_running(w.daemon.port)?;
+                daemon::run_daemon(w.daemon, passcode).await
+            }
+        },
         Commands::Open { url, json } => client::open(&server, pass, &url, tab, json).await,
         Commands::Status { json } => client::status(&server, pass, tab, json).await,
         Commands::List { json } => client::list(&server, pass, json).await,

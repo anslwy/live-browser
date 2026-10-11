@@ -192,7 +192,7 @@ if [[ "$FROM_SOURCE" == "1" ]]; then install_from_source; else install_release; 
 
 msg "done!"
 echo
-echo "  lb daemon --port 8765          # start browser + web UI"
+echo "  lb web --port 8765          # start browser + web UI"
 echo "  lb open https://example.com    # drive it"
 echo
 case ":$PATH:" in

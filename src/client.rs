@@ -40,7 +40,7 @@ async fn get(server: &str, passcode: Option<&str>, path: &str) -> Result<Value> 
     let res = with_auth(client.get(api(server, path)), passcode)
         .send()
         .await
-        .context("daemon not reachable — did you run `lb daemon`?")?;
+        .context("daemon not reachable — did you run `lb web`?")?;
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Ok(unauthorized_value());
     }
@@ -54,7 +54,7 @@ async fn post(server: &str, passcode: Option<&str>, path: &str, body: Value) -> 
         .json(&body)
         .send()
         .await
-        .context("daemon not reachable — did you run `lb daemon`?")?;
+        .context("daemon not reachable — did you run `lb web`?")?;
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Ok(unauthorized_value());
     }

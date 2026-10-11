@@ -144,5 +144,5 @@ Add-ToUserPath $Prefix
 
 Write-Step "done!"
 Write-Host ""
-Write-Host "  lb daemon --port 8765          # start browser + web UI"
+Write-Host "  lb web --port 8765          # start browser + web UI"
 Write-Host "  lb open https://example.com    # drive it"

@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(name = "lb", version, about = "Live Browser — a remote browser that humans and agents control together, live")]
 pub struct Cli {
-    /// Daemon base URL (the `lb daemon` you started)
+    /// Daemon base URL (the `lb web` server you started)
     #[arg(long, global = true, env = "LB_SERVER")]
     pub server: Option<String>,
 
@@ -12,7 +12,7 @@ pub struct Cli {
     pub tab: Option<u32>,
 
     /// Passcode protecting the daemon (API + UI). Same value must be given
-    /// to `lb daemon` (to set it) and to every other command (to use it).
+    /// to `lb web` (to set it) and to every other command (to use it).
     /// Prefer LB_PASSCODE env var over the flag (flags leak via `ps`).
     #[arg(long, global = true, visible_alias = "password", env = "LB_PASSCODE", hide_env_values = true)]
     pub passcode: Option<String>,
@@ -23,8 +23,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Start browser + web UI daemon (run once, keep alive)
-    Daemon(DaemonArgs),
+    /// Start the browser + web UI server (foreground, keep alive).
+    /// With no subcommand this starts the server; see `stop`/`restart`.
+    /// (The old `lb daemon` spelling still works as an alias.)
+    #[command(visible_alias = "daemon")]
+    Web(WebArgs),
 
     /// Open a URL in the running browser
     Open {
@@ -199,6 +202,22 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Args, Debug)]
+pub struct WebArgs {
+    #[command(subcommand)]
+    pub action: Option<WebAction>,
+    #[command(flatten)]
+    pub daemon: DaemonArgs,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WebAction {
+    /// Stop the running server (`--port` selects it: `lb web --port 9000 stop`)
+    Stop,
+    /// Stop the running server (if any) and start a new one in the foreground
+    Restart,
 }
 
 #[derive(Args, Debug)]
