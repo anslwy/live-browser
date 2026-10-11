@@ -40,10 +40,14 @@ fn is_newer(current: &str, latest: &str) -> bool {
 
 /// Release asset stem for this platform (`live-browser-<tag>-<stem>.<ext>`),
 /// or `None` when no prebuilt binary is published for it.
+///
+/// NOTE: Rust reports Apple Silicon as `aarch64` (not `arm64`, which is
+/// Apple's/Node's name) — matching the wrong string silently disables
+/// updates on every modern Mac.
 fn asset_stem() -> Option<(&'static str, &'static str)> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some(("linux-x86_64", "tar.gz")),
-        ("macos", "arm64") => Some(("darwin-arm64", "tar.gz")),
+        ("macos", "aarch64") => Some(("darwin-arm64", "tar.gz")),
         ("macos", "x86_64") => Some(("darwin-x86_64", "tar.gz")),
         ("windows", _) => Some(("windows-x86_64", "zip")),
         _ => None,
@@ -292,6 +296,12 @@ pub async fn update(force: bool) -> Result<()> {
         println!("{}", status_line(&latest));
         return Ok(());
     }
+    // Fail fast on platforms without a prebuilt binary — before stopping
+    // anything, so a doomed update never takes the running daemon down.
+    asset_name(&latest).context(
+        "no prebuilt binary for this platform — update with the installer script instead \
+         (or build with --from-source / -FromSource)",
+    )?;
     if force && !is_newer(CURRENT, &latest) {
         println!("reinstalling {latest} (--force)…");
     } else {
@@ -342,21 +352,34 @@ mod tests {
 
     #[test]
     fn asset_name_matches_release() {
-        let stem = asset_stem();
-        if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-            assert_eq!(stem, Some(("linux-x86_64", "tar.gz")));
-        }
-        if cfg!(target_os = "macos") {
-            assert!(stem.map(|s| s.1) == Some("tar.gz"));
-        }
-        if cfg!(windows) {
-            assert_eq!(stem, Some(("windows-x86_64", "zip")));
-        }
-        if let Some((platform, ext)) = stem {
+        // Exact per-platform mapping — a wrong ARCH string (e.g. `arm64`
+        // instead of Rust's `aarch64`) silently disables updates, so assert
+        // precisely, on every platform CI runs.
+        let expected: Option<(&str, &str)> = if cfg!(target_os = "linux") {
+            if cfg!(target_arch = "x86_64") {
+                Some(("linux-x86_64", "tar.gz"))
+            } else {
+                None
+            }
+        } else if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                Some(("darwin-arm64", "tar.gz"))
+            } else {
+                Some(("darwin-x86_64", "tar.gz"))
+            }
+        } else if cfg!(windows) {
+            Some(("windows-x86_64", "zip"))
+        } else {
+            None
+        };
+        assert_eq!(asset_stem(), expected);
+        if let Some((platform, ext)) = asset_stem() {
             assert_eq!(
                 asset_name("v0.2.5"),
                 Some(format!("live-browser-v0.2.5-{platform}.{ext}"))
             );
+        } else {
+            assert_eq!(asset_name("v0.2.5"), None);
         }
     }
 }
