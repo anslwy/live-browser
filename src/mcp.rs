@@ -674,6 +674,50 @@ impl LbMcp {
         Ok(Self::daemon_result(v))
     }
 
+    #[tool(
+        description = "Shareable web UI link for a tab (/?tabId=N). Opening it focuses that tab in the UI — send it to the human so they land on the right tab."
+    )]
+    async fn tab_link(
+        &self,
+        Parameters(a): Parameters<TabArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let v = self.get_json("/api/tabs").await?;
+        if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+            return Ok(Self::daemon_result(v));
+        }
+        let tabs = v.get("tabs").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        if tabs.is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "error: no tabs — is `lb web` running?",
+            )]));
+        }
+        let wanted = self.tab(a.tab);
+        let id: u64 = match wanted {
+            Some(id) => id as u64,
+            None => tabs
+                .iter()
+                .find(|t| t.get("active").and_then(|x| x.as_bool()).unwrap_or(false))
+                .and_then(|t| t.get("id").and_then(|x| x.as_u64()))
+                .unwrap_or(0),
+        };
+        match tabs.iter().find(|t| t.get("id").and_then(|x| x.as_u64()) == Some(id)) {
+            Some(t) => {
+                let url = format!("{}/?tabId={id}", self.server.trim_end_matches('/'));
+                let mut out = serde_json::json!({ "ok": true, "tab": id, "url": url });
+                if let Some(title) = t.get("title").and_then(|x| x.as_str()) {
+                    out["title"] = serde_json::Value::String(title.to_string());
+                }
+                if let Some(page_url) = t.get("url").and_then(|x| x.as_str()) {
+                    out["page_url"] = serde_json::Value::String(page_url.to_string());
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text(pretty(&out))]))
+            }
+            None => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "error: no such tab: {id} — see list_tabs"
+            ))])),
+        }
+    }
+
     #[tool(description = "Recent daemon action log (last entries).")]
     async fn log(
         &self,
@@ -692,7 +736,8 @@ impl ServerHandler for LbMcp {
                 "Live Browser: drive the shared browser tab. Typical loop: \
                  status -> snapshot -> click/type_text -> snapshot. \
                  Use screenshot when layout/coordinates matter. \
-                 For logins/captchas use handover_request, poll handover_status, then snapshot again.",
+                 For logins/captchas use handover_request, poll handover_status, then snapshot again. \
+                 Use tab_link to get a shareable UI link (/?tabId=N) that opens the UI on a specific tab.",
             )
     }
 }

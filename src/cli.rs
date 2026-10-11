@@ -227,6 +227,14 @@ pub enum WebAction {
     Stop,
     /// Stop the running server (if any) and start a new one in the foreground
     Restart,
+    /// Print a shareable web UI link for a tab (`/?tabId=N`).
+    /// Opening it focuses that tab in the UI.
+    Link {
+        /// Tab id to link to (default: active tab; also honors global --tab / LB_TAB)
+        tab: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]

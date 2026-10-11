@@ -69,6 +69,7 @@
     // Re-probe: a wrong code flips needAuth back on via apiFetch.
     try {
       await refreshAll();
+      await handleTabLinkParam();
     } catch {}
     if (!needAuth) {
       shotUrl = shotUrlWithAuth();
@@ -380,6 +381,48 @@
   type TabInfo = { id: number; active: boolean; title: string; url: string; handover: boolean };
   let tabs: TabInfo[] = [];
 
+  // Deep link: `/?tabId=N` (from `lb web link N`) focuses that tab on load.
+  let tabLinkErr = '';
+  let tabLinkDone = false;
+
+  async function handleTabLinkParam() {
+    if (tabLinkDone) return;
+    let raw: string | null = null;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      raw = params.get('tabId') ?? params.get('tab');
+    } catch {
+      return;
+    }
+    if (raw === null || raw.trim() === '') return;
+    raw = raw.trim();
+    const id = Number(raw);
+    if (!Number.isInteger(id) || id <= 0) {
+      tabLinkErr = `invalid tab id: ${raw} — expected a positive number (e.g. ?tabId=2)`;
+      tabLinkDone = true;
+      return;
+    }
+    try {
+      const r = await apiFetch('/api/activate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tab: id })
+      });
+      const j = await r.json();
+      if (!j.ok) {
+        tabLinkErr = `tab ${id} does not exist — see the tab strip below`;
+      } else {
+        tabLinkErr = '';
+        await refreshAll();
+      }
+    } catch {
+      // Unauthorized flips needAuth — retry after unlock (leave tabLinkDone false).
+      if (needAuth) return;
+      tabLinkErr = `could not switch to tab ${id} — daemon unreachable`;
+    }
+    tabLinkDone = true;
+  }
+
   async function fetchTabs() {
     try {
       const r = await apiFetch('/api/tabs');
@@ -616,6 +659,7 @@
     fetchMetrics();
     fetchTabs();
     loadSnapshot();
+    handleTabLinkParam();
     requestShot();
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
@@ -658,6 +702,10 @@
 
   {#if error}
     <div class="card constrain">{error}</div>
+  {/if}
+
+  {#if tabLinkErr}
+    <div class="card constrain" role="alert"><strong><Icon name="warn" /> {tabLinkErr}</strong></div>
   {/if}
 
   {#if tabs.length > 0}

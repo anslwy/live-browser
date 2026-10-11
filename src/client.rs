@@ -587,3 +587,56 @@ pub async fn use_tab(server: &str, passcode: Option<&str>, tab: u32, json: bool)
     .await?;
     check_ok(&v, json)
 }
+
+pub async fn link(server: &str, passcode: Option<&str>, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = get(server, passcode, "/api/tabs").await?;
+    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        eprintln!(
+            "error: {}",
+            v.get("error").and_then(|x| x.as_str()).unwrap_or("failed to list tabs")
+        );
+        std::process::exit(1);
+    }
+    let empty = vec![];
+    let tabs = v.get("tabs").and_then(|x| x.as_array()).unwrap_or(&empty);
+    if tabs.is_empty() {
+        eprintln!("error: no tabs — is `lb web` running?");
+        std::process::exit(1);
+    }
+    let id = match tab {
+        Some(id) => id as u64,
+        None => tabs
+            .iter()
+            .find(|t| t.get("active").and_then(|x| x.as_bool()).unwrap_or(false))
+            .and_then(|t| t.get("id").and_then(|x| x.as_u64()))
+            .unwrap_or(0),
+    };
+    let found = tabs.iter().find(|t| t.get("id").and_then(|x| x.as_u64()) == Some(id));
+    match found {
+        Some(t) => {
+            let url = format!("{}/?tabId={id}", server.trim_end_matches('/'));
+            if json {
+                let mut out = serde_json::json!({ "ok": true, "tab": id, "url": url });
+                if let Some(title) = t.get("title").and_then(|x| x.as_str()) {
+                    out["title"] = serde_json::Value::String(title.to_string());
+                }
+                if let Some(page_url) = t.get("url").and_then(|x| x.as_str()) {
+                    out["page_url"] = serde_json::Value::String(page_url.to_string());
+                }
+                print_json(&out);
+            } else {
+                println!("{url}");
+            }
+            Ok(())
+        }
+        None => {
+            let msg = format!("no such tab: {id} — see `lb list`");
+            if json {
+                print_json(&serde_json::json!({ "ok": false, "error": msg }));
+            } else {
+                eprintln!("error: {msg}");
+            }
+            std::process::exit(1);
+        }
+    }
+}

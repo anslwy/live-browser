@@ -71,6 +71,24 @@ async fn main() -> Result<()> {
                 update::spawn_update_reminder();
                 daemon::run_daemon(w.daemon, passcode).await
             }
+            Some(WebAction::Link { tab: t, json }) => {
+                // Base URL precedence: explicit --server / LB_SERVER / SB_SERVER
+                // wins; otherwise derive from --port so
+                // `lb web --port 9000 link 2` links to :9000, not the default :8765.
+                let explicit = cli.server.is_some()
+                    || std::env::var("LB_SERVER")
+                        .ok()
+                        .is_some_and(|s| !s.trim().is_empty())
+                    || std::env::var("SB_SERVER")
+                        .ok()
+                        .is_some_and(|s| !s.trim().is_empty());
+                let base = if explicit {
+                    server.clone()
+                } else {
+                    format!("http://127.0.0.1:{}", w.daemon.port)
+                };
+                client::link(&base, pass, t.or(tab), json).await
+            }
         },
         Commands::Update { force } => update::update(force).await,
         Commands::Open { url, json } => client::open(&server, pass, &url, tab, json).await,

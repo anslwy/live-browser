@@ -124,6 +124,7 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb web [--port N] [flags]` | Start the browser + web UI server (old `lb daemon` still works) |
 | `lb web --port N stop` | Stop the running server |
 | `lb web --port N restart` | Stop (if running) and start a new server |
+| `lb web --port N link [tab]` | Print a shareable UI link for a tab (`/?tabId=N`, default: active) |
 | `lb update [--force]` | Update to the latest release (reports when already current) |
 | `lb open <URL\|text>` | Navigate the tab (plain text searches Google) |
 | `lb status` | URL, title, handover state |
@@ -155,7 +156,8 @@ Targets accept a snapshot ref (`lb click 12`) or a raw CSS selector
 The same actions as JSON-RPC tools on stdio — for opencode, Claude Code, etc.
 The daemon must be running (`lb web`); `lb mcp` is a stateless bridge to it
 (`handover_request` returns immediately — poll `handover_status` instead of
-blocking like `lb handover` does).
+blocking like `lb handover` does). `tab_link` returns a shareable UI link
+(`/?tabId=N`) that opens the UI focused on that tab.
 
 ```json
 "mcp": {
@@ -179,6 +181,8 @@ blocking like `lb handover` does).
 - **Handover banner** — appears when the agent runs `lb handover`; human takes over the
   browser window, then clicks **Done — return to agent**
 - **Open / back / reload** controls and **action log**
+- **Deep link** — open `/?tabId=N` (from `lb web link N` / `tab_link`) to focus
+  that tab on load; invalid or missing ids show an error instead of switching.
 
 Dev mode: `cd web && npm run dev` (proxies `/api` to the daemon on :8765).
 
