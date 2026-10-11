@@ -10,7 +10,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "live_browser=info".into()),
+                // NOTE: the binary crate is named `lb` ([[bin]] in Cargo.toml),
+                // so `live_browser=…` alone would silence every tracing event.
+                .unwrap_or_else(|_| "lb=info,live_browser=info".into()),
         )
         .with_target(false)
         .compact()

@@ -1280,13 +1280,28 @@ async fn api_activate(State(s): State<AppState>, Json(b): Json<ActivateReq>) -> 
 // ---------------------------------------------------------------------------
 
 /// Serve the built Svelte app from `web/dist` (sibling of crate root).
-/// Falls back to a minimal placeholder page when the UI hasn't been built yet.
+/// Falls back to a diagnostic placeholder page when the UI isn't found —
+/// it names the directory that was searched so a broken install (stale
+/// binary on PATH, moved install dir) is obvious instead of mysterious.
 async fn ui_index() -> Html<String> {
-    let index = dist_dir().join("index.html");
+    let dir = dist_dir();
+    let index = dir.join("index.html");
     if let Ok(html) = tokio::fs::read_to_string(&index).await {
         return Html(html);
     }
-    Html(PLACEHOLDER_HTML.to_string())
+    Html(format!(
+        r#"<!doctype html><html><body style="font-family:sans-serif;max-width:640px;margin:4rem auto">
+<h1>Live Browser</h1>
+<p>Daemon is running, but the web UI was not found.</p>
+<p>Looked in: <code>{}</code></p>
+<p>If you installed with the installer, it may be a stale <code>lb</code> on your PATH
+(check <code>which -a lb</code> / <code>lb --version</code>) — re-run the installer.
+If you built from source, build the UI first:</p>
+<pre>cd web &amp;&amp; npm install &amp;&amp; npm run build</pre>
+<p>Meanwhile the JSON API works: <a href="/api/status">/api/status</a></p>
+</body></html>"#,
+        dir.display()
+    ))
 }
 
 /// Locate the `web/dist` directory (built Svelte UI), supporting both
@@ -1314,13 +1329,6 @@ fn dist_dir() -> std::path::PathBuf {
     }
     cwd
 }
-
-const PLACEHOLDER_HTML: &str = r#"<!doctype html><html><body style="font-family:sans-serif;max-width:640px;margin:4rem auto">
-<h1>Live Browser</h1>
-<p>Daemon is running, but the Svelte UI hasn't been built yet.</p>
-<pre>cd web && npm install && npm run build</pre>
-<p>Meanwhile the JSON API works: <a href="/api/status">/api/status</a></p>
-</body></html>"#;
 
 // ---------------------------------------------------------------------------
 // Daemon entrypoint
@@ -1568,6 +1576,24 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
 
     let addr = format!("127.0.0.1:{}", args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Say exactly which binary and UI dir are in play: a stale `lb` earlier
+    // on PATH (or a moved install dir) otherwise shows up only as a
+    // mysterious missing UI in the browser.
+    match std::env::current_exe() {
+        Ok(exe) => tracing::info!("binary: {}", exe.display()),
+        Err(e) => tracing::warn!("could not determine binary path: {e:#}"),
+    }
+    let ui_dir = dist_dir();
+    if ui_dir.join("index.html").exists() {
+        tracing::info!("serving web UI from {}", ui_dir.display());
+    } else {
+        tracing::warn!(
+            "web UI not found in {} — the root page will show a diagnostic. \
+             Installed via script? Re-run it (check `which -a lb` for a stale binary). \
+             Built from source? Run `cd web && npm install && npm run build` first.",
+            ui_dir.display()
+        );
+    }
     println!("live-browser daemon ready");
     println!("  UI:  http://{addr}/");
     println!("  API: http://{addr}/api/status");
