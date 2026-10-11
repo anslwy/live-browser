@@ -346,7 +346,9 @@ async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json
         let current = page_url(&page).await;
         if goto.is_ok() || !current.starts_with("chrome-error") {
             // Give the page a moment to keep loading; don't hard-fail on waits.
-            let _ = tokio::time::timeout(Duration::from_secs(10), page.wait_for_navigation()).await;
+            // Non-http(s) targets (about:blank, data:, …) settle instantly.
+            let wait = if url.starts_with("http") { 10 } else { 1 };
+            let _ = tokio::time::timeout(Duration::from_secs(wait), page.wait_for_navigation()).await;
             let landed = page_url(&page).await;
             // Remember the last healthy URL so reload can recover from errors.
             if !landed.starts_with("chrome-error") && !landed.is_empty() {

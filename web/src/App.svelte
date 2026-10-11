@@ -359,12 +359,13 @@
   async function newTab() {
     busy = 'newtab';
     try {
+      // Always a blank tab (Chrome behavior) — the address bar holds the
+      // current URL now, so it can't double as the new-tab source.
       await fetch('/api/open', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: openUrl.trim() || 'about:blank' })
+        body: JSON.stringify({ url: 'about:blank' })
       });
-      openUrl = '';
     } finally {
       busy = '';
       await refreshAll();
@@ -388,6 +389,10 @@
       status = await r.json();
       connected = true;
       error = '';
+      // Mirror the current URL into the address bar — unless the user is
+      // actively typing in it.
+      const ae = document.activeElement as HTMLElement | null;
+      if (status?.url && ae?.id !== 'addr-bar') openUrl = status.url;
     } catch (e) {
       connected = false;
       error = 'daemon unreachable — is `lb daemon` running?';
@@ -579,8 +584,14 @@
           class="tabpill"
           class:active={t.active}
           class:needs-human={t.handover}
-          title={t.url}
-          on:click={() => !t.active && activateTab(t.id)}>
+          title={t.title || t.url}
+          on:click={() => !t.active && activateTab(t.id)}
+          on:mousedown={(e) => {
+            if (e.button === 1) {
+              e.preventDefault();
+              closeTab(t.id);
+            }
+          }}>
           <span class="tabtitle">{t.title || t.url || `Tab ${t.id}`}</span>
           {#if t.handover}<span class="tabflag" title="Needs human">!</span>{/if}
           <span
@@ -588,10 +599,11 @@
             role="button"
             aria-label="Close tab {t.id}"
             title="Close tab (agents lose control of it)"
-            on:click|stopPropagation={() => closeTab(t.id)}>×</span>
+            on:click|stopPropagation={() => closeTab(t.id)}
+            on:mousedown|stopPropagation={() => {}}>×</span>
         </button>
       {/each}
-      <button class="tabnew" on:click={newTab} disabled={busy === 'newtab'} title="New tab (uses the address bar, or blank)" aria-label="New tab">+</button>
+      <button class="tabnew" on:click={newTab} disabled={busy === 'newtab'} title="New blank tab" aria-label="New tab"><Icon name="plus" /></button>
     </div>
   {/if}
 
@@ -618,14 +630,13 @@
       <button class="iconplain" on:click={() => nav('back')} title="Back"><Icon name="arrow-left" /></button>
       <button class="iconplain" on:click={() => nav('reload')} title="Reload"><Icon name="reload" /></button>
       <button class="iconplain" on:click={() => nav('forward')} title="Forward"><Icon name="arrow-right" /></button>
-      <input class="omnibox" type="text" placeholder="Type a URL or search…" bind:value={openUrl} on:keydown={(e) => e.key === 'Enter' && doOpen()} />
+      <input id="addr-bar" class="omnibox" type="text" placeholder="Type a URL or search…" bind:value={openUrl} on:focus={(e) => (e.target as HTMLInputElement).select()} on:keydown={(e) => e.key === 'Enter' && doOpen()} />
+      {#if status?.url && !status.url.startsWith('about:') && !status.url.startsWith('chrome-error')}
+        <a class="iconplain" href={status.url} target="_blank" rel="noreferrer" title="Open this page in your own browser">
+          <Icon name="external" />
+        </a>
+      {/if}
     </div>
-    {#if status}
-      <p class="mono page-meta" style="margin:8px 0 0">
-        <span class="title"><Icon name="doc" /> {status.title || '(no title)'}</span>
-        <a class="url" href={status.url}>{status.url}</a>
-      </p>
-    {/if}
   </div>
 
   <div class="card constrain">

@@ -146,7 +146,7 @@ button.iconbtn .icon {
 }
 /* Chrome-style browser bar: borderless icon buttons + pill omnibox. */
 .browserbar { gap: 2px; }
-.browserbar button.iconplain {
+.browserbar .iconplain {
   background: transparent;
   border: 0;
   border-radius: 50%;
@@ -154,10 +154,14 @@ button.iconbtn .icon {
   line-height: 1;
   color: inherit;
   opacity: 0.85;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
 }
-.browserbar button.iconplain:hover:not(:disabled) { background: var(--ghost-bg); opacity: 1; }
-.browserbar button.iconplain:disabled { opacity: 0.4; }
-.browserbar button.iconplain .icon {
+.browserbar .iconplain:hover:not(:disabled) { background: var(--ghost-bg); opacity: 1; }
+.browserbar .iconplain:disabled { opacity: 0.4; }
+.browserbar .iconplain .icon {
   width: 1.25em;
   height: 1.25em;
   vertical-align: -0.25em;
@@ -334,10 +338,10 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
 /* Chrome-style tab strip. */
 .tabstrip {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 4px;
   overflow-x: auto;
-  padding: 6px 4px 0;
+  padding: 6px 4px;
   margin-bottom: 10px;
   scrollbar-width: thin;
 }
@@ -374,7 +378,7 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
   white-space: nowrap;
 }
 .tabpill .tabclose {
-  display: none;
+  display: inline-block;
   border-radius: 50%;
   width: 20px;
   height: 20px;
@@ -383,7 +387,6 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
   font-size: 14px;
   flex: none;
 }
-.tabpill:hover .tabclose, .tabpill.active .tabclose { display: inline-block; }
 .tabpill .tabclose:hover { background: var(--input-border); }
 .tabpill.needs-human { box-shadow: inset 0 -2px 0 #f59e0b; }
 .tabpill .tabflag {
@@ -402,9 +405,7 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
   background: transparent;
   border: 0;
   border-radius: 50%;
-  width: 30px;
-  height: 30px;
-  font-size: 18px;
+  padding: 8px;
   line-height: 1;
   color: inherit;
   opacity: 0.7;
@@ -412,4 +413,10 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
   flex: none;
   align-self: center;
 }
-.tabnew:hover { background: var(--ghost-bg); opacity: 1; }
+.tabnew:hover:not(:disabled) { background: var(--ghost-bg); opacity: 1; }
+.tabnew:disabled { opacity: 0.4; }
+.tabnew .icon {
+  width: 1.25em;
+  height: 1.25em;
+  vertical-align: -0.25em;
+}
