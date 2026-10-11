@@ -6,6 +6,14 @@ fn api(server: &str, path: &str) -> String {
     format!("{}{}", server.trim_end_matches('/'), path)
 }
 
+/// `?tab=N` suffix for GET endpoints (empty for the active tab).
+fn tq(tab: Option<u32>) -> String {
+    match tab {
+        Some(id) => format!("?tab={id}"),
+        None => String::new(),
+    }
+}
+
 fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap());
 }
@@ -54,20 +62,35 @@ fn check_ok(v: &Value, json: bool) -> Result<()> {
     }
 }
 
-pub async fn open(server: &str, url: &str, json: bool) -> Result<()> {
-    let v = post(server, "/api/open", serde_json::json!({ "url": url })).await?;
+pub async fn open(server: &str, url: &str, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/open",
+        serde_json::json!({ "url": url, "tab": tab }),
+    )
+    .await?;
     check_ok(&v, json)
 }
 
-pub async fn status(server: &str, json: bool) -> Result<()> {
-    let v = get(server, "/api/status").await?;
+pub async fn status(server: &str, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = get(server, &format!("/api/status{}", tq(tab))).await?;
+    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        eprintln!(
+            "error: {}",
+            v.get("error").and_then(|x| x.as_str()).unwrap_or("status failed")
+        );
+        std::process::exit(1);
+    }
     if json {
         print_json(&v);
     } else {
+        let id = v.get("tab").and_then(|x| x.as_u64()).unwrap_or(0);
+        let is_active = v.get("active").and_then(|x| x.as_bool()).unwrap_or(true);
         let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("?");
         let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
         let ho = v.get("handover").cloned().unwrap_or(Value::Null);
         let active = ho.get("active").and_then(|x| x.as_bool()).unwrap_or(false);
+        println!("tab:   {id}{}", if is_active { " (active)" } else { "" });
         println!("url:   {url}");
         println!("title: {title}");
         println!("ui:    {}/", server.trim_end_matches('/'));
@@ -83,8 +106,8 @@ pub async fn status(server: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn snapshot(server: &str, json: bool, full: bool) -> Result<()> {
-    let v = get(server, "/api/snapshot").await?;
+pub async fn snapshot(server: &str, tab: Option<u32>, json: bool, full: bool) -> Result<()> {
+    let v = get(server, &format!("/api/snapshot{}", tq(tab))).await?;
     if json || full {
         print_json(&v);
         return Ok(());
@@ -97,9 +120,10 @@ pub async fn snapshot(server: &str, json: bool, full: bool) -> Result<()> {
         );
         std::process::exit(1);
     }
+    let id = v.get("tab").and_then(|x| x.as_u64()).unwrap_or(0);
     let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("");
     let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
-    println!("# {title} <{url}>");
+    println!("# tab {id}: {title} <{url}>");
     let empty = vec![];
     let els = v.get("elements").and_then(|x| x.as_array()).unwrap_or(&empty);
     if els.is_empty() {
@@ -119,9 +143,9 @@ pub async fn snapshot(server: &str, json: bool, full: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn shot(server: &str, out: Option<&str>) -> Result<()> {
+pub async fn shot(server: &str, tab: Option<u32>, out: Option<&str>) -> Result<()> {
     let out = out.unwrap_or("screenshot.png");
-    let url = api(server, "/api/screenshot");
+    let url = api(server, &format!("/api/screenshot{}", tq(tab)));
     let bytes = reqwest::get(&url)
         .await
         .context("daemon not reachable")?
@@ -140,18 +164,33 @@ pub async fn shot(server: &str, out: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub async fn click(server: &str, target: &str, json: bool) -> Result<()> {
-    let v = post(server, "/api/click", serde_json::json!({ "target": target })).await?;
+pub async fn click(server: &str, target: &str, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/click",
+        serde_json::json!({ "target": target, "tab": tab }),
+    )
+    .await?;
     check_ok(&v, json)
 }
 
-pub async fn click_at(server: &str, x: f64, y: f64, json: bool) -> Result<()> {
-    let v = post(server, "/api/click-at", serde_json::json!({ "x": x, "y": y })).await?;
+pub async fn click_at(server: &str, x: f64, y: f64, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/click-at",
+        serde_json::json!({ "x": x, "y": y, "tab": tab }),
+    )
+    .await?;
     check_ok(&v, json)
 }
 
-pub async fn hover(server: &str, x: f64, y: f64, json: bool) -> Result<()> {
-    let v = post(server, "/api/hover", serde_json::json!({ "x": x, "y": y })).await?;
+pub async fn hover(server: &str, x: f64, y: f64, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/hover",
+        serde_json::json!({ "x": x, "y": y, "tab": tab }),
+    )
+    .await?;
     if json {
         print_json(&v);
         return Ok(());
@@ -163,16 +202,29 @@ pub async fn hover(server: &str, x: f64, y: f64, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn scroll(server: &str, dx: f64, dy: f64, json: bool) -> Result<()> {
-    let v = post(server, "/api/scroll", serde_json::json!({ "dx": dx, "dy": dy })).await?;
+pub async fn scroll(server: &str, dx: f64, dy: f64, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/scroll",
+        serde_json::json!({ "dx": dx, "dy": dy, "tab": tab }),
+    )
+    .await?;
     check_ok(&v, json)
 }
 
-pub async fn wheel(server: &str, x: f64, y: f64, dx: f64, dy: f64, json: bool) -> Result<()> {
+pub async fn wheel(
+    server: &str,
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+    tab: Option<u32>,
+    json: bool,
+) -> Result<()> {
     let v = post(
         server,
         "/api/wheel",
-        serde_json::json!({ "x": x, "y": y, "dx": dx, "dy": dy }),
+        serde_json::json!({ "x": x, "y": y, "dx": dx, "dy": dy, "tab": tab }),
     )
     .await?;
     check_ok(&v, json)
@@ -185,54 +237,82 @@ pub async fn drag(
     x2: f64,
     y2: f64,
     steps: u32,
+    tab: Option<u32>,
     json: bool,
 ) -> Result<()> {
     let v = post(
         server,
         "/api/drag",
-        serde_json::json!({ "x1": x1, "y1": y1, "x2": x2, "y2": y2, "steps": steps }),
+        serde_json::json!({ "x1": x1, "y1": y1, "x2": x2, "y2": y2, "steps": steps, "tab": tab }),
     )
     .await?;
     check_ok(&v, json)
 }
 
-pub async fn zoom(server: &str, action: &str, json: bool) -> Result<()> {
-    let v = post(server, "/api/zoom", serde_json::json!({ "action": action })).await?;
+pub async fn zoom(server: &str, action: &str, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/zoom",
+        serde_json::json!({ "action": action, "tab": tab }),
+    )
+    .await?;
     check_ok(&v, json)
 }
 
-pub async fn type_text(server: &str, target: &str, text: &str, submit: bool, json: bool) -> Result<()> {
+pub async fn type_text(
+    server: &str,
+    target: &str,
+    text: &str,
+    submit: bool,
+    tab: Option<u32>,
+    json: bool,
+) -> Result<()> {
     let v = post(
         server,
         "/api/type",
-        serde_json::json!({ "target": target, "text": text, "submit": submit }),
+        serde_json::json!({ "target": target, "text": text, "submit": submit, "tab": tab }),
     )
     .await?;
     check_ok(&v, json)
 }
 
-pub async fn press(server: &str, key: &str, json: bool) -> Result<()> {
-    let v = post(server, "/api/press", serde_json::json!({ "key": key })).await?;
+pub async fn press(server: &str, key: &str, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/press",
+        serde_json::json!({ "key": key, "tab": tab }),
+    )
+    .await?;
     check_ok(&v, json)
 }
 
-pub async fn select(server: &str, target: &str, value: &str, json: bool) -> Result<()> {
+pub async fn select(server: &str, target: &str, value: &str, tab: Option<u32>, json: bool) -> Result<()> {
     let v = post(
         server,
         "/api/select",
-        serde_json::json!({ "target": target, "value": value }),
+        serde_json::json!({ "target": target, "value": value, "tab": tab }),
     )
     .await?;
     check_ok(&v, json)
 }
 
-pub async fn insert(server: &str, text: &str, json: bool) -> Result<()> {
-    let v = post(server, "/api/insert", serde_json::json!({ "text": text })).await?;
+pub async fn insert(server: &str, text: &str, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/insert",
+        serde_json::json!({ "text": text, "tab": tab }),
+    )
+    .await?;
     check_ok(&v, json)
 }
 
-pub async fn eval(server: &str, js: &str, json: bool) -> Result<()> {
-    let v = post(server, "/api/eval", serde_json::json!({ "js": js })).await?;
+pub async fn eval(server: &str, js: &str, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/eval",
+        serde_json::json!({ "js": js, "tab": tab }),
+    )
+    .await?;
     if json {
         print_json(&v);
     } else if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
@@ -251,16 +331,21 @@ pub async fn eval(server: &str, js: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn nav(server: &str, action: &str, json: bool) -> Result<()> {
-    let v = post(server, "/api/nav", serde_json::json!({ "action": action })).await?;
+pub async fn nav(server: &str, action: &str, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/nav",
+        serde_json::json!({ "action": action, "tab": tab }),
+    )
+    .await?;
     check_ok(&v, json)
 }
 
-pub async fn handover(server: &str, message: &str, timeout: u64) -> Result<()> {
+pub async fn handover(server: &str, message: &str, tab: Option<u32>, timeout: u64) -> Result<()> {
     let v = post(
         server,
         "/api/handover/request",
-        serde_json::json!({ "message": message }),
+        serde_json::json!({ "message": message, "tab": tab }),
     )
     .await?;
     if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
@@ -270,7 +355,8 @@ pub async fn handover(server: &str, message: &str, timeout: u64) -> Result<()> {
         );
         std::process::exit(1);
     }
-    println!("=== human handover requested ===");
+    let tab_id = v.get("tab").and_then(|x| x.as_u64()).unwrap_or(0);
+    println!("=== human handover requested (tab {tab_id}) ===");
     println!("message: {message}");
     println!("live monitor: {}/", server.trim_end_matches('/'));
     println!("The browser window is now yours: log in / solve captcha / 2FA,");
@@ -286,7 +372,7 @@ pub async fn handover(server: &str, message: &str, timeout: u64) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
         let st: Value = client
-            .get(api(server, "/api/handover"))
+            .get(api(server, &format!("/api/handover?tab={tab_id}")))
             .send()
             .await?
             .json()
@@ -294,22 +380,27 @@ pub async fn handover(server: &str, message: &str, timeout: u64) -> Result<()> {
         let active = st.get("active").and_then(|x| x.as_bool()).unwrap_or(true);
         if !active {
             println!("=== human done — resuming agent control ===");
-            let _ = status(server, false).await;
+            let _ = status(server, Some(tab_id as u32), false).await;
             return Ok(());
         }
     }
 }
 
-pub async fn handover_done(server: &str, json: bool) -> Result<()> {
-    let v = post(server, "/api/handover/done", serde_json::json!({})).await?;
+pub async fn handover_done(server: &str, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        &format!("/api/handover/done{}", tq(tab)),
+        serde_json::json!({}),
+    )
+    .await?;
     check_ok(&v, json)
 }
 
-pub async fn claim(server: &str, message: &str, json: bool) -> Result<()> {
+pub async fn claim(server: &str, message: &str, tab: Option<u32>, json: bool) -> Result<()> {
     let v = post(
         server,
         "/api/handover/claim",
-        serde_json::json!({ "message": message }),
+        serde_json::json!({ "message": message, "tab": tab }),
     )
     .await?;
     check_ok(&v, json)
@@ -330,4 +421,85 @@ pub async fn log(server: &str, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub async fn list(server: &str, json: bool) -> Result<()> {
+    let v = get(server, "/api/tabs").await?;
+    if json {
+        print_json(&v);
+        return Ok(());
+    }
+    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        eprintln!("error: failed to list tabs");
+        std::process::exit(1);
+    }
+    let empty = vec![];
+    let tabs = v.get("tabs").and_then(|x| x.as_array()).unwrap_or(&empty);
+    if tabs.is_empty() {
+        println!("(no tabs)");
+        return Ok(());
+    }
+    for t in tabs {
+        let id = t.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+        let mark = if t.get("active").and_then(|x| x.as_bool()).unwrap_or(false) {
+            "*"
+        } else {
+            " "
+        };
+        let ho = if t.get("handover").and_then(|x| x.as_bool()).unwrap_or(false) {
+            " [needs human]"
+        } else {
+            ""
+        };
+        let title = t.get("title").and_then(|x| x.as_str()).unwrap_or("(no title)");
+        let url = t.get("url").and_then(|x| x.as_str()).unwrap_or("");
+        println!("{mark} tab {id}: {title} <{url}>{ho}");
+    }
+    Ok(())
+}
+
+pub async fn close(server: &str, tab: Option<u32>, json: bool) -> Result<()> {
+    // Resolve the tab first so the warning names what is being closed.
+    let tabs = get(server, "/api/tabs").await?;
+    let empty = vec![];
+    let list = tabs.get("tabs").and_then(|x| x.as_array()).unwrap_or(&empty);
+    let id = match tab {
+        Some(id) => id as u64,
+        None => list
+            .iter()
+            .find(|t| t.get("active").and_then(|x| x.as_bool()).unwrap_or(false))
+            .and_then(|t| t.get("id").and_then(|x| x.as_u64()))
+            .unwrap_or(0),
+    };
+    let describe = list
+        .iter()
+        .find(|t| t.get("id").and_then(|x| x.as_u64()) == Some(id))
+        .map(|t| {
+            format!(
+                "{} <{}>",
+                t.get("title").and_then(|x| x.as_str()).unwrap_or("?"),
+                t.get("url").and_then(|x| x.as_str()).unwrap_or("?")
+            )
+        })
+        .unwrap_or_else(|| format!("tab {id}"));
+    if !json {
+        eprintln!("warning: closing {describe} — agents won't be able to control it afterwards.");
+    }
+    let v = post(
+        server,
+        "/api/close",
+        serde_json::json!({ "tab": tab }),
+    )
+    .await?;
+    check_ok(&v, json)
+}
+
+pub async fn use_tab(server: &str, tab: u32, json: bool) -> Result<()> {
+    let v = post(
+        server,
+        "/api/activate",
+        serde_json::json!({ "tab": tab }),
+    )
+    .await?;
+    check_ok(&v, json)
 }

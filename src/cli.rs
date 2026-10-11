@@ -7,6 +7,10 @@ pub struct Cli {
     #[arg(long, global = true, env = "LB_SERVER")]
     pub server: Option<String>,
 
+    /// Tab id to operate on (default: active tab). See `lb list`.
+    #[arg(long, global = true, env = "LB_TAB")]
+    pub tab: Option<u32>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -24,6 +28,23 @@ pub enum Commands {
     },
     /// Show current URL / title / handover state
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List all tabs (id, title, url)
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Close a tab (default: active). Warns: agents lose control of it.
+    Close {
+        tab: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Switch the active tab
+    Use {
+        tab: u32,
         #[arg(long)]
         json: bool,
     },

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -42,17 +42,55 @@ struct CursorState {
     at: i64,
 }
 
+/// Per-tab state (a tab is one CDP target / Page).
+struct TabState {
+    page: Page,
+    handover: HandoverState,
+    zoom: f64,
+    cursor: CursorState,
+    last_url: String,
+}
+
+struct Tabs {
+    map: std::collections::HashMap<u32, TabState>,
+    active: u32,
+    next_id: u32,
+}
+
 #[derive(Clone)]
 struct AppState {
-    page: Page,
-    handover: Arc<Mutex<HandoverState>>,
+    tabs: Arc<Mutex<Tabs>>,
+    browser: Arc<Mutex<Browser>>,
     log: Arc<Mutex<Vec<LogEntry>>>,
-    /// Page zoom factor (CSS `body.style.zoom`), re-applied after navigations.
-    zoom: Arc<Mutex<f64>>,
-    /// Last pointer action, rendered as a fake cursor in the web UI.
-    cursor: Arc<Mutex<CursorState>>,
-    /// Last healthy page URL — reload recovers here from error pages.
-    last_url: Arc<Mutex<String>>,
+}
+
+/// Resolve a tab selector (None = active tab) to its id + a Page handle.
+async fn tab_page(s: &AppState, tab: Option<u32>) -> anyhow::Result<(u32, Page)> {
+    let t = s.tabs.lock().await;
+    let id = tab.unwrap_or(t.active);
+    t.map
+        .get(&id)
+        .map(|ts| (id, ts.page.clone()))
+        .ok_or_else(|| anyhow::anyhow!("no such tab: {id} — see `lb list`"))
+}
+
+macro_rules! tab {
+    ($s:expr, $t:expr) => {
+        match tab_page($s, $t).await {
+            Ok(x) => x,
+            Err(e) => return err(format!("{e:#}")),
+        }
+    };
+}
+
+/// Mutate one tab's state.
+async fn with_tab<F>(s: &AppState, id: u32, f: F)
+where
+    F: FnOnce(&mut TabState),
+{
+    if let Some(ts) = s.tabs.lock().await.map.get_mut(&id) {
+        f(ts);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,13 +142,16 @@ impl AppState {
         });
     }
 
-    async fn set_cursor(&self, x: f64, y: f64, kind: &str, by: &str) {
-        let mut c = self.cursor.lock().await;
-        c.x = x;
-        c.y = y;
-        c.kind = kind.to_string();
-        c.by = if by == "human" { "human".into() } else { "agent".into() };
-        c.at = chrono::Utc::now().timestamp_millis();
+    async fn set_cursor(&self, id: u32, x: f64, y: f64, kind: &str, by: &str) {
+        let by = if by == "human" { "human".into() } else { "agent".into() };
+        with_tab(self, id, move |ts| {
+            ts.cursor.x = x;
+            ts.cursor.y = y;
+            ts.cursor.kind = kind.to_string();
+            ts.cursor.by = by;
+            ts.cursor.at = chrono::Utc::now().timestamp_millis();
+        })
+        .await;
     }
 }
 
@@ -196,24 +237,39 @@ async fn page_title(page: &Page) -> String {
 // API handlers
 // ---------------------------------------------------------------------------
 
-async fn api_status(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let url = page_url(&s.page).await;
-    let title = page_title(&s.page).await;
-    let ho = s.handover.lock().await.clone();
-    let zoom = *s.zoom.lock().await;
-    let cursor = s.cursor.lock().await.clone();
+/// `?tab=N` query shared by GET endpoints (default: active tab).
+#[derive(Deserialize)]
+struct TabQuery {
+    #[serde(default)]
+    tab: Option<u32>,
+}
+
+async fn api_status(
+    State(s): State<AppState>,
+    Query(q): Query<TabQuery>,
+) -> Json<serde_json::Value> {
+    let (tab_id, page) = tab!(&s, q.tab);
+    let url = page_url(&page).await;
+    let title = page_title(&page).await;
+    let t = s.tabs.lock().await;
+    let ts = t.map.get(&tab_id).unwrap();
     Json(serde_json::json!({
         "ok": true,
+        "tab": tab_id,
+        "active": tab_id == t.active,
         "url": url,
         "title": title,
-        "handover": ho,
-        "zoom": zoom,
-        "cursor": cursor,
+        "handover": ts.handover,
+        "zoom": ts.zoom,
+        "cursor": ts.cursor,
     }))
 }
 
 #[derive(Deserialize)]
 struct OpenReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     url: String,
 }
 /// Omnibox-style normalization: full URLs pass through, bare domains get
@@ -248,27 +304,60 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
         return err("empty url".into());
     }
     let url = normalize_open_url(&input);
-    s.push_log("open", &url);
+    // With an explicit tab: navigate it in place. Without: open a new tab.
+    let (tab_id, page) = match b.tab {
+        Some(id) => tab!(&s, Some(id)),
+        None => {
+            let page = match s.browser.lock().await.new_page(&url).await {
+                Ok(p) => p,
+                Err(e) => return err(format!("new tab failed: {e:#}")),
+            };
+            let mut t = s.tabs.lock().await;
+            let id = t.next_id;
+            t.next_id += 1;
+            t.map.insert(
+                id,
+                TabState {
+                    page: page.clone(),
+                    handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
+                    zoom: 1.0,
+                    cursor: CursorState::default(),
+                    last_url: url.clone(),
+                },
+            );
+            t.active = id;
+            s.push_log("open/tab", &format!("tab {id} <- {url}"));
+            return open_navigate(&s, id, page, &url).await;
+        }
+    };
+    s.push_log("open", &format!("tab {tab_id} <- {url}"));
+    open_navigate(&s, tab_id, page, &url).await
+}
+
+/// Shared goto-with-retry used by open (new or existing tab).
+async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json<serde_json::Value> {
     // The network here can flap (VPN/tailscale), so retry transient failures.
     let mut last_err = String::new();
     for attempt in 1..=3 {
-        let goto = s.page.goto(&url).await;
+        let goto = page.goto(url).await;
         // goto may report transient network errors (e.g. ERR_NETWORK_CHANGED)
         // while the navigation still succeeds — verify by current URL.
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        let current = page_url(&s.page).await;
+        let current = page_url(&page).await;
         if goto.is_ok() || !current.starts_with("chrome-error") {
             // Give the page a moment to keep loading; don't hard-fail on waits.
-            let _ = tokio::time::timeout(Duration::from_secs(10), s.page.wait_for_navigation()).await;
-            let landed = page_url(&s.page).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), page.wait_for_navigation()).await;
+            let landed = page_url(&page).await;
             // Remember the last healthy URL so reload can recover from errors.
             if !landed.starts_with("chrome-error") && !landed.is_empty() {
-                *s.last_url.lock().await = landed.clone();
+                with_tab(s, tab_id, |ts| ts.last_url = landed.clone()).await;
             }
             // Navigations reset document zoom — re-apply the stored level.
-            apply_zoom(&s.page, *s.zoom.lock().await).await;
+            let zoom = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.zoom).unwrap_or(1.0);
+            apply_zoom(&page, zoom).await;
             let note = if attempt > 1 { format!(" (after {attempt} attempts)") } else { String::new() };
-            return ok(&format!("opened {url} (now at {landed}){note}"));
+            return Json(serde_json::json!({ "ok": true, "tab": tab_id,
+                "message": format!("tab {tab_id}: opened {url} (now at {landed}){note}") }));
         }
         last_err = format!("{:#}", goto.unwrap_err());
         s.push_log("open/retry", &format!("attempt {attempt}: {last_err}"));
@@ -277,13 +366,17 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
     err(format!("goto failed after 3 attempts (network flapping?): {last_err}"))
 }
 
-async fn api_snapshot(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let url = page_url(&s.page).await;
-    let title = page_title(&s.page).await;
-    match s.page.evaluate(SNAPSHOT_JS).await {
+async fn api_snapshot(
+    State(s): State<AppState>,
+    Query(q): Query<TabQuery>,
+) -> Json<serde_json::Value> {
+    let (tab_id, page) = tab!(&s, q.tab);
+    let url = page_url(&page).await;
+    let title = page_title(&page).await;
+    match page.evaluate(SNAPSHOT_JS).await {
         Ok(eval) => match eval.into_value::<serde_json::Value>() {
             Ok(elements) => Json(serde_json::json!({
-                "ok": true, "url": url, "title": title, "elements": elements,
+                "ok": true, "tab": tab_id, "url": url, "title": title, "elements": elements,
                 "hint": "click with `lb click <ref>`, type with `lb type <ref> <text>`. Re-run snapshot after navigation."
             })),
             Err(e) => err(format!("decode snapshot failed: {e:#}")),
@@ -292,14 +385,28 @@ async fn api_snapshot(State(s): State<AppState>) -> Json<serde_json::Value> {
     }
 }
 
-async fn api_screenshot(State(s): State<AppState>) -> impl IntoResponse {
+async fn api_screenshot(
+    State(s): State<AppState>,
+    Query(q): Query<TabQuery>,
+) -> impl IntoResponse {
+    let (_tab_id, page) = match tab_page(&s, q.tab).await {
+        Ok(x) => x,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "text/plain")],
+                format!("{e:#}").into_bytes(),
+            )
+                .into_response()
+        }
+    };
     // Never let a slow screenshot pile up: the UI polls every ~2s, so fail
     // fast (the UI just retries on the next tick).
     let params = chromiumoxide::page::ScreenshotParams::builder()
         .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Jpeg)
         .quality(70)
         .build();
-    let shot = tokio::time::timeout(Duration::from_secs(10), s.page.screenshot(params)).await;
+    let shot = tokio::time::timeout(Duration::from_secs(10), page.screenshot(params)).await;
     match shot {
         Ok(Ok(bytes)) => (
             StatusCode::OK,
@@ -324,6 +431,9 @@ async fn api_screenshot(State(s): State<AppState>) -> impl IntoResponse {
 
 #[derive(Deserialize)]
 struct ClickReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     target: String,
     /// "human" when triggered from the web UI; anything else = agent.
     #[serde(default)]
@@ -331,20 +441,21 @@ struct ClickReq {
 }
 async fn api_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> Json<serde_json::Value> {
     let sel = target_to_selector(&b.target);
-    s.push_log("click", &sel);
+    let (tab_id, page) = tab!(&s, b.tab);
+    s.push_log("click", &format!("tab {tab_id} <- {sel}"));
     // Ensure refs exist (snapshot tags elements). Best-effort.
-    let _ = s.page.evaluate(SNAPSHOT_JS).await;
-    match s.page.find_element(&sel).await {
+    let _ = page.evaluate(SNAPSHOT_JS).await;
+    match page.find_element(&sel).await {
         Ok(el) => {
             // Report the click point for the UI's fake cursor.
             let center_js = format!(
                 "(() => {{ const el = document.querySelector({}); if (!el) return null; const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }})()",
                 serde_json::to_string(&sel).unwrap()
             );
-            if let Ok(ev) = s.page.evaluate(center_js.as_str()).await {
+            if let Ok(ev) = page.evaluate(center_js.as_str()).await {
                 if let Ok(pt) = ev.into_value::<Vec<f64>>() {
                     if pt.len() == 2 {
-                        s.set_cursor(pt[0], pt[1], "click", &b.by).await;
+                        s.set_cursor(tab_id, pt[0], pt[1], "click", &b.by).await;
                     }
                 }
             }
@@ -362,6 +473,9 @@ async fn api_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> Json<s
 
 #[derive(Deserialize)]
 struct TypeReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     target: String,
     text: String,
     #[serde(default)]
@@ -369,9 +483,10 @@ struct TypeReq {
 }
 async fn api_type(State(s): State<AppState>, Json(b): Json<TypeReq>) -> Json<serde_json::Value> {
     let sel = target_to_selector(&b.target);
+    let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("type", &format!("{sel} <- {:?}", b.text));
-    let _ = s.page.evaluate(SNAPSHOT_JS).await;
-    let el = match s.page.find_element(&sel).await {
+    let _ = page.evaluate(SNAPSHOT_JS).await;
+    let el = match page.find_element(&sel).await {
         Ok(el) => el,
         Err(e) => return err(format!("element not found for `{sel}`: {e:#}")),
     };
@@ -383,7 +498,7 @@ async fn api_type(State(s): State<AppState>, Json(b): Json<TypeReq>) -> Json<ser
         "(() => {{ const el = document.querySelector({}); if (el) {{ el.focus(); if ('value' in el) {{ el.value=''; el.dispatchEvent(new Event('input', {{bubbles:true}})); }} }} }})()",
         serde_json::to_string(&sel).unwrap()
     );
-    let _ = s.page.evaluate(clear_js.as_str()).await;
+    let _ = page.evaluate(clear_js.as_str()).await;
     // Type line-by-line: '\n' has no key definition, so press Enter between
     // lines. Leading whitespace is stripped and left to the editor's
     // auto-indent (typing it verbatim would double-indent); electric
@@ -421,11 +536,15 @@ async fn api_type(State(s): State<AppState>, Json(b): Json<TypeReq>) -> Json<ser
 
 #[derive(Deserialize)]
 struct PressReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     key: String,
 }
 async fn api_press(State(s): State<AppState>, Json(b): Json<PressReq>) -> Json<serde_json::Value> {
+    let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("press", &b.key);
-    match s.page.find_element("body").await {
+    match page.find_element("body").await {
         Ok(el) => match el.press_key(b.key.as_str()).await {
             Ok(_) => {
                 tokio::time::sleep(Duration::from_millis(400)).await;
@@ -439,13 +558,17 @@ async fn api_press(State(s): State<AppState>, Json(b): Json<PressReq>) -> Json<s
 
 #[derive(Deserialize)]
 struct EvalReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     js: String,
 }
 async fn api_eval(State(s): State<AppState>, Json(b): Json<EvalReq>) -> Json<serde_json::Value> {
+    let (tab_id, page) = tab!(&s, b.tab);
     s.push_log("eval", &b.js);
-    match s.page.evaluate(b.js.as_str()).await {
+    match page.evaluate(b.js.as_str()).await {
         Ok(r) => match r.into_value::<serde_json::Value>() {
-            Ok(v) => Json(serde_json::json!({ "ok": true, "result": v })),
+            Ok(v) => Json(serde_json::json!({ "ok": true, "tab": tab_id, "result": v })),
             Err(_) => Json(serde_json::json!({ "ok": true, "result": "(non-JSON value — side effects applied)" })),
         },
         Err(e) => err(format!("eval failed: {e:#}")),
@@ -454,28 +577,33 @@ async fn api_eval(State(s): State<AppState>, Json(b): Json<EvalReq>) -> Json<ser
 
 #[derive(Deserialize)]
 struct NavReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     action: String,
 }
 async fn api_nav(State(s): State<AppState>, Json(b): Json<NavReq>) -> Json<serde_json::Value> {
-    s.push_log(&b.action, "");
+    let (tab_id, page) = tab!(&s, b.tab);
+    s.push_log(&b.action, &format!("tab {tab_id}"));
     // Reloading a chrome-error page just redisplays the error — recover by
     // re-opening the last healthy URL instead.
     if b.action == "reload" {
-        let current = page_url(&s.page).await;
+        let current = page_url(&page).await;
         if current.starts_with("chrome-error") {
-            let last = s.last_url.lock().await.clone();
+            let last = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.last_url.clone()).unwrap_or_default();
             if last.is_empty() {
                 return err("error page with no previous URL — use open instead".into());
             }
             s.push_log("reload/recover", &last);
-            let goto = s.page.goto(&last).await;
+            let goto = page.goto(&last).await;
             tokio::time::sleep(Duration::from_millis(1500)).await;
-            let landed = page_url(&s.page).await;
+            let landed = page_url(&page).await;
             if goto.is_ok() || !landed.starts_with("chrome-error") {
                 if !landed.starts_with("chrome-error") && !landed.is_empty() {
-                    *s.last_url.lock().await = landed.clone();
+                    with_tab(&s, tab_id, |ts| ts.last_url = landed.clone()).await;
                 }
-                apply_zoom(&s.page, *s.zoom.lock().await).await;
+                let zoom = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.zoom).unwrap_or(1.0);
+                apply_zoom(&page, zoom).await;
                 return ok(&format!("recovered to {landed}"));
             }
             return err("still failing — the network is flapping, try again in a bit".into());
@@ -487,14 +615,18 @@ async fn api_nav(State(s): State<AppState>, Json(b): Json<NavReq>) -> Json<serde
         "reload" => "location.reload()",
         other => return err(format!("unknown nav action: {other}")),
     };
-    let _ = s.page.evaluate(js).await;
+    let _ = page.evaluate(js).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
-    apply_zoom(&s.page, *s.zoom.lock().await).await;
+    let zoom = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.zoom).unwrap_or(1.0);
+    apply_zoom(&page, zoom).await;
     ok(&format!("navigated {}", b.action))
 }
 
 #[derive(Deserialize)]
 struct ClickAtReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     x: f64,
     y: f64,
     /// "human" when triggered from the web UI; anything else = agent.
@@ -506,10 +638,11 @@ async fn api_click_at(State(s): State<AppState>, Json(b): Json<ClickAtReq>) -> J
     if !b.x.is_finite() || !b.y.is_finite() || b.x < 0.0 || b.y < 0.0 {
         return err("invalid coordinates".into());
     }
+    let (tab_id, page) = tab!(&s, b.tab);
     s.push_log("click-at", &format!("{}, {}", b.x.round(), b.y.round()));
-    s.set_cursor(b.x, b.y, "click", &b.by).await;
+    s.set_cursor(tab_id, b.x, b.y, "click", &b.by).await;
     let point = chromiumoxide::layout::Point::new(b.x, b.y);
-    match s.page.click(point).await {
+    match page.click(point).await {
         Ok(_) => {
             tokio::time::sleep(Duration::from_millis(700)).await;
             ok("clicked")
@@ -520,6 +653,9 @@ async fn api_click_at(State(s): State<AppState>, Json(b): Json<ClickAtReq>) -> J
 
 #[derive(Deserialize)]
 struct ScrollReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     #[serde(default)]
     dx: f64,
     #[serde(default)]
@@ -529,9 +665,10 @@ async fn api_scroll(State(s): State<AppState>, Json(b): Json<ScrollReq>) -> Json
     if !b.dx.is_finite() || !b.dy.is_finite() {
         return err("invalid scroll delta".into());
     }
+    let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("scroll", &format!("{}, {}", b.dx, b.dy));
     let js = format!("window.scrollBy({}, {})", b.dx, b.dy);
-    match s.page.evaluate(js.as_str()).await {
+    match page.evaluate(js.as_str()).await {
         Ok(_) => {
             tokio::time::sleep(Duration::from_millis(400)).await;
             ok("scrolled")
@@ -542,6 +679,9 @@ async fn api_scroll(State(s): State<AppState>, Json(b): Json<ScrollReq>) -> Json
 
 #[derive(Deserialize)]
 struct KeyReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     /// "down" or "up"
     event: String,
     /// JS KeyboardEvent.key (e.g. "a", "Enter", "Backspace")
@@ -564,6 +704,9 @@ struct KeyReq {
 }
 #[derive(Deserialize)]
 struct SelectReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     target: String,
     /// Option value (or visible text — matched case-insensitively as fallback).
     value: String,
@@ -573,8 +716,9 @@ struct SelectReq {
 /// fires the same input/change events a real choice would.
 async fn api_select(State(s): State<AppState>, Json(b): Json<SelectReq>) -> Json<serde_json::Value> {
     let sel = target_to_selector(&b.target);
+    let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("select", &format!("{sel} <- {:?}", b.value));
-    let _ = s.page.evaluate(SNAPSHOT_JS).await;
+    let _ = page.evaluate(SNAPSHOT_JS).await;
     const SET_JS: &str = r#"((sel, want) => {
       const el = document.querySelector(sel);
       if (!el || el.tagName !== 'SELECT') return { error: 'not a select element' };
@@ -592,12 +736,12 @@ async fn api_select(State(s): State<AppState>, Json(b): Json<SelectReq>) -> Json
         serde_json::to_string(&sel).unwrap(),
         serde_json::to_string(&b.value).unwrap()
     );
-    match s.page.evaluate(call.as_str()).await {
+    match page.evaluate(call.as_str()).await {
         Ok(r) => match r.into_value::<serde_json::Value>() {
             Ok(v) => {
                 if v.get("error").and_then(|x| x.as_str()).is_some() {
                     // Fall back to keyboard-driving the native control.
-                    return select_via_keyboard(&s, &sel, &b.value).await;
+                    return select_via_keyboard(&page, &sel, &b.value).await;
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 Json(serde_json::json!({ "ok": true,
@@ -611,8 +755,8 @@ async fn api_select(State(s): State<AppState>, Json(b): Json<SelectReq>) -> Json
 
 /// Fallback: focus the select and type the option text (native control
 /// type-ahead), confirming with Enter.
-async fn select_via_keyboard(s: &AppState, sel: &str, want: &str) -> Json<serde_json::Value> {
-    let el = match s.page.find_element(sel).await {
+async fn select_via_keyboard(page: &Page, sel: &str, want: &str) -> Json<serde_json::Value> {
+    let el = match page.find_element(sel).await {
         Ok(el) => el,
         Err(e) => return err(format!("element not found for `{sel}`: {e:#}")),
     };
@@ -665,9 +809,10 @@ async fn api_key(State(s): State<AppState>, Json(b): Json<KeyReq>) -> Json<serde
     if is_down && b.text.chars().count() == 1 {
         cmd = cmd.text(b.text.clone()).unmodified_text(b.text.clone());
     }
+    let (_tab_id, page) = tab!(&s, b.tab);
     // Keystrokes are intentionally not logged: at ~2 events per key they'd
     // drown the action log. Failures still surface via the API response.
-    match s.page.execute(cmd.build().unwrap()).await {
+    match page.execute(cmd.build().unwrap()).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
         Err(e) => err(format!("key event failed: {e:#}")),
     }
@@ -675,6 +820,9 @@ async fn api_key(State(s): State<AppState>, Json(b): Json<KeyReq>) -> Json<serde
 
 #[derive(Deserialize)]
 struct ZoomReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     /// "in", "out" or "reset"
     #[serde(default = "default_zoom_action")]
     action: String,
@@ -683,18 +831,24 @@ fn default_zoom_action() -> String {
     "in".to_string()
 }
 async fn api_zoom(State(s): State<AppState>, Json(b): Json<ZoomReq>) -> Json<serde_json::Value> {
-    let mut z = s.zoom.lock().await;
-    *z = step_zoom(*z, b.action.as_str());
-    let zoom = *z;
-    drop(z);
-    s.push_log("zoom", &format!("{zoom}"));
-    apply_zoom(&s.page, zoom).await;
+    let (tab_id, page) = tab!(&s, b.tab);
+    let zoom = {
+        let mut t = s.tabs.lock().await;
+        let ts = t.map.get_mut(&tab_id).unwrap();
+        ts.zoom = step_zoom(ts.zoom, b.action.as_str());
+        ts.zoom
+    };
+    s.push_log("zoom", &format!("tab {tab_id} -> {zoom}"));
+    apply_zoom(&page, zoom).await;
     tokio::time::sleep(Duration::from_millis(400)).await;
     Json(serde_json::json!({ "ok": true, "zoom": zoom, "message": format!("zoom {zoom}") }))
 }
 
 #[derive(Deserialize)]
 struct InsertReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     text: String,
 }
 /// Insert text at the cursor as if typed (single trusted `Input.insertText`).
@@ -705,8 +859,9 @@ async fn api_insert(State(s): State<AppState>, Json(b): Json<InsertReq>) -> Json
     if b.text.is_empty() {
         return err("empty text".into());
     }
+    let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("insert", &format!("{} chars", b.text.chars().count()));
-    match s.page.execute(InsertTextParams::new(b.text)).await {
+    match page.execute(InsertTextParams::new(b.text)).await {
         Ok(_) => {
             tokio::time::sleep(Duration::from_millis(400)).await;
             ok("inserted")
@@ -717,6 +872,9 @@ async fn api_insert(State(s): State<AppState>, Json(b): Json<InsertReq>) -> Json
 
 #[derive(Deserialize)]
 struct TypeRawReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     text: String,
 }
 /// Type text as individual trusted keystrokes (one `Input.insertText` per char).
@@ -727,6 +885,7 @@ async fn api_type_raw(State(s): State<AppState>, Json(b): Json<TypeRawReq>) -> J
     if b.text.is_empty() {
         return err("empty text".into());
     }
+    let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("type-raw", &format!("{} chars", b.text.chars().count()));
     for c in b.text.chars() {
         let s_ = c.to_string();
@@ -734,7 +893,7 @@ async fn api_type_raw(State(s): State<AppState>, Json(b): Json<TypeRawReq>) -> J
         if s_.is_empty() {
             continue;
         }
-        if let Err(e) = s.page.execute(InsertTextParams::new(s_)).await {
+        if let Err(e) = page.execute(InsertTextParams::new(s_)).await {
             return err(format!("type-raw failed: {e:#}"));
         }
     }
@@ -744,6 +903,9 @@ async fn api_type_raw(State(s): State<AppState>, Json(b): Json<TypeRawReq>) -> J
 
 #[derive(Deserialize)]
 struct HoverReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     x: f64,
     y: f64,
 }
@@ -753,8 +915,8 @@ async fn api_hover(State(s): State<AppState>, Json(b): Json<HoverReq>) -> Json<s
     if !b.x.is_finite() || !b.y.is_finite() || b.x < 0.0 || b.y < 0.0 {
         return err("invalid coordinates".into());
     }
-    match s
-        .page
+    let (_tab_id, page) = tab!(&s, b.tab);
+    match page
         .move_mouse(chromiumoxide::layout::Point::new(b.x, b.y))
         .await
     {
@@ -765,6 +927,9 @@ async fn api_hover(State(s): State<AppState>, Json(b): Json<HoverReq>) -> Json<s
 
 #[derive(Deserialize)]
 struct WheelReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     x: f64,
     y: f64,
     #[serde(default)]
@@ -780,7 +945,8 @@ async fn api_wheel(State(s): State<AppState>, Json(b): Json<WheelReq>) -> Json<s
     if ![b.x, b.y, b.dx, b.dy].iter().all(|v| v.is_finite()) || b.x < 0.0 || b.y < 0.0 {
         return err("invalid wheel params".into());
     }
-    if let Err(e) = s.page.move_mouse(chromiumoxide::layout::Point::new(b.x, b.y)).await {
+    let (_tab_id, page) = tab!(&s, b.tab);
+    if let Err(e) = page.move_mouse(chromiumoxide::layout::Point::new(b.x, b.y)).await {
         return err(format!("mouse move failed: {e:#}"));
     }
     let params = DispatchMouseEventParams::builder()
@@ -791,7 +957,7 @@ async fn api_wheel(State(s): State<AppState>, Json(b): Json<WheelReq>) -> Json<s
         .delta_y(b.dy)
         .build()
         .unwrap();
-    match s.page.execute(params).await {
+    match page.execute(params).await {
         Ok(_) => {
             tokio::time::sleep(Duration::from_millis(300)).await;
             ok("wheeled")
@@ -802,6 +968,9 @@ async fn api_wheel(State(s): State<AppState>, Json(b): Json<WheelReq>) -> Json<s
 
 #[derive(Deserialize)]
 struct DragReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     x1: f64,
     y1: f64,
     x2: f64,
@@ -825,13 +994,14 @@ async fn api_drag(State(s): State<AppState>, Json(b): Json<DragReq>) -> Json<ser
         return err("invalid drag coords".into());
     }
     let steps = b.steps.clamp(2, 50) as usize;
+    let (tab_id, page) = tab!(&s, b.tab);
     s.push_log("drag", &format!("({},{}) -> ({},{})", b.x1, b.y1, b.x2, b.y2));
-    s.set_cursor(b.x1, b.y1, "drag", &b.by).await;
+    s.set_cursor(tab_id, b.x1, b.y1, "drag", &b.by).await;
     // Field recipe mirrors Puppeteer's Mouse exactly (verified against
     // puppeteer-core 25: moves carry button+buttons, press carries
     // buttons=1 AFTER engaging, release carries buttons=0 AFTER clearing).
     let run = async {
-        s.page
+        page
             .execute(
                 DispatchMouseEventParams::builder()
                     .r#type(DispatchMouseEventType::MouseMoved)
@@ -846,7 +1016,7 @@ async fn api_drag(State(s): State<AppState>, Json(b): Json<DragReq>) -> Json<ser
             .await?;
         // NB: no click_count on press — a real mousedown carries none, and
         // sending one suppresses drag initiation (clicks complete on release).
-        s.page
+        page
             .execute(
                 DispatchMouseEventParams::builder()
                     .r#type(DispatchMouseEventType::MousePressed)
@@ -861,7 +1031,7 @@ async fn api_drag(State(s): State<AppState>, Json(b): Json<DragReq>) -> Json<ser
             .await?;
         for i in 1..=steps {
             let t = i as f64 / steps as f64;
-            s.page
+            page
                 .execute(
                     DispatchMouseEventParams::builder()
                         .r#type(DispatchMouseEventType::MouseMoved)
@@ -876,7 +1046,7 @@ async fn api_drag(State(s): State<AppState>, Json(b): Json<DragReq>) -> Json<ser
                 .await?;
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
-        s.page
+        page
             .execute(
                 DispatchMouseEventParams::builder()
                     .r#type(DispatchMouseEventType::MouseReleased)
@@ -892,7 +1062,7 @@ async fn api_drag(State(s): State<AppState>, Json(b): Json<DragReq>) -> Json<ser
     };
     match run.await {
         Ok(()) => {
-            s.set_cursor(b.x2, b.y2, "drag", &b.by).await;
+            s.set_cursor(tab_id, b.x2, b.y2, "drag", &b.by).await;
             tokio::time::sleep(Duration::from_millis(500)).await;
             ok("dragged")
         }
@@ -901,9 +1071,13 @@ async fn api_drag(State(s): State<AppState>, Json(b): Json<DragReq>) -> Json<ser
 }
 
 /// Viewport metrics for mapping screenshot pixels → page coordinates.
-async fn api_metrics(State(s): State<AppState>) -> Json<serde_json::Value> {
+async fn api_metrics(
+    State(s): State<AppState>,
+    Query(q): Query<TabQuery>,
+) -> Json<serde_json::Value> {
+    let (_tab_id, page) = tab!(&s, q.tab);
     const METRICS_JS: &str = "({w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio || 1, sx: window.scrollX, sy: window.scrollY})";
-    match s.page.evaluate(METRICS_JS).await {
+    match page.evaluate(METRICS_JS).await {
         Ok(r) => match r.into_value::<serde_json::Value>() {
             Ok(m) => Json(serde_json::json!({ "ok": true, "metrics": m })),
             Err(e) => err(format!("decode metrics failed: {e:#}")),
@@ -914,23 +1088,33 @@ async fn api_metrics(State(s): State<AppState>) -> Json<serde_json::Value> {
 
 #[derive(Deserialize)]
 struct HandoverReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     message: String,
 }
 async fn api_handover_request(
     State(s): State<AppState>,
     Json(b): Json<HandoverReq>,
 ) -> Json<serde_json::Value> {
-    let mut ho = s.handover.lock().await;
-    ho.active = true;
-    ho.message = b.message.clone();
-    ho.claimed = false;
-    ho.requested_at = Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-    s.push_log("handover/request", &b.message);
-    Json(serde_json::json!({ "ok": true, "message": "handover requested — human should take over the browser window, then click Done in the web UI" }))
+    let (tab_id, _page) = tab!(&s, b.tab);
+    {
+        let mut t = s.tabs.lock().await;
+        let ho = &mut t.map.get_mut(&tab_id).unwrap().handover;
+        ho.active = true;
+        ho.message = b.message.clone();
+        ho.claimed = false;
+        ho.requested_at = Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+    s.push_log("handover/request", &format!("tab {tab_id}: {}", b.message));
+    Json(serde_json::json!({ "ok": true, "tab": tab_id, "message": "handover requested — human should take over the browser window, then click Done in the web UI" }))
 }
 
 #[derive(Deserialize)]
 struct ClaimReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
     #[serde(default)]
     message: String,
 }
@@ -939,34 +1123,133 @@ async fn api_handover_claim(
     State(s): State<AppState>,
     Json(b): Json<ClaimReq>,
 ) -> Json<serde_json::Value> {
-    let mut ho = s.handover.lock().await;
-    ho.active = true;
-    ho.message = if b.message.trim().is_empty() {
+    let (tab_id, _page) = tab!(&s, b.tab);
+    let msg = if b.message.trim().is_empty() {
         "Human claimed control from the web UI.".to_string()
     } else {
         b.message.clone()
     };
-    ho.claimed = true;
-    ho.requested_at = Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-    s.push_log("handover/claim", &ho.message.clone());
+    {
+        let mut t = s.tabs.lock().await;
+        let ho = &mut t.map.get_mut(&tab_id).unwrap().handover;
+        ho.active = true;
+        ho.message = msg.clone();
+        ho.claimed = true;
+        ho.requested_at = Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+    s.push_log("handover/claim", &format!("tab {tab_id}: {msg}"));
     Json(serde_json::json!({ "ok": true, "message": "control claimed — the agent should hold off until you click Done in the web UI" }))
 }
 
-async fn api_handover_get(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let ho = s.handover.lock().await.clone();
-    Json(serde_json::json!({ "ok": true, "active": ho.active, "claimed": ho.claimed, "message": ho.message, "requested_at": ho.requested_at }))
+async fn api_handover_get(
+    State(s): State<AppState>,
+    Query(q): Query<TabQuery>,
+) -> Json<serde_json::Value> {
+    let (tab_id, _page) = tab!(&s, q.tab);
+    let ho = s.tabs.lock().await.map.get(&tab_id).unwrap().handover.clone();
+    Json(serde_json::json!({ "ok": true, "tab": tab_id, "active": ho.active, "claimed": ho.claimed, "message": ho.message, "requested_at": ho.requested_at }))
 }
 
-async fn api_handover_done(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let mut ho = s.handover.lock().await;
-    ho.active = false;
-    s.push_log("handover/done", "human returned control to agent");
+async fn api_handover_done(
+    State(s): State<AppState>,
+    Query(q): Query<TabQuery>,
+) -> Json<serde_json::Value> {
+    let (tab_id, _page) = tab!(&s, q.tab);
+    with_tab(&s, tab_id, |ts| ts.handover.active = false).await;
+    s.push_log("handover/done", &format!("tab {tab_id}: human returned control to agent"));
     ok("handover complete — agent may continue (re-run `lb snapshot`)")
 }
 
 async fn api_log(State(s): State<AppState>) -> Json<serde_json::Value> {
     let entries = s.log.lock().await.clone();
     Json(serde_json::json!({ "ok": true, "entries": entries }))
+}
+
+/// List all tabs with basic info for quick overview.
+async fn api_tabs(State(s): State<AppState>) -> Json<serde_json::Value> {
+    // Snapshot ids first so we don't hold the lock across CDP calls.
+    let (ids, active) = {
+        let t = s.tabs.lock().await;
+        (t.map.keys().copied().collect::<Vec<_>>(), t.active)
+    };
+    let mut tabs = vec![];
+    for id in ids {
+        let page = match s.tabs.lock().await.map.get(&id).map(|ts| ts.page.clone()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let url = page_url(&page).await;
+        let title = page_title(&page).await;
+        let t = s.tabs.lock().await;
+        let ts = t.map.get(&id).unwrap();
+        tabs.push(serde_json::json!({
+            "id": id,
+            "active": id == active,
+            "title": title,
+            "url": url,
+            "handover": ts.handover.active,
+        }));
+    }
+    tabs.sort_by_key(|t| t["id"].as_u64().unwrap_or(0));
+    Json(serde_json::json!({ "ok": true, "tabs": tabs }))
+}
+
+#[derive(Deserialize)]
+struct CloseReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
+}
+async fn api_close(State(s): State<AppState>, Json(b): Json<CloseReq>) -> Json<serde_json::Value> {
+    let (tab_id, _page) = tab!(&s, b.tab);
+    let removed = s.tabs.lock().await.map.remove(&tab_id);
+    match removed {
+        Some(ts) => {
+            let url = page_url(&ts.page).await;
+            let _ = ts.page.close().await;
+            s.push_log("close", &format!("tab {tab_id} ({url})"));
+            // Never leave the daemon tabless: open a fresh blank tab.
+            let mut t = s.tabs.lock().await;
+            if t.map.is_empty() {
+                drop(t);
+                match s.browser.lock().await.new_page("about:blank").await {
+                    Ok(page) => {
+                        let mut t = s.tabs.lock().await;
+                        let id = t.next_id;
+                        t.next_id += 1;
+                        t.map.insert(id, TabState {
+                            page,
+                            handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
+                            zoom: 1.0,
+                            cursor: CursorState::default(),
+                            last_url: String::new(),
+                        });
+                        t.active = id;
+                        return ok(&format!("closed tab {tab_id}; opened fresh tab {id}"));
+                    }
+                    Err(e) => return err(format!("closed tab {tab_id} but fresh tab failed: {e:#}")),
+                }
+            }
+            if t.active == tab_id {
+                t.active = *t.map.keys().max().unwrap();
+            }
+            ok(&format!("closed tab {tab_id} ({url})"))
+        }
+        None => err(format!("no such tab: {tab_id}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct ActivateReq {
+    tab: u32,
+}
+async fn api_activate(State(s): State<AppState>, Json(b): Json<ActivateReq>) -> Json<serde_json::Value> {
+    let (tab_id, page) = tab!(&s, Some(b.tab));
+    s.tabs.lock().await.active = tab_id;
+    // Best-effort: bring to front so a headed window follows the switch.
+    let _ = page.bring_to_front().await;
+    s.push_log("activate", &format!("tab {tab_id}"));
+    ok(&format!("tab {tab_id} active"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,35 +1365,37 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         }
     });
 
+    let start_url = args.url.clone().unwrap_or_else(|| "about:blank".into());
     let page = browser
-        .new_page(args.url.as_deref().unwrap_or("about:blank"))
+        .new_page(start_url.as_str())
         .await
         .context("failed to open browser page")?;
 
+    let mut tabs_map = std::collections::HashMap::new();
+    tabs_map.insert(
+        1u32,
+        TabState {
+            page,
+            handover: HandoverState {
+                active: false,
+                message: String::new(),
+                claimed: false,
+                requested_at: None,
+            },
+            zoom: 1.0,
+            cursor: CursorState::default(),
+            last_url: start_url.clone(),
+        },
+    );
     let state = AppState {
-        page,
-        handover: Arc::new(Mutex::new(HandoverState {
-            active: false,
-            message: String::new(),
-            claimed: false,
-            requested_at: None,
-        })),
-        zoom: Arc::new(Mutex::new(1.0)),
-        cursor: Arc::new(Mutex::new(CursorState::default())),
-        last_url: Arc::new(Mutex::new(String::new())),
+        tabs: Arc::new(Mutex::new(Tabs { map: tabs_map, active: 1, next_id: 2 })),
+        browser: Arc::new(Mutex::new(browser)),
         log: Arc::new(Mutex::new(vec![LogEntry {
             at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             action: "daemon".into(),
             detail: "browser launched".into(),
         }])),
     };
-
-    // Keep the browser alive for the process lifetime.
-    let _browser_guard: Arc<Mutex<Browser>> = Arc::new(Mutex::new(browser));
-
-    if let Some(u) = &args.url {
-        *state.last_url.lock().await = u.clone();
-    }
 
     let app = Router::new()
         .route("/", get(ui_index))
@@ -1139,6 +1424,9 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         .route("/api/handover/claim", post(api_handover_claim))
         .route("/api/handover/done", post(api_handover_done))
         .route("/api/log", get(api_log))
+        .route("/api/tabs", get(api_tabs))
+        .route("/api/close", post(api_close))
+        .route("/api/activate", post(api_activate))
         .fallback_service(tower_http::services::ServeDir::new(dist_dir()))
         .with_state(state);
 
