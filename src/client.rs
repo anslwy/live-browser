@@ -230,6 +230,7 @@ pub async fn wheel(
     check_ok(&v, json)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn drag(
     server: &str,
     x1: f64,
