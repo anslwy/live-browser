@@ -91,7 +91,6 @@ jobs:
           cp -r web/dist "pkg/${OUT}/web/dist"
           cp README.md install.sh "pkg/${OUT}/"
           tar -czf "${OUT}.tar.gz" -C pkg "${OUT}"
-          ASSETS="${OUT}.tar.gz"
           # Intel asset when the cross build succeeded.
           if [[ -f target/x86_64-apple-darwin/release/lb ]]; then
             OUT="live-browser-${TAG}-darwin-x86_64"
@@ -100,11 +99,17 @@ jobs:
             cp -r web/dist "pkg/${OUT}/web/dist"
             cp README.md install.sh "pkg/${OUT}/"
             tar -czf "${OUT}.tar.gz" -C pkg "${OUT}"
-            ASSETS="$ASSETS ${OUT}.tar.gz"
           else
             echo "WARNING: Intel cross build unavailable — Intel Macs can install with --from-source"
           fi
-          echo "ASSETS=${ASSETS}" >> "$GITHUB_ENV"
+          # Newline-separated: softprops/action-gh-release treats each
+          # line as one glob (a space-separated string is one pattern
+          # and matches nothing).
+          {
+            echo "ASSETS<<EOF"
+            ls live-browser-"${TAG}"-darwin-*.tar.gz
+            echo "EOF"
+          } >> "$GITHUB_ENV"
 
       - name: Release
         uses: softprops/action-gh-release@v2
