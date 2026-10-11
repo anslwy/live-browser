@@ -71,14 +71,12 @@ fn step_zoom(current: f64, dir: &str) -> f64 {
         "out" => ZOOM_LEVELS
             .iter()
             .copied()
-            .filter(|z| *z < current - 1e-9)
-            .last()
+            .rfind(|z| *z < current - 1e-9)
             .unwrap_or(0.5),
         _ => ZOOM_LEVELS
             .iter()
             .copied()
-            .filter(|z| *z > current + 1e-9)
-            .next()
+            .find(|z| *z > current + 1e-9)
             .unwrap_or(1.5), // "in" and anything else
     }
 }
@@ -1033,10 +1031,8 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         let dir = base.join("live-browser").join("profile");
         // One-time migration from the old `simple-browser` profile location.
         let legacy = base.join("simple-browser").join("profile");
-        if !dir.exists() && legacy.exists() {
-            if std::fs::rename(&legacy, &dir).is_ok() {
-                tracing::info!("migrated browser profile from {}", legacy.display());
-            }
+        if !dir.exists() && legacy.exists() && std::fs::rename(&legacy, &dir).is_ok() {
+            tracing::info!("migrated browser profile from {}", legacy.display());
         }
         dir.to_string_lossy().to_string()
     });
