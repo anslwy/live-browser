@@ -480,6 +480,10 @@
     } catch {}
   }
 
+  // Navigation in flight (address bar / back-forward-reload): dim the live
+  // view as a loading indication until the new page settles.
+  $: pageLoading = busy === 'open' || busy === 'back' || busy === 'forward' || busy === 'reload';
+
   async function doOpen() {
     if (!openUrl.trim()) return;
     busy = 'open';
@@ -564,16 +568,6 @@
 </script>
 
 <div class="wrap">
-  <header class="constrain">
-    <span class="dot {connected ? '' : 'off'}"></span>
-    <h2 style="margin:0"><span class="brand"><Icon name="globe" /></span> Live Browser</h2>
-    <span class="muted mono status">{connected ? 'connected' : 'offline'}</span>
-    <span style="flex:1"></span>
-    <button class="ghost iconbtn" on:click={() => setTheme(theme === 'dark' ? 'light' : 'dark')} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light / dark mode">
-      <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
-    </button>
-  </header>
-
   {#if error}
     <div class="card constrain">{error}</div>
   {/if}
@@ -637,8 +631,15 @@
         <a class="iconplain" href={status.url} target="_blank" rel="noreferrer" title="Open this page in your own browser">
           <Icon name="external" />
         </a>
+      {:else}
+        <span class="iconplain is-disabled" title="Nothing to open — this tab is blank">
+          <Icon name="external" />
+        </span>
       {/if}
-      <input id="addr-bar" class="omnibox" type="text" placeholder="Type a URL or search…" bind:value={openUrl} on:focus={(e) => (e.target as HTMLInputElement).select()} on:keydown={(e) => e.key === 'Enter' && doOpen()} />
+      <input id="addr-bar" class="omnibox" type="text" placeholder="Type a URL or search…" bind:value={openUrl} disabled={busy === 'open'} on:focus={(e) => (e.target as HTMLInputElement).select()} on:keydown={(e) => e.key === 'Enter' && doOpen()} />
+      <button class="iconplain" on:click={() => setTheme(theme === 'dark' ? 'light' : 'dark')} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light / dark mode">
+        <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
+      </button>
     </div>
   </div>
 
@@ -647,7 +648,7 @@
       <span class="livepill" title="Streaming screenshots"><span class="livedot"></span>LIVE</span>
     </div>
         <!-- Single persistent <img>: src swaps only after the new frame decodes. -->
-        <div class="shotwrap">
+        <div class="shotwrap" class:dim={pageLoading}>
           <img
             id="live-shot"
             bind:this={shotImg}

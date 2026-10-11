@@ -95,6 +95,17 @@ header .status {
   padding: 12px 14px;
   margin-bottom: 12px;
 }
+/* Fused address-bar + live-view surface: no gap, no double border. */
+.card.flush-bottom {
+  margin-bottom: 0;
+  border-bottom: 0;
+  border-radius: 12px 12px 0 0;
+}
+.card.flush-top {
+  margin-top: 0;
+  border-top: 0;
+  border-radius: 0 0 12px 12px;
+}
 .banner {
   background: var(--banner-warn-bg);
   border: 1px solid var(--banner-warn-border);
@@ -161,6 +172,7 @@ button.iconbtn .icon {
 }
 .browserbar .iconplain:hover:not(:disabled) { background: var(--ghost-bg); opacity: 1; }
 .browserbar .iconplain:disabled { opacity: 0.4; }
+.browserbar .iconplain.is-disabled { opacity: 0.35; cursor: default; }
 .browserbar .iconplain .icon {
   width: 1.25em;
   height: 1.25em;
@@ -189,8 +201,8 @@ img.shot {
   /* Keep the whole live view + its toolbar inside the initial viewport so no
      vertical scrolling is needed to drive the page. JS mapping accounts for
      the resulting letterbox (see imgToPage). */
-  max-height: calc(100vh - 340px);
-  max-height: calc(100svh - 340px);
+  max-height: calc(100vh - 280px);
+  max-height: calc(100svh - 280px);
   object-fit: contain;
   border-radius: 8px;
   border: 1px solid var(--input-border);
@@ -208,6 +220,8 @@ img.shot.actionable {
 }
 /* Fake cursor overlay: positioned like imgToPage in reverse. */
 .shotwrap { position: relative; }
+.shotwrap img.shot { transition: opacity 0.25s ease; }
+.shotwrap.dim img.shot { opacity: 0.5; }
 .cursorlayer {
   position: absolute;
   inset: 0;
@@ -341,7 +355,7 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
   align-items: center;
   gap: 4px;
   overflow-x: auto;
-  padding: 6px 4px;
+  padding: 6px 0 0;
   margin-bottom: 10px;
   scrollbar-width: thin;
 }
