@@ -24,47 +24,54 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("SB_SERVER").ok())
         .unwrap_or_else(|| "http://127.0.0.1:8765".to_string());
     let tab = cli.tab;
+    // Passcode precedence: --passcode flag > LB_PASSCODE > LB_PASSWORD (compat) > none.
+    let passcode = cli
+        .passcode
+        .clone()
+        .or_else(|| std::env::var("LB_PASSWORD").ok())
+        .filter(|s| !s.is_empty());
+    let pass = passcode.as_deref();
 
     match cli.command {
-        Commands::Daemon(args) => daemon::run_daemon(args).await,
-        Commands::Open { url, json } => client::open(&server, &url, tab, json).await,
-        Commands::Status { json } => client::status(&server, tab, json).await,
-        Commands::List { json } => client::list(&server, json).await,
-        Commands::Close { tab: t, json } => client::close(&server, t.or(tab), json).await,
-        Commands::Use { tab: t, json } => client::use_tab(&server, t, json).await,
-        Commands::Snapshot { json, full } => client::snapshot(&server, tab, json, full).await,
-        Commands::Shot { out } => client::shot(&server, tab, Some(out.as_str())).await,
-        Commands::Click { target, json } => client::click(&server, &target, tab, json).await,
-        Commands::ClickAt { x, y, json } => client::click_at(&server, x, y, tab, json).await,
-        Commands::Hover { x, y, json } => client::hover(&server, x, y, tab, json).await,
-        Commands::Scroll { dx, dy, json } => client::scroll(&server, dx, dy, tab, json).await,
+        Commands::Daemon(args) => daemon::run_daemon(args, passcode).await,
+        Commands::Open { url, json } => client::open(&server, pass, &url, tab, json).await,
+        Commands::Status { json } => client::status(&server, pass, tab, json).await,
+        Commands::List { json } => client::list(&server, pass, json).await,
+        Commands::Close { tab: t, json } => client::close(&server, pass, t.or(tab), json).await,
+        Commands::Use { tab: t, json } => client::use_tab(&server, pass, t, json).await,
+        Commands::Snapshot { json, full } => client::snapshot(&server, pass, tab, json, full).await,
+        Commands::Shot { out } => client::shot(&server, pass, tab, Some(out.as_str())).await,
+        Commands::Click { target, json } => client::click(&server, pass, &target, tab, json).await,
+        Commands::ClickAt { x, y, json } => client::click_at(&server, pass, x, y, tab, json).await,
+        Commands::Hover { x, y, json } => client::hover(&server, pass, x, y, tab, json).await,
+        Commands::Scroll { dx, dy, json } => client::scroll(&server, pass, dx, dy, tab, json).await,
         Commands::Wheel { x, y, dy, dx, json } => {
-            client::wheel(&server, x, y, dx, dy, tab, json).await
+            client::wheel(&server, pass, x, y, dx, dy, tab, json).await
         }
         Commands::Drag { x1, y1, x2, y2, steps, json } => {
-            client::drag(&server, x1, y1, x2, y2, steps, tab, json).await
+            client::drag(&server, pass, x1, y1, x2, y2, steps, tab, json).await
         }
-        Commands::Zoom { action, json } => client::zoom(&server, &action, tab, json).await,
+        Commands::Zoom { action, json } => client::zoom(&server, pass, &action, tab, json).await,
         Commands::Type {
             target,
             text,
             submit,
             json,
-        } => client::type_text(&server, &target, &text, submit, tab, json).await,
-        Commands::Press { key, json } => client::press(&server, &key, tab, json).await,
+        } => client::type_text(&server, pass, &target, &text, submit, tab, json).await,
+        Commands::Press { key, json } => client::press(&server, pass, &key, tab, json).await,
         Commands::Select { target, value, json } => {
-            client::select(&server, &target, &value, tab, json).await
+            client::select(&server, pass, &target, &value, tab, json).await
         }
-        Commands::Insert { text, json } => client::insert(&server, &text, tab, json).await,
-        Commands::Eval { js, json } => client::eval(&server, &js, tab, json).await,
-        Commands::Back { json } => client::nav(&server, "back", tab, json).await,
-        Commands::Forward { json } => client::nav(&server, "forward", tab, json).await,
-        Commands::Reload { json } => client::nav(&server, "reload", tab, json).await,
+        Commands::Insert { text, json } => client::insert(&server, pass, &text, tab, json).await,
+        Commands::Eval { js, json } => client::eval(&server, pass, &js, tab, json).await,
+        Commands::Back { json } => client::nav(&server, pass, "back", tab, json).await,
+        Commands::Forward { json } => client::nav(&server, pass, "forward", tab, json).await,
+        Commands::Reload { json } => client::nav(&server, pass, "reload", tab, json).await,
         Commands::Handover { message, timeout } => {
-            client::handover(&server, &message, tab, timeout).await
+            client::handover(&server, pass, &message, tab, timeout).await
         }
-        Commands::HandoverDone { json } => client::handover_done(&server, tab, json).await,
-        Commands::Claim { message, json } => client::claim(&server, &message, tab, json).await,
-        Commands::Log { json } => client::log(&server, json).await,
+        Commands::HandoverDone { json } => client::handover_done(&server, pass, tab, json).await,
+        Commands::Claim { message, json } => client::claim(&server, pass, &message, tab, json).await,
+        Commands::Log { json } => client::log(&server, pass, json).await,
     }
 }

@@ -62,6 +62,131 @@ struct AppState {
     tabs: Arc<Mutex<Tabs>>,
     browser: Arc<Mutex<Browser>>,
     log: Arc<Mutex<Vec<LogEntry>>>,
+    /// Optional passcode guarding the HTTP API. `None`/empty = open server.
+    passcode: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Passcode auth (optional, like `opencode web` + OPENCODE_SERVER_PASSWORD)
+// ---------------------------------------------------------------------------
+
+/// True when `req` carries the configured passcode, via any of:
+/// - `Authorization: Bearer <code>`
+/// - `Authorization: Basic <base64(user:code)>` (password part must match;
+///   username is ignored, so browsers / curl `--user x:<code>` just work)
+/// - `x-lb-passcode: <code>` header (what the `lb` CLI and web UI send)
+/// - `?passcode=<code>` (or `?password=`) query (what `<img>` tags need,
+///   since they can't set headers)
+fn request_has_passcode(req: &axum::http::Request<axum::body::Body>, passcode: &str) -> bool {
+    if let Some(v) = req.headers().get("x-lb-passcode") {
+        if v.as_bytes() == passcode.as_bytes() {
+            return true;
+        }
+    }
+    if let Some(v) = req.headers().get(axum::http::header::AUTHORIZATION) {
+        if let Ok(s) = v.to_str() {
+            if let Some(token) = s.strip_prefix("Bearer ") {
+                if token.trim() == passcode {
+                    return true;
+                }
+            } else if let Some(b64) = s.strip_prefix("Basic ") {
+                if let Ok(decoded) = base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    b64.trim(),
+                ) {
+                    // `user:password` — password may itself contain ':'.
+                    if let Some(idx) = decoded.iter().rposition(|b| *b == b':') {
+                        if &decoded[idx + 1..] == passcode.as_bytes() {
+                            return true;
+                        }
+                    } else if decoded.as_slice() == passcode.as_bytes() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // Query fallback for <img src="/api/screenshot"> and quick curl checks.
+    if let Some(q) = req.uri().query() {
+        for pair in q.split('&') {
+            let (k, v) = match pair.split_once('=') {
+                Some(x) => x,
+                None => continue,
+            };
+            if k == "passcode" || k == "password" {
+                // Query values are percent-encoded; decode minimally.
+                let decoded = percent_decode(v);
+                if decoded == passcode {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Axum middleware guarding every `/api/*` route. Open server (no passcode
+/// configured) lets everything through; otherwise missing/wrong credentials
+/// get a 401 JSON (deliberately *without* `WWW-Authenticate`, so browsers
+/// show our login form instead of a native dialog).
+async fn require_passcode(
+    State(s): State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> impl IntoResponse {
+    // Only gate the JSON API + screenshots; the static UI stays public so
+    // it can render its own passcode form.
+    if !req.uri().path().starts_with("/api/") {
+        return next.run(req).await;
+    }
+    let configured = s.passcode.clone().unwrap_or_default();
+    if configured.is_empty() {
+        return next.run(req).await;
+    }
+    if request_has_passcode(&req, &configured) {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")],
+        axum::Json(serde_json::json!({
+            "ok": false,
+            "error": "unauthorized — wrong or missing passcode (set --passcode / LB_PASSCODE)",
+        }))
+        .to_string(),
+    )
+        .into_response()
 }
 
 /// Resolve a tab selector (None = active tab) to its id + a Page handle.
@@ -1447,7 +1572,24 @@ fn detect_chrome() -> Option<String> {
     None
 }
 
-pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
+pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()> {
+    // Normalize: empty string = no passcode. Fall back to LB_PASSWORD for
+    // folks coming from OPENCODE_SERVER_PASSWORD-style setups.
+    let passcode = passcode
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("LB_PASSWORD")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+    if passcode.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+        // Mirror `opencode web`: loud opt-in warning, not a hard failure.
+        eprintln!("\x1b[1;33m!\tLB_PASSCODE is not set; server is unsecured.\x1b[0m");
+        eprintln!("\x1b[33m\tSet a passcode with --passcode <code> or LB_PASSCODE=<code> lb daemon.\x1b[0m");
+        tracing::warn!("LB_PASSCODE is not set; server is unsecured");
+    } else {
+        tracing::info!("passcode protection enabled");
+    }
     let profile = args.profile.clone().unwrap_or_else(default_profile_dir);
     std::fs::create_dir_all(&profile).ok();
 
@@ -1525,8 +1667,11 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
             action: "daemon".into(),
             detail: "browser launched".into(),
         }])),
+        passcode: passcode.clone(),
     };
 
+    // `/api/*` goes behind the passcode gate (when configured); the static
+    // UI itself stays public so it can render its own login form.
     let app = Router::new()
         .route("/", get(ui_index))
         .route("/api/status", get(api_status))
@@ -1557,6 +1702,7 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         .route("/api/tabs", get(api_tabs))
         .route("/api/close", post(api_close))
         .route("/api/activate", post(api_activate))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), require_passcode))
         // Live tool: nothing is cacheable (stale tabs/snapshots caused real
         // confusion — the UI once needed a manual refresh to show new tabs).
         .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
@@ -1571,8 +1717,15 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
     println!("live-browser daemon ready");
     println!("  UI:  http://{addr}/");
     println!("  API: http://{addr}/api/status");
+    if passcode.is_some() {
+        println!("  auth: passcode protection enabled");
+    }
     println!("CLI example:");
-    println!("  lb --server http://{addr} open https://example.com");
+    if passcode.is_some() {
+        println!("  lb --server http://{addr} --passcode <code> open https://example.com");
+    } else {
+        println!("  lb --server http://{addr} open https://example.com");
+    }
     println!("  lb --server http://{addr} snapshot");
     println!("  lb --server http://{addr} handover \"please log in, then click Done in the UI\"");
     axum::serve(listener, app).await?;
