@@ -1326,8 +1326,56 @@ const PLACEHOLDER_HTML: &str = r#"<!doctype html><html><body style="font-family:
 // Daemon entrypoint
 // ---------------------------------------------------------------------------
 
-pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
-    let profile = args.profile.clone().unwrap_or_else(|| {
+/// Default persistent browser-profile dir, per OS convention:
+/// - Windows: `%LOCALAPPDATA%\live-browser\profile`
+/// - macOS:   `~/Library/Caches/live-browser/profile`
+/// - Linux:   `$XDG_CACHE_HOME/live-browser/profile` (else `~/.cache/…`)
+fn default_profile_dir() -> String {
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            if !local.is_empty() {
+                return std::path::PathBuf::from(local)
+                    .join("live-browser")
+                    .join("profile")
+                    .to_string_lossy()
+                    .to_string();
+            }
+        }
+        // Fallback: %USERPROFILE%\AppData\Local\…
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            return std::path::PathBuf::from(home)
+                .join("AppData")
+                .join("Local")
+                .join("live-browser")
+                .join("profile")
+                .to_string_lossy()
+                .to_string();
+        }
+        return "live-browser-profile".to_string();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let base = std::path::PathBuf::from(home).join("Library").join("Caches");
+        let dir = base.join("live-browser").join("profile");
+        // Migrate a profile created by an older version that used ~/.cache.
+        let legacy = std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+        )
+        .join(".cache")
+        .join("live-browser")
+        .join("profile");
+        if !dir.exists() && legacy.exists() {
+            std::fs::create_dir_all(dir.parent().unwrap()).ok();
+            if std::fs::rename(&legacy, &dir).is_ok() {
+                tracing::info!("migrated browser profile from {}", legacy.display());
+            }
+        }
+        return dir.to_string_lossy().to_string();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
         let base = std::env::var("XDG_CACHE_HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
@@ -1341,7 +1389,66 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
             tracing::info!("migrated browser profile from {}", legacy.display());
         }
         dir.to_string_lossy().to_string()
-    });
+    }
+}
+
+/// Best-effort Chrome/Chromium auto-detect for `--chrome` default.
+/// `chromiumoxide` already searches PATH + standard locations, so this only
+/// pins well-known absolute paths that are *not* on PATH.
+fn detect_chrome() -> Option<String> {
+    let candidates: &[&str] = if cfg!(windows) {
+        &[
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+    } else {
+        &[
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]
+    };
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            return Some(c.to_string());
+        }
+    }
+    // Windows per-user install (%LOCALAPPDATA%) — path depends on env.
+    #[cfg(windows)]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let p = std::path::PathBuf::from(local)
+            .join("Google")
+            .join("Chrome")
+            .join("Application")
+            .join("chrome.exe");
+        if p.exists() {
+            return Some(p.to_string_lossy().to_string());
+        }
+    }
+    // macOS per-user ~/Applications install.
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = std::env::var("HOME") {
+        for app in [
+            "Google Chrome.app/Contents/MacOS/Google Chrome",
+            "Chromium.app/Contents/MacOS/Chromium",
+        ] {
+            let p = std::path::PathBuf::from(&home).join("Applications").join(app);
+            if p.exists() {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
+pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
+    let profile = args.profile.clone().unwrap_or_else(default_profile_dir);
     std::fs::create_dir_all(&profile).ok();
 
     let mut cfg = BrowserConfig::builder()
@@ -1352,8 +1459,8 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
 
     if let Some(chrome) = &args.chrome {
         cfg = cfg.chrome_executable(chrome.as_str());
-    } else if std::path::Path::new("/usr/bin/google-chrome-stable").exists() {
-        cfg = cfg.chrome_executable("/usr/bin/google-chrome-stable");
+    } else if let Some(detected) = detect_chrome() {
+        cfg = cfg.chrome_executable(detected);
     }
 
     if args.headless {

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# Live Browser installer (Linux x86_64).
+# Live Browser installer (Linux + macOS).
 #
 #   curl -fsSL https://raw.githubusercontent.com/anslwy/live-browser/main/install.sh | bash
 #
 # What it does by default (fast path):
-#   1. installs a browser (distro Chromium, or Google Chrome as fallback)
+#   1. installs a browser (distro Chromium/Chrome on Linux, Chrome cask on macOS)
 #   2. downloads the latest prebuilt `lb` release (binary + web UI)
 #   3. installs to ~/.local (override with PREFIX=/usr/local)
 #
@@ -28,9 +28,25 @@ msg() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+OS="$(uname -s)"
 ARCH="$(uname -m)"
-[[ "$ARCH" == "x86_64" ]] || err "only x86_64 is supported yet (found: $ARCH)"
-[[ "$(uname -s)" == "Linux" ]] || err "only Linux is supported yet"
+
+# Normalize to release-asset platform/arch names.
+case "$OS" in
+  Linux) PLATFORM="linux" ;;
+  Darwin) PLATFORM="darwin" ;;
+  *) err "unsupported OS: $OS (Linux and macOS only — on Windows use install.ps1)" ;;
+esac
+case "$ARCH" in
+  x86_64) ASSET_ARCH="x86_64" ;;
+  arm64|aarch64)
+    if [[ "$PLATFORM" == "darwin" ]]; then ASSET_ARCH="arm64";
+    else ASSET_ARCH="aarch64"; fi ;;
+  *) err "unsupported architecture: $ARCH (x86_64, or arm64 on macOS)" ;;
+esac
+if [[ "$PLATFORM" == "linux" && "$ASSET_ARCH" == "aarch64" ]]; then
+  err "prebuilt Linux arm64 binaries are not published yet — re-run with --from-source"
+fi
 
 if ! have curl && ! have wget; then err "need curl or wget"; fi
 if ! have tar; then err "need tar"; fi
@@ -43,6 +59,19 @@ fetch() { # fetch <url> <out>
 install_browser() {
   if have google-chrome-stable || have google-chrome || have chromium || have chromium-browser; then
     msg "browser already installed ($(command -v google-chrome-stable google-chrome chromium chromium-browser 2>/dev/null | head -1))"
+    return
+  fi
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    if [[ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]]; then
+      msg "browser already installed (/Applications/Google Chrome.app)"
+      return
+    fi
+    msg "installing Google Chrome…"
+    if have brew; then
+      brew install --cask google-chrome
+    else
+      err "no browser found — install Google Chrome from https://www.google.com/chrome/ (or 'brew install --cask google-chrome'), then re-run"
+    fi
     return
   fi
   msg "installing a browser…"
@@ -85,9 +114,18 @@ install_node() {
   msg "installing node 22 (user-local, no sudo)…"
   mkdir -p "$PREFIX"
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-  fetch "https://nodejs.org/dist/v22.21.0/node-v22.21.0-linux-x64.tar.xz" "$tmp/node.tar.xz"
+  # Node dist names: linux-x64, linux-arm64, darwin-x64, darwin-arm64.
+  case "${PLATFORM}-${ARCH}" in
+    linux-x86_64) NODE_PLAT="linux-x64" ;;
+    linux-aarch64|linux-arm64) NODE_PLAT="linux-arm64" ;;
+    darwin-arm64|darwin-aarch64) NODE_PLAT="darwin-arm64" ;;
+    darwin-x86_64) NODE_PLAT="darwin-x64" ;;
+    *) err "unsupported platform for node download: ${PLATFORM}-${ARCH}" ;;
+  esac
+  NODE_VER="v22.21.0"
+  fetch "https://nodejs.org/dist/${NODE_VER}/node-${NODE_VER}-${NODE_PLAT}.tar.xz" "$tmp/node.tar.xz"
   tar -xJf "$tmp/node.tar.xz" -C "$tmp"
-  cp -r "$tmp"/node-v22.21.0-linux-x64/. "$PREFIX/"
+  cp -r "$tmp"/node-${NODE_VER}-${NODE_PLAT}/. "$PREFIX/"
   export PATH="$PREFIX/bin:$PATH"
 }
 
@@ -100,10 +138,11 @@ install_release() {
     TAG="$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" | grep -m1 '"tag_name"' | cut -d'"' -f4)"
   fi
   [[ -n "${TAG:-}" ]] || err "could not determine latest release (network? rate limit?)"
-  ASSET="live-browser-${TAG}-linux-x86_64.tar.gz"
+  ASSET="live-browser-${TAG}-${PLATFORM}-${ASSET_ARCH}.tar.gz"
   msg "installing ${ASSET}…"
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-  fetch "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}" "$tmp/pkg.tar.gz"
+  fetch "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}" "$tmp/pkg.tar.gz" \
+    || err "no prebuilt binary for ${PLATFORM}-${ASSET_ARCH} yet — re-run with --from-source"
   rm -rf "$LB_HOME"
   mkdir -p "$LB_HOME" "$BIN_DIR"
   tar -xzf "$tmp/pkg.tar.gz" -C "$tmp"
@@ -119,8 +158,13 @@ install_from_source() {
   export PATH="$HOME/.cargo/bin:$PREFIX/bin:$PATH"
   work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
   msg "cloning ${REPO}…"
-  git clone --depth 1 "https://github.com/${REPO}.git" "$work/repo" 2>/dev/null \
-    || err "need git to build from source (sudo apt-get install -y git)"
+  if [[ "$PLATFORM" == "darwin" ]]; then
+    git clone --depth 1 "https://github.com/${REPO}.git" "$work/repo" 2>/dev/null \
+      || err "need git (xcode-select --install, or brew install git)"
+  else
+    git clone --depth 1 "https://github.com/${REPO}.git" "$work/repo" 2>/dev/null \
+      || err "need git to build from source (sudo apt-get install -y git)"
+  fi
   cd "$work/repo"
   msg "building web UI…"
   (cd web && npm ci && npm run build)

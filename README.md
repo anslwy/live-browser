@@ -13,13 +13,21 @@ agent drives via CLI  ──►  lb daemon (Chrome via CDP + JSON API)
                                     │
 user watches + takes over ──►  web UI (live screenshot, handover banner)
 ```
-## Install (Linux x86_64)
+## Install (Linux x86_64, macOS arm64/x86_64, Windows x86_64)
 
 One line — installs a browser (Chromium/Chrome) plus the latest prebuilt
-`lb` release into `~/.local`:
+`lb` release into `~/.local` (Windows: `%LOCALAPPDATA%\live-browser`):
+
+Linux / macOS:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/anslwy/live-browser/main/install.sh | bash
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/anslwy/live-browser/main/install.ps1 | iex
 ```
 
 Then:

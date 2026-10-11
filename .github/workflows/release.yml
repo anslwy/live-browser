@@ -49,3 +49,107 @@ jobs:
         with:
           files: ${{ env.ASSET }}
           generate_release_notes: true
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (both mac targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - name: Build binary (native arm64)
+        run: cargo build --release
+
+      - name: Build binary (Intel x86_64, best-effort cross)
+        id: intel
+        continue-on-error: true
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Native arm64 asset (always).
+          OUT="live-browser-${TAG}-darwin-arm64"
+          mkdir -p "pkg/${OUT}/web"
+          cp target/release/lb "pkg/${OUT}/lb"
+          cp -r web/dist "pkg/${OUT}/web/dist"
+          cp README.md install.sh "pkg/${OUT}/"
+          tar -czf "${OUT}.tar.gz" -C pkg "${OUT}"
+          ASSETS="${OUT}.tar.gz"
+          # Intel asset when the cross build succeeded.
+          if [[ -f target/x86_64-apple-darwin/release/lb ]]; then
+            OUT="live-browser-${TAG}-darwin-x86_64"
+            mkdir -p "pkg/${OUT}/web"
+            cp target/x86_64-apple-darwin/release/lb "pkg/${OUT}/lb"
+            cp -r web/dist "pkg/${OUT}/web/dist"
+            cp README.md install.sh "pkg/${OUT}/"
+            tar -czf "${OUT}.tar.gz" -C pkg "${OUT}"
+            ASSETS="$ASSETS ${OUT}.tar.gz"
+          else
+            echo "WARNING: Intel cross build unavailable — Intel Macs can install with --from-source"
+          fi
+          echo "ASSETS=${ASSETS}" >> "$GITHUB_ENV"
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSETS }}
+          generate_release_notes: true
+
+  windows-x86_64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - name: Build binary
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
+          $out = "live-browser-$tag-windows-x86_64"
+          New-Item -ItemType Directory -Path "pkg/$out/web" -Force | Out-Null
+          Copy-Item "target/release/lb.exe" "pkg/$out/lb.exe"
+          Copy-Item "web/dist" "pkg/$out/web/dist" -Recurse -Force
+          Copy-Item "README.md", "install.ps1" "pkg/$out/"
+          Compress-Archive -Path "pkg/$out" -DestinationPath "$out.zip" -Force
+          "ASSET=$out.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
