@@ -1463,34 +1463,68 @@ fn dist_dir() -> std::path::PathBuf {
 /// - Windows: `%LOCALAPPDATA%\live-browser\profile`
 /// - macOS:   `~/Library/Caches/live-browser/profile`
 /// - Linux:   `$XDG_CACHE_HOME/live-browser/profile` (else `~/.cache/…`)
-fn default_profile_dir() -> String {
+// Base dir for live-browser state (profile + pidfile): %LOCALAPPDATA% on
+// Windows, ~/Library/Caches on macOS, $XDG_CACHE_HOME (else ~/.cache)
+// on Linux.
+pub(crate) fn cache_base() -> std::path::PathBuf {
     #[cfg(windows)]
     {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             if !local.is_empty() {
-                return std::path::PathBuf::from(local)
-                    .join("live-browser")
-                    .join("profile")
-                    .to_string_lossy()
-                    .to_string();
+                return std::path::PathBuf::from(local);
             }
         }
         // Fallback: %USERPROFILE%\AppData\Local\…
         if let Ok(home) = std::env::var("USERPROFILE") {
-            return std::path::PathBuf::from(home)
-                .join("AppData")
-                .join("Local")
-                .join("live-browser")
-                .join("profile")
-                .to_string_lossy()
-                .to_string();
+            if !home.is_empty() {
+                return std::path::PathBuf::from(home)
+                    .join("AppData")
+                    .join("Local");
+            }
         }
-        return "live-browser-profile".to_string();
+        return std::env::temp_dir();
     }
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let base = std::path::PathBuf::from(home).join("Library").join("Caches");
+        return std::path::PathBuf::from(home).join("Library").join("Caches");
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::env::var("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                std::path::PathBuf::from(home).join(".cache")
+            })
+    }
+}
+
+/// Pidfile for the daemon serving `port` (one daemon per port).
+/// Written on startup, removed on clean shutdown; `lb web stop` uses it.
+pub(crate) fn pid_file(port: u16) -> std::path::PathBuf {
+    cache_base()
+        .join("live-browser")
+        .join(format!("daemon-{port}.pid"))
+}
+
+pub(crate) fn default_profile_dir() -> String {
+    let base = cache_base();
+    #[cfg(windows)]
+    {
+        let dir = base.join("live-browser").join("profile");
+        if dir.exists() {
+            return dir.to_string_lossy().to_string();
+        }
+        // Fallback when LOCALAPPDATA/USERPROFILE are both missing (service
+        // accounts): a profile dir next to the pidfile fallback.
+        if base == std::env::temp_dir() {
+            return base.join("live-browser-profile").to_string_lossy().to_string();
+        }
+        return dir.to_string_lossy().to_string();
+    }
+    #[cfg(target_os = "macos")]
+    {
         let dir = base.join("live-browser").join("profile");
         // Migrate a profile created by an older version that used ~/.cache.
         let legacy = std::path::PathBuf::from(
@@ -1509,12 +1543,6 @@ fn default_profile_dir() -> String {
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let base = std::env::var("XDG_CACHE_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                std::path::PathBuf::from(home).join(".cache")
-            });
         let dir = base.join("live-browser").join("profile");
         // One-time migration from the old `simple-browser` profile location.
         let legacy = base.join("simple-browser").join("profile");
@@ -1593,7 +1621,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     if passcode.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true) {
         // Mirror `opencode web`: loud opt-in warning, not a hard failure.
         eprintln!("\x1b[1;33m!\tLB_PASSCODE is not set; server is unsecured.\x1b[0m");
-        eprintln!("\x1b[33m\tSet a passcode with --passcode <code> or LB_PASSCODE=<code> lb daemon.\x1b[0m");
+        eprintln!("\x1b[33m\tSet a passcode with --passcode <code> or LB_PASSCODE=<code> lb web.\x1b[0m");
         tracing::warn!("LB_PASSCODE is not set; server is unsecured");
     } else {
         tracing::info!("passcode protection enabled");
@@ -1677,6 +1705,9 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         }])),
         passcode: passcode.clone(),
     };
+    // Kept for shutdown: closing the browser releases the profile lock so
+    // the next `lb web` starts clean (no orphaned Chrome).
+    let browser_handle = state.browser.clone();
 
     // `/api/*` goes behind the passcode gate (when configured); the static
     // UI itself stays public so it can render its own login form.
@@ -1721,7 +1752,21 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .with_state(state);
 
     let addr = format!("127.0.0.1:{}", args.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+        anyhow::anyhow!(
+            "cannot bind {addr}: {e:#} — is another `lb web` already running? (`lb web stop` stops it)"
+        )
+    })?;
+    // Record our pid so `lb web stop` / `lb web restart` can find us.
+    // A stale file from a crashed daemon is tolerated: stop verifies
+    // liveness before trusting it.
+    let pid = pid_file(args.port);
+    if let Some(parent) = pid.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if let Err(e) = std::fs::write(&pid, std::process::id().to_string()) {
+        tracing::warn!("could not write pid file {}: {e:#}", pid.display());
+    }
     // Say exactly which binary and UI dir are in play: a stale `lb` earlier
     // on PATH (or a moved install dir) otherwise shows up only as a
     // mysterious missing UI in the browser.
@@ -1754,6 +1799,41 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     }
     println!("  lb --server http://{addr} snapshot");
     println!("  lb --server http://{addr} handover \"please log in, then click Done in the UI\"");
-    axum::serve(listener, app).await?;
+    println!("  (stop this server with: lb web --port {} stop)", args.port);
+    // Ctrl-C / SIGTERM: shut down the HTTP server, then close the browser
+    // (releasing the profile lock) and remove the pidfile, so `lb web stop`
+    // / `restart` and the next start find a clean slate. SIGKILL can't be
+    // caught — `stop` reaps those leftovers by profile dir.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    {
+        let mut b = browser_handle.lock().await;
+        tracing::info!("closing browser …");
+        let _ = tokio::time::timeout(Duration::from_secs(10), b.close()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), b.wait()).await;
+        tracing::info!("browser closed");
+    }
+    std::fs::remove_file(pid_file(args.port)).ok();
     Ok(())
+}
+
+/// Fires on Ctrl-C everywhere, and on SIGTERM on Unix (that's what
+/// `lb web stop` and most supervisors send).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => {},
+            _ = int.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

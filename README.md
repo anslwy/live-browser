@@ -9,8 +9,8 @@ judgment calls, then hand back. Neither side steps on the other.
 ![Live Browser UI](docs/ui.png)
 
 ```
-agent drives via CLI  ──►  lb daemon (Chrome via CDP + JSON API)
-                                    │
+agent drives via CLI  ──►  lb web (Chrome via CDP + JSON API)
+                                     │
 user watches + takes over ──►  web UI (live screenshot, handover banner)
 ```
 ## Install (Linux x86_64, macOS arm64/x86_64, Windows x86_64)
@@ -34,7 +34,7 @@ Then:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"  # if not already set
-lb daemon --port 8765
+lb web --port 8765
 ```
 
 Prefer building from source (installs Rust + Node toolchains, clones and
@@ -85,12 +85,16 @@ cd web && npm install && npm run build   # builds the monitor UI into web/dist
 
 ```sh
 # Headed (default): visible browser window so a human can take over.
-lb daemon --port 8765
+lb web --port 8765
 
 # Headless (servers, CI — no human takeover possible):
-lb daemon --port 8765 --headless --no-sandbox
+lb web --port 8765 --headless --no-sandbox
 
-# Useful daemon flags:
+# Stop / restart the server (port flag goes before the subcommand):
+lb web --port 8765 stop
+lb web --port 8765 restart
+
+# Useful server flags:
 #   --chrome /path/to/chrome   (auto-detects /usr/bin/google-chrome-stable)
 #   --profile DIR              (persistent profile; keeps logins)
 #   --url URL                  (page to open on start)
@@ -102,7 +106,7 @@ without one the daemon prints `! LB_PASSCODE is not set; server is unsecured.`
 and anyone on the machine can drive the browser.
 
 ```sh
-LB_PASSCODE=secret lb daemon --port 8765          # set it (env preferred over --passcode flag, which leaks via `ps`)
+LB_PASSCODE=secret lb web --port 8765          # set it (env preferred over --passcode flag, which leaks via `ps`)
 LB_PASSCODE=secret lb status                      # every CLI command needs the same value
 # Web UI asks for the passcode once and remembers it in localStorage.
 # Raw HTTP also works:  curl -H "x-lb-passcode: secret" http://127.0.0.1:8765/api/status
@@ -115,6 +119,9 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 
 | Command | What it does |
 |---|---|
+| `lb web [--port N] [flags]` | Start the browser + web UI server (old `lb daemon` still works) |
+| `lb web --port N stop` | Stop the running server |
+| `lb web --port N restart` | Stop (if running) and start a new server |
 | `lb open <URL\|text>` | Navigate the tab (plain text searches Google) |
 | `lb status` | URL, title, handover state |
 | `lb snapshot` | Interactive elements as `[ref] tag "name"` (`--json` for full JSON) |
@@ -167,6 +174,7 @@ src/main.rs    CLI entry (clap)
 src/cli.rs     command definitions
 src/client.rs  thin HTTP client (each command → daemon API)
 src/daemon.rs  Chrome (chromiumoxide/CDP) + Axum API + static UI server
+src/webctl.rs  `lb web stop`/`restart` (pidfile lifecycle)
 web/           Svelte 5 + TS + Vite monitor app (build → web/dist)
 ```
 

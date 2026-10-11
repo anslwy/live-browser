@@ -27,7 +27,7 @@
   let keysOn = true;
   let keyChain: Promise<void> = Promise.resolve();
 
-  // Optional daemon passcode (set via `lb daemon --passcode` / LB_PASSCODE).
+  // Optional daemon passcode (set via `lb web --passcode` / LB_PASSCODE).
   // Persisted locally so a reload doesn't lock the UI out again.
   let passcode: string =
     typeof localStorage !== 'undefined' ? localStorage.getItem('lb-passcode') ?? '' : '';
@@ -465,7 +465,7 @@
         connected = false;
       } else {
         connected = false;
-        error = 'daemon unreachable — is `lb daemon` running?';
+        error = 'daemon unreachable — is `lb web` running?';
       }
     }
   }
