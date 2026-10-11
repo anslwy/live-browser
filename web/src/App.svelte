@@ -12,6 +12,9 @@
   let status: Status | null = null;
   let connected = false;
   let shotUrl = '/api/screenshot';
+  // Hash of the frame currently shown. Sent as `?have=` so the server can
+  // reply `304 Not Modified` (headers only) instead of re-sending the JPEG.
+  let lastShotHash: string | null = null;
   let openUrl = '';
   let snapshot: SnapEl[] = [];
   let snapHint = '';
@@ -39,11 +42,18 @@
     return passcode ? { 'x-lb-passcode': passcode } : {};
   }
 
+  function screenshotFetchUrl(): string {
+    // No `t=` cache-buster: the server replies `304` when `have` matches,
+    // so identical frames cost a tiny header instead of ~47kB of JPEG.
+    const params = new URLSearchParams();
+    if (passcode) params.set('passcode', passcode);
+    if (lastShotHash) params.set('have', lastShotHash);
+    const qs = params.toString();
+    return qs ? `/api/screenshot?${qs}` : '/api/screenshot';
+  }
+
   function shotUrlWithAuth(): string {
-    const q = passcode
-      ? `passcode=${encodeURIComponent(passcode)}&t=${Date.now()}`
-      : `t=${Date.now()}`;
-    return `/api/screenshot?${q}`;
+    return screenshotFetchUrl();
   }
 
   async function apiFetch(url: string, opts: RequestInit = {}): Promise<Response> {
@@ -72,7 +82,7 @@
       await handleTabLinkParam();
     } catch {}
     if (!needAuth) {
-      shotUrl = shotUrlWithAuth();
+      lastShotHash = null;
       requestShot();
     }
   }
@@ -294,7 +304,7 @@
     } finally {
       busy = '';
     }
-    refreshShot();
+    requestShot();
     await fetchStatus();
     await loadSnapshot();
   }
@@ -568,28 +578,55 @@
   // Coalescing refresh: at most one screenshot request in flight; every
   // interaction marks a frame pending and it fires ASAP after the current one
   // lands. Frames preload off-DOM and swap on decode (no blink, no jump).
+  // Unchanged frames (HTTP 304) keep the current <img> untouched.
   function requestShot() {
     shotPending = true;
-    pumpShot();
+    void pumpShot();
   }
 
-  function pumpShot() {
+  async function pumpShot() {
     if (shotLoading || !shotPending) return;
     shotPending = false;
     shotLoading = true;
-    // <img> can't set headers, so the passcode travels as a query param.
-    const url = shotUrlWithAuth();
-    const pre = new Image();
-    pre.onload = () => {
-      shotUrl = url;
+    try {
+      // Passcode travels as a header (primary) and query param (fallback);
+      // `have` carries the hash of the frame we already show.
+      const res = await fetch(screenshotFetchUrl(), { headers: authHeaders() });
+      if (res.status === 304) {
+        // Identical frame — keep current image, no decode cost.
+      } else if (res.ok) {
+        const etag = res.headers.get('ETag') ?? res.headers.get('X-Image-Hash') ?? '';
+        const hash = etag.replace(/^W\//, '').replace(/"/g, '').trim() || null;
+        const blob = await res.blob();
+        const objUrl = URL.createObjectURL(blob);
+        await new Promise<void>((resolve) => {
+          const pre = new Image();
+          pre.onload = () => {
+            if (shotUrl.startsWith('blob:')) {
+              try { URL.revokeObjectURL(shotUrl); } catch {}
+            }
+            shotUrl = objUrl;
+            // Only remember the hash once the frame actually decodes.
+            if (hash) lastShotHash = hash;
+            resolve();
+          };
+          pre.onerror = () => {
+            try { URL.revokeObjectURL(objUrl); } catch {}
+            resolve();
+          };
+          pre.src = objUrl;
+        });
+      } else if (res.status === 401) {
+        needAuth = true;
+      }
+      // Other errors: keep old frame, retry on next tick.
+    } catch {
+      // Daemon unreachable — liveness tick retries; keep old frame.
+    } finally {
       shotLoading = false;
-      pumpShot();
-    };
-    pre.onerror = () => {
-      shotLoading = false;
-      pumpShot();
-    };
-    pre.src = url;
+      measureShot();
+      if (shotPending) void pumpShot();
+    }
   }
 
   // Theme (persisted): applied pre-paint by index.html, mirrored here.
