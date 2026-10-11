@@ -599,6 +599,25 @@
   // view as a loading indication until the new page settles.
   $: pageLoading = busy === 'open' || busy === 'back' || busy === 'forward' || busy === 'reload';
 
+  // Address-bar select-all: Safari places the caret on mouseup, which runs
+  // *after* focus and clobbers select() (Chrome keeps the selection).
+  // Defer the selection a tick and swallow the mouseup of a fresh focus.
+  let addrJustFocused = false;
+  function addrFocus(e: FocusEvent) {
+    const el = e.currentTarget as HTMLInputElement;
+    addrJustFocused = true;
+    requestAnimationFrame(() => el.select());
+    setTimeout(() => {
+      if (document.activeElement === el && addrJustFocused) el.select();
+    }, 0);
+  }
+  function addrMouseUp(e: MouseEvent) {
+    if (addrJustFocused) {
+      e.preventDefault();
+      addrJustFocused = false;
+    }
+  }
+
   async function doOpen() {
     if (!openUrl.trim()) return;
     busy = 'open';
@@ -772,7 +791,7 @@
           <Icon name="external" />
         </span>
       {/if}
-      <input id="addr-bar" class="omnibox" type="text" placeholder="Type a URL or search…" bind:value={openUrl} disabled={busy === 'open'} on:focus={(e) => (e.target as HTMLInputElement).select()} on:keydown={(e) => e.key === 'Enter' && doOpen()} />
+      <input id="addr-bar" class="omnibox" type="text" placeholder="Type a URL or search…" bind:value={openUrl} disabled={busy === 'open'} on:focus={addrFocus} on:mouseup={addrMouseUp} on:blur={() => (addrJustFocused = false)} on:keydown={(e) => e.key === 'Enter' && doOpen()} />
       <button class="iconplain" on:click={() => setTheme(theme === 'dark' ? 'light' : 'dark')} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light / dark mode">
         <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
       </button>
