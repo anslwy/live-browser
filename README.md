@@ -1,10 +1,8 @@
-# 🌐 Live Browser
-
 **One browser, two drivers — you and your agent, in the same tab, at the same time.**
 
 Drive any page from the CLI (`lb click`, `lb type`, `lb snapshot`, …) while
 watching the live view — and grab control yourself for logins, captchas, and
-judgment calls, then hand back. Neither side steps on the other.
+judgment calls, then hand back. You can see where agents get stuck and unstuck them by using the Web UI, just like the way how you use the browser.
 
 ![Live Browser UI](docs/ui.png)
 
@@ -183,9 +181,3 @@ src/webctl.rs  `lb web stop`/`restart` (pidfile lifecycle)
 src/update.rs  `lb update` + startup update reminder
 web/           Svelte 5 + TS + Vite monitor app (build → web/dist)
 ```
-
-## Minimal on purpose
-
-Single tab, single browser, polling screenshots — no multi-tab orchestration, no WebSocket
-streaming, no remote input injection in the UI (the human uses the real browser window).
-Those are the obvious next steps if this workflow proves useful.
