@@ -143,6 +143,54 @@ pub async fn binary_version(path: &str) -> Option<String> {
     }
 }
 
+/// Headless smoke run in a throwaway profile: proves the binary can actually
+/// drive a page (`--headless --dump-dom about:blank`) — `--version` alone is
+/// not enough (a binary can print its version yet die on launch, e.g. the
+/// connection dropping before the first tab). Runs BEFORE the running browser
+/// is touched, so a dud is rejected with its own stderr attached while the
+/// old browser is still up.
+pub async fn smoke_test_headless(binary: &str, no_sandbox: bool) -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("lb-smoke-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let mut args = vec![
+        "--headless".to_string(),
+        "--disable-gpu".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        format!("--user-data-dir={}", dir.display()),
+        "--dump-dom".to_string(),
+        "about:blank".to_string(),
+    ];
+    if no_sandbox {
+        args.push("--no-sandbox".to_string());
+    }
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        tokio::process::Command::new(binary).args(&args).output(),
+    )
+    .await;
+    std::fs::remove_dir_all(&dir).ok();
+    match run {
+        Err(_) => anyhow::bail!("smoke run timed out after 45s (first launch can be slow — retry)"),
+        Ok(Err(e)) => anyhow::bail!("smoke run failed to spawn: {e:#}"),
+        Ok(Ok(o)) if o.status.success() => Ok(()),
+        Ok(Ok(o)) => anyhow::bail!("smoke run exited {}: {}", o.status, output_tail(&o)),
+    }
+}
+
+/// Last ~1500 chars of stderr (else stdout) for error display.
+fn output_tail(o: &std::process::Output) -> String {
+    let err = String::from_utf8_lossy(&o.stderr);
+    let src = if err.trim().is_empty() {
+        String::from_utf8_lossy(&o.stdout)
+    } else {
+        err
+    };
+    let tail: String = src.chars().rev().take(1500).collect::<String>().chars().rev().collect();
+    tail.trim().to_string()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InstalledCloak {
     pub version: String,

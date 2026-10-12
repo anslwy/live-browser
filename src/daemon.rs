@@ -2864,11 +2864,12 @@ struct BrowsersUseReq {
     version: Option<String>,
 }
 
-/// Switch the running browser in-process: validate the target binary, close
-/// the old browser (releasing the profile lock), launch the new one on the
-/// same profile, and reset to a single blank tab. Bounded throughout so the
-/// UI always gets a response; on failure the old browser is relaunched and
-/// the error is reported.
+/// Switch the running browser in-process: pre-validate the target (version +
+/// headless smoke run) while the old browser is still up, then close the old
+/// browser, launch the new one on the same profile, and reset to a single
+/// blank tab. Bounded throughout; ANY post-close failure rolls back to the
+/// previous binary, so the daemon is never left browserless and the UI never
+/// claims a switch that didn't happen.
 async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseReq>) -> Json<serde_json::Value> {
     let kind = b.kind.trim().to_lowercase();
     let target: String = match kind.as_str() {
@@ -2899,67 +2900,85 @@ async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseRe
         Some(v) => tracing::info!("switching browser to {target} ({v})"),
         None => return err(format!("{target} would not run (`--version` failed)")),
     }
+    let no_sandbox = s.launch.lock().await.no_sandbox;
+    if let Err(e) = crate::cloak::smoke_test_headless(&target, no_sandbox).await {
+        return err(format!("{target} failed a headless smoke run, old browser untouched: {e:#}"));
+    }
     s.push_log("browser", &format!("switching to {target}"));
     // Lock ordering (browser → launch → tabs → log) is exclusive to this
     // endpoint, so holding across the relaunch is deadlock-free.
     let mut browser = s.browser.lock().await;
-    // Close the old browser first (releases the profile lock).
+    // Close the old browser first (releases the profile lock), then settle
+    // briefly so slow platforms release it before the new launch.
     {
         let _ = tokio::time::timeout(Duration::from_secs(10), browser.close()).await;
         let _ = tokio::time::timeout(Duration::from_secs(10), browser.wait()).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
     }
     let mut launch = s.launch.lock().await.clone();
     let previous = launch.chrome.clone();
     launch.chrome = Some(target.clone());
-    let new_browser = match build_browser_config(&launch) {
-        Ok(cfg) => match tokio::time::timeout(Duration::from_secs(75), Browser::launch(cfg)).await {
-            Ok(Ok((nb, handler))) => {
-                spawn_browser_watcher(handler);
-                Some(nb)
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("browser switch launch failed: {e:#}");
-                None
-            }
-            Err(_) => None,
-        },
-        Err(e) => {
-            tracing::warn!("browser switch config failed: {e}");
-            None
+    match launch_with_page(&launch).await {
+        Ok((nb, page)) => {
+            install_fresh_browser(&s, &mut browser, launch.clone(), nb, page).await;
+            s.push_log("browser", &format!("now using {target} (tabs reset)"));
+            Json(serde_json::json!({ "ok": true, "message": format!("now using {target} (open tabs were reset)") }))
         }
-    };
-    let nb = match new_browser {
-        Some(nb) => nb,
-        None => {
-            // Roll back to the previous binary so the daemon keeps serving.
+        Err(stage) => {
+            // Roll back so the daemon is never left browserless.
             launch.chrome = previous;
-            match build_browser_config(&launch) {
-                Ok(cfg) => match Browser::launch(cfg).await {
-                    Ok((rb, handler)) => {
-                        spawn_browser_watcher(handler);
-                        *browser = rb;
-                        BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-                        return err("new browser failed to launch — rolled back to the previous one".into());
-                    }
-                    Err(e) => {
-                        mark_browser_dead();
-                        return err(format!("new browser failed AND rollback failed ({e:#}) — restart with `lb web restart`"));
-                    }
-                },
-                Err(e) => return err(format!("rollback config failed: {e}")),
+            match launch_with_page(&launch).await {
+                Ok((rb, page)) => {
+                    let prev = launch.chrome.clone().unwrap_or_default();
+                    install_fresh_browser(&s, &mut browser, launch.clone(), rb, page).await;
+                    s.push_log("browser", &format!("switch failed ({stage}) — rolled back to {prev}"));
+                    err(format!("switch failed ({stage}) — still on the previous browser (tabs were reset)"))
+                }
+                Err(e2) => {
+                    mark_browser_dead();
+                    err(format!("switch failed ({stage}) AND rollback failed ({e2}) — restart with `lb web restart`"))
+                }
             }
         }
-    };
-    // Fresh browser → fresh tabs (single blank tab, like a restart).
-    let page = match nb.new_page("about:blank").await {
-        Ok(p) => p,
-        Err(e) => {
-            return err(format!("switched browser but the first tab failed: {e:#} — reload the UI"));
+    }
+}
+
+/// Launch `launch` and open a first blank tab: the shared relaunch path for
+/// switches and rollbacks. Spawns the generation-guarded watcher per launch.
+/// The first tab is retried (first launches can be slow — macOS verifies the
+/// bundle); a half-dead browser is dropped (child reaped) on failure.
+async fn launch_with_page(launch: &LaunchConfig) -> Result<(Browser, Page), String> {
+    let cfg = build_browser_config(launch).map_err(|e| format!("bad browser config: {e}"))?;
+    let (nb, handler) = tokio::time::timeout(Duration::from_secs(75), Browser::launch(cfg))
+        .await
+        .map_err(|_| "launch timed out after 75s (first launch can be slow — retry)".to_string())?
+        .map_err(|e| format!("launch failed: {e:#}"))?;
+    spawn_browser_watcher(handler);
+    let mut last = String::new();
+    for attempt in 1..=3 {
+        match tokio::time::timeout(Duration::from_secs(20), nb.new_page("about:blank")).await {
+            Ok(Ok(p)) => return Ok((nb, p)),
+            Ok(Err(e)) => last = format!("{e:#}"),
+            Err(_) => last = "first tab timed out after 20s".into(),
         }
-    };
-    *browser = nb;
+        tracing::warn!("browser (re)launch: first tab attempt {attempt} failed ({last})");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Err(format!("first tab failed after 3 tries ({last})"))
+}
+
+/// Install a freshly launched browser as current: single blank tab (like a
+/// restart), dialog guard armed, launch config stored.
+async fn install_fresh_browser(
+    s: &AppState,
+    browser_guard: &mut tokio::sync::MutexGuard<'_, Browser>,
+    launch: LaunchConfig,
+    nb: Browser,
+    page: Page,
+) {
+    **browser_guard = nb;
     BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-    s.launch.lock().await.chrome = launch.chrome.clone();
+    s.launch.lock().await.chrome = launch.chrome;
     {
         let mut t = s.tabs.lock().await;
         t.map.clear();
@@ -2977,8 +2996,6 @@ async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseRe
         t.next_id = 2;
     }
     spawn_dialog_guard(page, s.log.clone(), 1);
-    s.push_log("browser", &format!("now using {target} (tabs reset)"));
-    Json(serde_json::json!({ "ok": true, "message": format!("now using {target} (open tabs were reset)") }))
 }
 
 // ---------------------------------------------------------------------------
