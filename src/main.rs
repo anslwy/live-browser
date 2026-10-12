@@ -1,5 +1,6 @@
 mod cli;
 mod client;
+mod cloak;
 mod daemon;
 mod mcp;
 mod update;
