@@ -111,10 +111,6 @@ lb web --port 8765 restart
 #   --passcode CODE             (optional API+UI guard; env LB_PASSCODE)
 ```
 
-Optional passcode (like `opencode web` + `OPENCODE_SERVER_PASSWORD`):
-without one the daemon prints `! LB_PASSCODE is not set; server is unsecured.`
-and anyone on the machine can drive the browser.
-
 ```sh
 LB_PASSCODE=secret lb web --port 8765          # set it (env preferred over --passcode flag, which leaks via `ps`)
 LB_PASSCODE=secret lb status                      # every CLI command needs the same value
