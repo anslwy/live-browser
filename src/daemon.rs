@@ -3553,10 +3553,12 @@ fn tailscale_ipv4() -> Option<String> {
 /// Launch the startup browser and open the first page. On a first-page
 /// failure the half-launched browser is closed (releasing the profile lock)
 /// so a fallback launch starts clean.
-async fn startup_browser(
-    launch: &LaunchConfig,
-    start_url: &str,
-) -> Result<(Browser, chromiumoxide::handler::Handler, Page)> {
+///
+/// NOTE: the handler must be driven *before* `new_page` — `new_page` sends
+/// its `CreateTarget` via the handler task, so awaiting it with an
+/// undriven handler deadlocks forever (every `lb web` start hung at
+/// "launching chrome …" with the browser listening but the daemon silent).
+async fn startup_browser(launch: &LaunchConfig, start_url: &str) -> Result<(Browser, Page)> {
     let cfg = build_browser_config(launch)
         .map_err(|e| anyhow::anyhow!("invalid browser config: {e}"))?;
     tracing::info!(
@@ -3567,13 +3569,28 @@ async fn startup_browser(
     let (mut browser, handler) = Browser::launch(cfg)
         .await
         .context("failed to launch Chrome — try --chrome /path/to/chrome or --no-sandbox")?;
-    match browser.new_page(start_url).await {
-        Ok(page) => Ok((browser, handler, page)),
-        Err(e) => {
+    // Drive the handler before any page operation (see NOTE above).
+    BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    spawn_browser_watcher(handler);
+    // Bound the first tab: first launches can be slow (macOS verifies the
+    // bundle), but a wedged renderer must never hang startup forever.
+    let page = match tokio::time::timeout(Duration::from_secs(30), browser.new_page(start_url)).await
+    {
+        Ok(Ok(page)) => page,
+        Ok(Err(e)) => {
             let _ = tokio::time::timeout(Duration::from_secs(10), browser.close()).await;
-            Err(anyhow::anyhow!("failed to open browser page: {e:#}"))
+            let _ = tokio::time::timeout(Duration::from_secs(10), browser.wait()).await;
+            return Err(anyhow::anyhow!("failed to open browser page: {e:#}"));
         }
-    }
+        Err(_) => {
+            let _ = tokio::time::timeout(Duration::from_secs(10), browser.close()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), browser.wait()).await;
+            return Err(anyhow::anyhow!(
+                "failed to open browser page: first tab timed out after 30s"
+            ));
+        }
+    };
+    Ok((browser, page))
 }
 
 pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()> {
@@ -3609,7 +3626,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     // *persisted* choice failing must never wedge startup — fall back to
     // system Chrome so the daemon (and the UI switch) still comes up.
     let explicit_chrome = args.chrome.as_ref().is_some_and(|c| !c.trim().is_empty());
-    let (browser, handler, page) = match startup_browser(&launch, &start_url).await {
+    let (browser, page) = match startup_browser(&launch, &start_url).await {
         Ok(x) => x,
         Err(e) if !explicit_chrome && launch.chrome.is_some() => {
             let bad = launch.chrome.clone().unwrap_or_default();
@@ -3640,11 +3657,10 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         save_persisted_chrome(launch.chrome.as_deref());
     }
 
-    // Drive the browser handler in the background. When this loop ends the
-    // browser connection is dead — record it so CDP error mapping can tell
-    // "browser died" (restart) apart from "one tab died" (close the tab).
+    // The startup browser's handler is already driven (spawned inside
+    // `startup_browser` before the first tab — `new_page` needs it). Just
+    // ensure the alive flag is set for the CDP error mapping below.
     BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-    spawn_browser_watcher(handler);
 
     let mut tabs_map = std::collections::HashMap::new();
     tabs_map.insert(
