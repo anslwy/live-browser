@@ -23,8 +23,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Pinned free version used when the GitHub releases API is unreachable.
-pub const FALLBACK_FREE_VERSION: &str = "146.0.7680.177.5";
+/// Pinned free version per platform, mirroring the cloakbrowser wrapper's
+/// `PLATFORM_CHROMIUM_VERSIONS` (free builds are NOT all cut from the same
+/// Chromium — e.g. macOS lags Linux). Used when the releases API is
+/// unreachable; [`latest_free_version`] is preferred when online.
+pub fn fallback_free_version() -> &'static str {
+    match platform_tag() {
+        Ok("linux-arm64") => "146.0.7680.177.3",
+        Ok("darwin-arm64") | Ok("darwin-x64") => "145.0.7632.109.2",
+        // linux-x64, windows-x64, and unknown (unreachable: platform_tag
+        // errors first, but stay on the newest pin regardless).
+        _ => "146.0.7680.177.5",
+    }
+}
 
 /// `linux-x64` / `linux-arm64` / `darwin-arm64` / `darwin-x64` / `windows-x64`.
 pub fn platform_tag() -> Result<&'static str> {
@@ -151,15 +162,16 @@ pub fn installed() -> Vec<InstalledCloak> {
 
 /// Newest free version from the GitHub releases API: first non-draft
 /// `chromium-v*` tag shipping this platform's tarball (wrapper's rule).
-/// `None` when offline / rate-limited — callers fall back to
-/// [`FALLBACK_FREE_VERSION`].
+/// Scans deep — per-platform free builds can sit well below the newest
+/// (Pro-only) tags. `None` when offline / rate-limited — callers fall back
+/// to [`fallback_free_version`].
 pub async fn latest_free_version() -> Option<String> {
     let archive = archive_name().ok()?;
     // NOTE: GitHub API 403s requests without a User-Agent.
     let client = reqwest::Client::builder().user_agent("live-browser").build().ok()?;
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        client.get("https://api.github.com/repos/CloakHQ/CloakBrowser/releases?per_page=20").send(),
+        std::time::Duration::from_secs(15),
+        client.get("https://api.github.com/repos/CloakHQ/CloakBrowser/releases?per_page=100").send(),
     )
     .await
     .ok()?
@@ -364,7 +376,7 @@ pub async fn download_free(version: Option<String>, state: Arc<Mutex<DownloadSta
     let archive = archive_name()?;
     let version = match version {
         Some(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => latest_free_version().await.unwrap_or_else(|| FALLBACK_FREE_VERSION.to_string()),
+        _ => latest_free_version().await.unwrap_or_else(|| fallback_free_version().to_string()),
     };
     set(&state, |d| {
         *d = DownloadState { phase: DlPhase::Downloading, version: version.clone(), received: 0, total: None, message: "starting…".into() };
@@ -504,4 +516,66 @@ pub async fn download_free(version: Option<String>, state: Arc<Mutex<DownloadSta
     })
     .await;
     Ok(bin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lb-cloak-test-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Windows path: `.zip` archives (single top-level dir) must flatten and
+    /// yield the `chrome.exe` binary, exercising the branch no unix CI host
+    /// otherwise touches.
+    #[test]
+    fn extract_zip_flattens_and_finds_binary() {
+        let dir = scratch("zip");
+        let archive = dir.join("cloakbrowser-windows-x64.zip");
+        {
+            let f = std::fs::File::create(&archive).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("cloakbrowser-win/chrome.exe", opts).unwrap();
+            use std::io::Write;
+            zip.write_all(b"fake-binary").unwrap();
+            zip.start_file("cloakbrowser-win/other.pak", opts).unwrap();
+            zip.write_all(b"pak").unwrap();
+            zip.finish().unwrap();
+        }
+        let staging = dir.join("staging");
+        extract_staged(&archive, &staging, PathBuf::from("chrome.exe").as_path()).unwrap();
+        assert!(staging.join("chrome.exe").is_file());
+        assert!(staging.join("other.pak").is_file());
+        assert!(!staging.join("cloakbrowser-win").exists());
+    }
+
+    /// `.tar.gz` archives extract as-is (wrapper uses strip=0).
+    #[test]
+    fn extract_tarball_keeps_layout() {
+        let dir = scratch("tar");
+        let archive = dir.join("cloakbrowser-linux-x64.tar.gz");
+        {
+            let f = std::fs::File::create(&archive).unwrap();
+            let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(gz);
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_size(4);
+            hdr.set_mode(0o755);
+            hdr.set_cksum();
+            tar.append_data(&mut hdr, "chrome", b"fake".as_slice()).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let staging = dir.join("staging");
+        extract_staged(&archive, &staging, PathBuf::from("chrome").as_path()).unwrap();
+        assert!(staging.join("chrome").is_file());
+    }
 }
