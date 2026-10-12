@@ -111,6 +111,21 @@ lb web --port 8765 restart
 #   --passcode CODE             (optional API+UI guard; env LB_PASSCODE)
 ```
 
+## Bot-walled sites (403s)
+
+Some sites (CloudFront WAF, x.com, …) block stock automated Chrome. When a
+site 403s, point `lb` at a stealth Chromium via the existing `--chrome`
+flag — it is an opt-in dependency, not bundled:
+
+```sh
+# CloakBrowser (https://github.com/CloakHQ/CloakBrowser) — patched Chromium;
+# free older build, latest via free/paid key:
+npm install cloakbrowser && npx cloakbrowser install
+# `npx cloakbrowser info` shows the exact binary path (versioned dir):
+lb web --port 8765 --chrome ~/.cloakbrowser/chromium-*/chrome
+# Tip: --headed (visible window) also looks less bot-like than headless.
+```
+
 ```sh
 LB_PASSCODE=secret lb web --port 8765          # set it (env preferred over --passcode flag, which leaks via `ps`)
 LB_PASSCODE=secret lb status                      # every CLI command needs the same value
