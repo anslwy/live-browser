@@ -320,6 +320,79 @@ where
     }
 }
 
+/// Adopt browser pages the page opened itself (`target=_blank` links,
+/// `window.open` popups): they bypass our tab map, so without this a click
+/// on an "open in new tab" link appears to do nothing in the live view.
+/// The newest adopted tab becomes active (foreground-open semantics).
+/// Cheap: `browser.pages()` is an in-memory handler query (no CDP round
+/// trip), and inserts are re-checked under the tabs lock so concurrent
+/// reconciles can't double-adopt the same target.
+async fn reconcile_tabs(s: &AppState) {
+    let pages = {
+        let browser = s.browser.lock().await;
+        match tokio::time::timeout(TAB_PROBE_TIMEOUT, browser.pages()).await {
+            Ok(Ok(p)) => p,
+            _ => return,
+        }
+    };
+    if pages.is_empty() {
+        return;
+    }
+    // Snapshot known targets (no CDP while holding the tabs lock).
+    let known: Vec<_> = {
+        let t = s.tabs.lock().await;
+        t.map.values().map(|ts| ts.page.target_id().clone()).collect()
+    };
+    let strays: Vec<Page> = pages
+        .into_iter()
+        .filter(|p| !known.contains(p.target_id()))
+        .collect();
+    if strays.is_empty() {
+        return;
+    }
+    // Resolve URLs before taking the tabs lock (bounded: a wedged renderer
+    // must not stall tab bookkeeping).
+    let mut fresh: Vec<(Page, String)> = vec![];
+    for p in strays {
+        let url = tokio::time::timeout(TAB_PROBE_TIMEOUT, p.url())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten()
+            .unwrap_or_default();
+        fresh.push((p, url));
+    }
+    let mut adopted: Vec<(Page, u32)> = vec![];
+    {
+        let mut t = s.tabs.lock().await;
+        for (page, url) in fresh {
+            // Re-check under the lock: a concurrent reconcile may have
+            // adopted this target after our snapshot.
+            if t.map.values().any(|ts| ts.page.target_id() == page.target_id()) {
+                continue;
+            }
+            let id = t.next_id;
+            t.next_id += 1;
+            t.map.insert(
+                id,
+                TabState {
+                    page: page.clone(),
+                    handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
+                    zoom: 1.0,
+                    cursor: CursorState::default(),
+                    last_url: url,
+                },
+            );
+            t.active = id;
+            adopted.push((page, id));
+        }
+    }
+    for (page, id) in adopted {
+        spawn_dialog_guard(page, s.log.clone(), id);
+        s.push_log("open/tab", &format!("tab {id} opened by the page (adopted)"));
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct LogEntry {
     at: String,
@@ -626,6 +699,8 @@ async fn api_status(
     State(s): State<AppState>,
     Query(q): Query<TabQuery>,
 ) -> Json<serde_json::Value> {
+    // Adopt page-opened tabs first so the live view follows target=_blank links.
+    reconcile_tabs(&s).await;
     let (tab_id, page) = tab!(&s, q.tab);
     // Bounded reads: a wedged renderer must not hang even the status call.
     // Falls back to the last known URL so status stays useful.
@@ -2492,6 +2567,8 @@ async fn api_log(State(s): State<AppState>) -> Json<serde_json::Value> {
 /// whole listing — that used to brick `lb list`, `lb close` and `lb web link`
 /// daemon-wide (stale tabs are flagged so callers can see it).
 async fn api_tabs(State(s): State<AppState>) -> Json<serde_json::Value> {
+    // Adopt page-opened tabs first so the tab strip shows target=_blank links.
+    reconcile_tabs(&s).await;
     // Snapshot ids first so we don't hold the lock across CDP calls.
     let (ids, active) = {
         let t = s.tabs.lock().await;
