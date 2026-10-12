@@ -126,7 +126,7 @@ lb web --port 8765 --chrome ~/.cloakbrowser/chromium-*/chrome
 # Tip: --headed (visible window) also looks less bot-like than headless.
 # Or in the web UI: the gear icon in the address bar → Browser section lists
 # System Chrome vs CloakBrowser, downloads CloakBrowser with progress, and
-# switches the running browser in place (open tabs reset, logins persist).
+# switches the running browser in place (open tabs reset, logins persist per browser).
 ```
 
 ```sh
