@@ -87,24 +87,42 @@ struct LaunchConfig {
 
 impl LaunchConfig {
     fn from_args(args: &DaemonArgs) -> Self {
+        // Explicit --chrome / LB_CHROME wins; otherwise reuse the last
+        // Settings → Browser choice, if any. Nothing is persisted here: the
+        // choice is saved only after a successful launch (see run_daemon),
+        // so a bad --chrome value can never poison later starts.
         let chrome = match args.chrome.clone().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()) {
-            // Explicit --chrome / LB_CHROME wins and becomes the new persisted
-            // default, so the next `lb web` without flags keeps it.
-            Some(raw) => {
-                let resolved = resolve_chrome_path(&raw);
-                save_persisted_chrome(Some(&resolved));
-                Some(resolved)
-            }
-            // Otherwise reuse the last Settings → Browser choice, if any.
+            Some(raw) => Some(resolve_chrome_path(&raw)),
             None => load_persisted_chrome(),
         };
+        let base = args.profile.clone().unwrap_or_else(default_profile_dir);
         Self {
-            profile: args.profile.clone().unwrap_or_else(default_profile_dir),
+            // Same per-kind profile the Settings → Browser switch uses
+            // (system <-> base, cloak <-> base-cloak): an older build
+            // trap-crashes on a profile a newer one has touched, so a cloak
+            // restart must NOT reuse the system profile dir.
+            profile: launch_profile_for(&base, chrome.as_deref()),
             headed: !args.headless_mode(),
             no_sandbox: args.no_sandbox,
             chrome,
         }
     }
+}
+
+/// "cloak" for CloakBrowser paths, "system" for everything else (including
+/// auto-detect). Same heuristic as the kind detection in [`api_browsers`].
+fn chrome_kind(path: Option<&str>) -> &'static str {
+    match path {
+        Some(p) if p.contains(".cloakbrowser") || p.contains("cloak") => "cloak",
+        _ => "system",
+    }
+}
+
+/// Profile dir for `chrome` under `base`: the shared rule for startup and
+/// the Settings → Browser switch (see [`kind_profile`] — stable, so repeated
+/// switches and restarts land on the same dirs).
+fn launch_profile_for(base: &str, chrome: Option<&str>) -> String {
+    kind_profile(base, chrome_kind(chrome))
 }
 
 /// File holding the last browser-binary choice (`{"chrome": "<path>"}`).
@@ -3532,6 +3550,32 @@ fn tailscale_ipv4() -> Option<String> {
     }
 }
 
+/// Launch the startup browser and open the first page. On a first-page
+/// failure the half-launched browser is closed (releasing the profile lock)
+/// so a fallback launch starts clean.
+async fn startup_browser(
+    launch: &LaunchConfig,
+    start_url: &str,
+) -> Result<(Browser, chromiumoxide::handler::Handler, Page)> {
+    let cfg = build_browser_config(launch)
+        .map_err(|e| anyhow::anyhow!("invalid browser config: {e}"))?;
+    tracing::info!(
+        "launching chrome (profile: {}, {}) …",
+        launch.profile,
+        if launch.headed { "headed" } else { "headless" }
+    );
+    let (mut browser, handler) = Browser::launch(cfg)
+        .await
+        .context("failed to launch Chrome — try --chrome /path/to/chrome or --no-sandbox")?;
+    match browser.new_page(start_url).await {
+        Ok(page) => Ok((browser, handler, page)),
+        Err(e) => {
+            let _ = tokio::time::timeout(Duration::from_secs(10), browser.close()).await;
+            Err(anyhow::anyhow!("failed to open browser page: {e:#}"))
+        }
+    }
+}
+
 pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()> {
     // Normalize: empty string = no passcode. Fall back to LB_PASSWORD for
     // folks coming from OPENCODE_SERVER_PASSWORD-style setups.
@@ -3550,7 +3594,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     } else {
         tracing::info!("passcode protection enabled");
     }
-    let launch = LaunchConfig::from_args(&args);
+    let mut launch = LaunchConfig::from_args(&args);
     std::fs::create_dir_all(&launch.profile).ok();
     // Say which binary is in play: without this a restart that silently falls
     // back to system Chrome (stale persisted path, missing --chrome) is
@@ -3560,29 +3604,47 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         None => tracing::info!("browser binary: auto-detect (no --chrome, no saved choice)"),
     }
 
-    let cfg = build_browser_config(&launch)
-        .map_err(|e| anyhow::anyhow!("invalid browser config: {e}"))?;
-
-    tracing::info!(
-        "launching chrome (profile: {}, {}) …",
-        launch.profile,
-        if launch.headed { "headed" } else { "headless" }
-    );
-    let (browser, handler) = Browser::launch(cfg)
-        .await
-        .context("failed to launch Chrome — try --chrome /path/to/chrome or --no-sandbox")?;
+    let start_url = args.url.clone().unwrap_or_else(|| "about:blank".into());
+    // An explicit --chrome failure is the user's typo to fix (fail fast); a
+    // *persisted* choice failing must never wedge startup — fall back to
+    // system Chrome so the daemon (and the UI switch) still comes up.
+    let explicit_chrome = args.chrome.as_ref().is_some_and(|c| !c.trim().is_empty());
+    let (browser, handler, page) = match startup_browser(&launch, &start_url).await {
+        Ok(x) => x,
+        Err(e) if !explicit_chrome && launch.chrome.is_some() => {
+            let bad = launch.chrome.clone().unwrap_or_default();
+            tracing::warn!("saved browser {bad} failed to start ({e:#}) — falling back to system Chrome and clearing the saved choice");
+            eprintln!("\x1b[1;33m!\tsaved browser failed to start ({e:#}).\x1b[0m");
+            eprintln!("\x1b[33m\tFalling back to system Chrome and clearing the saved choice — switch back in the UI (gear icon → Browser) once it is up.\x1b[0m");
+            save_persisted_chrome(None);
+            launch.chrome = None;
+            launch.profile = launch_profile_for(
+                &args.profile.clone().unwrap_or_else(default_profile_dir),
+                None,
+            );
+            std::fs::create_dir_all(&launch.profile).ok();
+            startup_browser(&launch, &start_url).await.map_err(|e2| {
+                anyhow::anyhow!("browser failed to start with the saved choice ({e:#}) and with auto-detected system Chrome ({e2:#}) — try `lb web --chrome /path/to/chrome`")
+            })?
+        }
+        Err(e) => {
+            return Err(e.context(format!(
+                "browser failed to start (binary: {})",
+                launch_chrome_path(&launch).unwrap_or_else(|| "auto-detect".into())
+            )));
+        }
+    };
+    // The binary proved it launches: only now remember an explicit --chrome.
+    // A bad flag value must never be persisted (it would wedge later starts).
+    if explicit_chrome {
+        save_persisted_chrome(launch.chrome.as_deref());
+    }
 
     // Drive the browser handler in the background. When this loop ends the
     // browser connection is dead — record it so CDP error mapping can tell
     // "browser died" (restart) apart from "one tab died" (close the tab).
     BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     spawn_browser_watcher(handler);
-
-    let start_url = args.url.clone().unwrap_or_else(|| "about:blank".into());
-    let page = browser
-        .new_page(start_url.as_str())
-        .await
-        .context("failed to open browser page")?;
 
     let mut tabs_map = std::collections::HashMap::new();
     tabs_map.insert(
@@ -3940,6 +4002,40 @@ mod tests {
         let nomatch = format!("{}/nomatch-*/chrome", root.display());
         assert_eq!(resolve_chrome_path(&nomatch), nomatch);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn chrome_kind_detects_cloak_paths() {
+        assert_eq!(chrome_kind(None), "system");
+        assert_eq!(chrome_kind(Some("/usr/bin/google-chrome")), "system");
+        assert_eq!(chrome_kind(Some("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")), "system");
+        assert_eq!(
+            chrome_kind(Some(
+                "/Users/u/.cloakbrowser/chromium-145.0.7632.109.2/Chromium.app/Contents/MacOS/Chromium"
+            )),
+            "cloak"
+        );
+        assert_eq!(chrome_kind(Some("/opt/cloak/chrome")), "cloak");
+    }
+
+    /// Startup must land on the same per-kind profile the Settings → Browser
+    /// switch uses — otherwise a cloak restart reuses the system profile dir
+    /// and the older build trap-crashes on it (wedged daemon, no UI to
+    /// switch back). Regression test for exactly that.
+    #[test]
+    fn launch_profile_follows_browser_kind() {
+        let base = "/tmp/lb-profile";
+        assert_eq!(launch_profile_for(base, None), base);
+        assert_eq!(launch_profile_for(base, Some("/usr/bin/chrome")), base);
+        assert_eq!(
+            launch_profile_for(base, Some("/Users/u/.cloakbrowser/c/Chromium")),
+            "/tmp/lb-profile-cloak"
+        );
+        // Stable: an already-suffixed base is not doubled.
+        assert_eq!(
+            launch_profile_for("/tmp/lb-profile-cloak", Some("/x/cloak")),
+            "/tmp/lb-profile-cloak"
+        );
     }
 
     #[test]

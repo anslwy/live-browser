@@ -129,6 +129,9 @@ lb web --port 8765 --chrome ~/.cloakbrowser/chromium-*/chrome
 # switches the running browser in place (open tabs reset, logins persist per browser).
 # The choice is remembered (`~/.cache/live-browser/browser.json`), so the
 # next `lb web` without `--chrome` keeps it; `--chrome` overrides and re-saves.
+# A saved choice that no longer starts falls back to system Chrome (clearing
+# the saved choice) instead of wedging startup — each engine keeps its own
+# profile dir, so per-browser logins survive the round-trip.
 ```
 
 ```sh
