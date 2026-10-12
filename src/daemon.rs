@@ -283,6 +283,13 @@ fn segment_matches(pattern: &str, name: &str) -> bool {
     rec(pattern.as_bytes(), name.as_bytes())
 }
 
+/// Default startup / fresh-tab URL: the New Tab page (not `about:blank`).
+/// Chrome always opens one initial tab on launch (NTP — or the
+/// `-third-party` variant on ungoogled-chromium), so creating a second tab
+/// via `new_page` used to leave two tabs on every `lb web` start. Startup
+/// now reuses that initial tab instead (see [`startup_page`]).
+const DEFAULT_START_URL: &str = "chrome://new-tab-page/";
+
 /// Build the chromiumoxide config for `launch` (shared by startup and
 /// in-process browser switches — keep them identical).
 fn build_browser_config(launch: &LaunchConfig) -> Result<BrowserConfig, String> {
@@ -317,6 +324,13 @@ fn build_browser_config(launch: &LaunchConfig) -> Result<BrowserConfig, String> 
     cfg = cfg.args(vec![
         "--no-first-run",
         "--no-default-browser-check",
+        // Never restore a previous session on launch: a restored
+        // `chrome://settings/help` (or any other leftover) tab plus our
+        // startup tab is exactly the "two tabs on start" confusion. The
+        // startup path additionally closes stray tabs (see `startup_page`),
+        // these flags just keep Chrome from showing the restore bubble.
+        "--disable-session-crashed-bubble",
+        "--disable-infobars",
     ]);
     cfg.build().map_err(|e| anyhow::anyhow!(e).to_string())
 }
@@ -2898,13 +2912,13 @@ async fn api_close(State(s): State<AppState>, Json(b): Json<CloseReq>) -> Json<s
                 let _ = tokio::time::timeout(Duration::from_secs(10), ts.page.close()).await;
             });
             s.push_log("close", &format!("tab {tab_id} ({url})"));
-            // Never leave the daemon tabless: open a fresh blank tab.
+            // Never leave the daemon tabless: open a fresh New-Tab page.
             let mut t = s.tabs.lock().await;
             if t.map.is_empty() {
                 drop(t);
                 let fresh = {
                     let browser = s.browser.lock().await;
-                    tokio::time::timeout(CDP_TIMEOUT, browser.new_page("about:blank")).await
+                    tokio::time::timeout(CDP_TIMEOUT, browser.new_page(DEFAULT_START_URL)).await
                 };
                 match fresh {
                     Ok(Ok(fresh_page)) => {
@@ -2917,7 +2931,7 @@ async fn api_close(State(s): State<AppState>, Json(b): Json<CloseReq>) -> Json<s
                             handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
                             zoom: 1.0,
                             cursor: CursorState::default(),
-                            last_url: String::new(),
+                            last_url: DEFAULT_START_URL.into(),
                         });
                         t.active = id;
                         return ok(&format!("closed tab {tab_id}; opened fresh tab {id}"));
@@ -3059,7 +3073,7 @@ struct BrowsersUseReq {
 
 /// Switch the running browser in-process: pre-validate the target (version +
 /// headless smoke run) while the old browser is still up, then close the old
-/// browser, launch the new one, and reset to a single blank tab. Bounded
+/// browser, launch the new one, and reset to a single New-Tab page. Bounded
 /// throughout; ANY post-close failure rolls back to the previous binary, so
 /// the daemon is never left browserless and the UI never claims a switch
 /// that didn't happen.
@@ -3173,31 +3187,98 @@ fn kind_profile(base: &str, kind: &str) -> String {
     }
 }
 
-/// Launch `launch` and open a first blank tab: the shared relaunch path for
+/// Reuse Chrome's initial tab instead of opening a second one.
+///
+/// Chrome always opens one tab on launch (the New Tab page — or the
+/// `-third-party` variant on ungoogled-chromium). Calling `new_page` on top
+/// of that used to leave *two* tabs on every `lb web` start (one blank, one
+/// NTP — or a restored `chrome://settings/help` when the profile had session
+/// state), and `reconcile_tabs` then adopted the stray as a second lb tab.
+///
+/// This waits briefly for the initial target(s) to attach, navigates the
+/// first one to `start_url` (unless already there), closes any extras, and
+/// returns the single page. When no initial target appears it falls back to
+/// `new_page` (retried — first launches can be slow on macOS).
+async fn startup_page(browser: &Browser, start_url: &str) -> Result<Page, String> {
+    // Wait for the initial tab(s) Chrome opens by itself.
+    let mut initial: Vec<Page> = vec![];
+    for _ in 0..25 {
+        match tokio::time::timeout(Duration::from_millis(1000), browser.pages()).await {
+            Ok(Ok(pages)) if !pages.is_empty() => {
+                initial = pages;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+    if initial.is_empty() {
+        // No initial target (rare) — create one, retried like before.
+        let mut last = String::new();
+        for attempt in 1..=3 {
+            match tokio::time::timeout(Duration::from_secs(20), browser.new_page(start_url)).await {
+                Ok(Ok(p)) => return Ok(p),
+                Ok(Err(e)) => last = format!("{e:#}"),
+                Err(_) => last = "first tab timed out after 20s".into(),
+            }
+            tracing::warn!("browser (re)launch: first tab attempt {attempt} failed ({last})");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        return Err(format!("first tab failed after 3 tries ({last})"));
+    }
+    let primary = initial.remove(0);
+    // Close any extra initial/restored tabs (session restore, etc.) so
+    // startup always leaves exactly one tab.
+    for extra in initial {
+        let _ = tokio::time::timeout(Duration::from_secs(5), extra.close()).await;
+    }
+    if start_url == "about:blank" {
+        let _ = tokio::time::timeout(Duration::from_secs(5), primary.bring_to_front()).await;
+        return Ok(primary);
+    }
+    // Navigate the initial tab to the wanted URL unless already there.
+    // (`chrome://new-tab-page/` via `goto` works on both system Chrome and
+    // ungoogled-chromium — verified, no redirect to `chrome://settings/help`.)
+    let current = tokio::time::timeout(TAB_PROBE_TIMEOUT, primary.url())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten()
+        .unwrap_or_default();
+    if current != start_url {
+        match tokio::time::timeout(Duration::from_secs(25), primary.goto(start_url)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("startup tab goto {start_url} failed ({e:#}) — keeping {current}"),
+            Err(_) => tracing::warn!("startup tab goto {start_url} timed out — keeping {current}"),
+        }
+        // Let WebUI NTP settle; don't hard-fail startup on the wait.
+        let _ = tokio::time::timeout(Duration::from_secs(3), primary.wait_for_navigation()).await;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(5), primary.bring_to_front()).await;
+    Ok(primary)
+}
+
+/// Launch `launch` and open a first tab: the shared relaunch path for
 /// switches and rollbacks. Spawns the generation-guarded watcher per launch.
-/// The first tab is retried (first launches can be slow — macOS verifies the
-/// bundle); a half-dead browser is dropped (child reaped) on failure.
+/// Reuses Chrome's initial tab (see [`startup_page`); a half-dead browser
+/// is dropped (child reaped) on failure.
 async fn launch_with_page(launch: &LaunchConfig) -> Result<(Browser, Page), String> {
     let cfg = build_browser_config(launch).map_err(|e| format!("bad browser config: {e}"))?;
-    let (nb, handler) = tokio::time::timeout(Duration::from_secs(75), Browser::launch(cfg))
+    let (mut nb, handler) = tokio::time::timeout(Duration::from_secs(75), Browser::launch(cfg))
         .await
         .map_err(|_| "launch timed out after 75s (first launch can be slow — retry)".to_string())?
         .map_err(|e| format!("launch failed: {e:#}"))?;
     spawn_browser_watcher(handler);
-    let mut last = String::new();
-    for attempt in 1..=3 {
-        match tokio::time::timeout(Duration::from_secs(20), nb.new_page("about:blank")).await {
-            Ok(Ok(p)) => return Ok((nb, p)),
-            Ok(Err(e)) => last = format!("{e:#}"),
-            Err(_) => last = "first tab timed out after 20s".into(),
+    match startup_page(&nb, DEFAULT_START_URL).await {
+        Ok(p) => Ok((nb, p)),
+        Err(last) => {
+            let _ = tokio::time::timeout(Duration::from_secs(10), nb.close()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), nb.wait()).await;
+            Err(format!("first tab failed after 3 tries ({last})"))
         }
-        tracing::warn!("browser (re)launch: first tab attempt {attempt} failed ({last})");
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    Err(format!("first tab failed after 3 tries ({last})"))
 }
 
-/// Install a freshly launched browser as current: single blank tab (like a
+/// Install a freshly launched browser as current: single New-Tab page (like a
 /// restart), dialog guard armed, launch config stored.
 async fn install_fresh_browser(
     s: &AppState,
@@ -3215,6 +3296,13 @@ async fn install_fresh_browser(
     }
     // Remember the switch so the next `lb web` (no --chrome flag) keeps it.
     save_persisted_chrome(launch.chrome.as_deref());
+    // Record the actual URL (normally the New Tab page).
+    let last_url = tokio::time::timeout(TAB_PROBE_TIMEOUT, page.url())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten()
+        .unwrap_or_else(|| DEFAULT_START_URL.into());
     {
         let mut t = s.tabs.lock().await;
         t.map.clear();
@@ -3225,7 +3313,7 @@ async fn install_fresh_browser(
                 handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
                 zoom: 1.0,
                 cursor: CursorState::default(),
-                last_url: "about:blank".into(),
+                last_url,
             },
         );
         t.active = 1;
@@ -3554,10 +3642,10 @@ fn tailscale_ipv4() -> Option<String> {
 /// failure the half-launched browser is closed (releasing the profile lock)
 /// so a fallback launch starts clean.
 ///
-/// NOTE: the handler must be driven *before* `new_page` — `new_page` sends
-/// its `CreateTarget` via the handler task, so awaiting it with an
-/// undriven handler deadlocks forever (every `lb web` start hung at
-/// "launching chrome …" with the browser listening but the daemon silent).
+/// NOTE: the handler must be driven *before* any page operation — page
+/// operations send via the handler task, so awaiting them with an undriven
+/// handler deadlocks forever (every `lb web` start hung at "launching
+/// chrome …" with the browser listening but the daemon silent).
 async fn startup_browser(launch: &LaunchConfig, start_url: &str) -> Result<(Browser, Page)> {
     let cfg = build_browser_config(launch)
         .map_err(|e| anyhow::anyhow!("invalid browser config: {e}"))?;
@@ -3572,25 +3660,25 @@ async fn startup_browser(launch: &LaunchConfig, start_url: &str) -> Result<(Brow
     // Drive the handler before any page operation (see NOTE above).
     BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     spawn_browser_watcher(handler);
-    // Bound the first tab: first launches can be slow (macOS verifies the
-    // bundle), but a wedged renderer must never hang startup forever.
-    let page = match tokio::time::timeout(Duration::from_secs(30), browser.new_page(start_url)).await
+    // Reuse Chrome's initial tab (single-tab startup) instead of opening a
+    // second one. Bound the whole step: first launches can be slow (macOS
+    // verifies the bundle), but a wedged renderer must never hang startup.
+    match tokio::time::timeout(Duration::from_secs(60), startup_page(&browser, start_url)).await
     {
-        Ok(Ok(page)) => page,
+        Ok(Ok(page)) => Ok((browser, page)),
         Ok(Err(e)) => {
             let _ = tokio::time::timeout(Duration::from_secs(10), browser.close()).await;
             let _ = tokio::time::timeout(Duration::from_secs(10), browser.wait()).await;
-            return Err(anyhow::anyhow!("failed to open browser page: {e:#}"));
+            Err(anyhow::anyhow!("failed to open browser page: {e}"))
         }
         Err(_) => {
             let _ = tokio::time::timeout(Duration::from_secs(10), browser.close()).await;
             let _ = tokio::time::timeout(Duration::from_secs(10), browser.wait()).await;
-            return Err(anyhow::anyhow!(
-                "failed to open browser page: first tab timed out after 30s"
-            ));
+            Err(anyhow::anyhow!(
+                "failed to open browser page: first tab timed out after 60s"
+            ))
         }
-    };
-    Ok((browser, page))
+    }
 }
 
 pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()> {
@@ -3621,7 +3709,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         None => tracing::info!("browser binary: auto-detect (no --chrome, no saved choice)"),
     }
 
-    let start_url = args.url.clone().unwrap_or_else(|| "about:blank".into());
+    let start_url = args.url.clone().unwrap_or_else(|| DEFAULT_START_URL.into());
     // An explicit --chrome failure is the user's typo to fix (fail fast); a
     // *persisted* choice failing must never wedge startup — fall back to
     // system Chrome so the daemon (and the UI switch) still comes up.
@@ -3658,7 +3746,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     }
 
     // The startup browser's handler is already driven (spawned inside
-    // `startup_browser` before the first tab — `new_page` needs it). Just
+    // `startup_browser` before the first tab — page ops need it). Just
     // ensure the alive flag is set for the CDP error mapping below.
     BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
 
