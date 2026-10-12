@@ -87,13 +87,182 @@ struct LaunchConfig {
 
 impl LaunchConfig {
     fn from_args(args: &DaemonArgs) -> Self {
+        let chrome = match args.chrome.clone().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()) {
+            // Explicit --chrome / LB_CHROME wins and becomes the new persisted
+            // default, so the next `lb web` without flags keeps it.
+            Some(raw) => {
+                let resolved = resolve_chrome_path(&raw);
+                save_persisted_chrome(Some(&resolved));
+                Some(resolved)
+            }
+            // Otherwise reuse the last Settings → Browser choice, if any.
+            None => load_persisted_chrome(),
+        };
         Self {
             profile: args.profile.clone().unwrap_or_else(default_profile_dir),
             headed: !args.headless_mode(),
             no_sandbox: args.no_sandbox,
-            chrome: args.chrome.clone(),
+            chrome,
         }
     }
+}
+
+/// File holding the last browser-binary choice (`{"chrome": "<path>"}`).
+/// Lives next to the pidfiles (`~/.cache/live-browser/browser.json`), so a
+/// Settings → Browser switch (or an explicit `--chrome`) survives `lb web`
+/// restarts that pass no `--chrome` flag. One file for all ports/profiles:
+/// the binary choice is a user preference, not per-server state.
+fn browser_prefs_path() -> std::path::PathBuf {
+    cache_base().join("live-browser").join("browser.json")
+}
+
+/// Last persisted chrome path, if any. Best-effort: corrupt / missing files
+/// and vanished binaries (uninstalled CloakBrowser) fall back to auto-detect
+/// so startup never breaks because of a stale preference.
+fn load_persisted_chrome() -> Option<String> {
+    load_persisted_chrome_from(&browser_prefs_path())
+}
+
+fn load_persisted_chrome_from(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let raw = v.get("chrome")?.as_str()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let resolved = resolve_chrome_path(&raw);
+    if std::path::Path::new(&resolved).exists() {
+        Some(resolved)
+    } else {
+        tracing::warn!(
+            "persisted browser {resolved} is gone (uninstalled?) — falling back to auto-detect"
+        );
+        None
+    }
+}
+
+/// Persist the browser choice (best-effort; a failure only logs).
+/// `None` clears the file so the next start auto-detects.
+fn save_persisted_chrome(chrome: Option<&str>) {
+    save_persisted_chrome_to(&browser_prefs_path(), chrome);
+}
+
+fn save_persisted_chrome_to(path: &std::path::Path, chrome: Option<&str>) {
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let result = match chrome.map(|c| c.trim()).filter(|c| !c.is_empty()) {
+        Some(c) => std::fs::write(path, format!("{{\"chrome\":{}}}\n", serde_json::Value::String(c.to_string()))),
+        None => {
+            // Clear: remove the file (missing file = auto-detect anyway).
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+    };
+    if let Err(e) = result {
+        tracing::warn!("could not persist browser choice to {}: {e:#}", path.display());
+    }
+}
+
+/// Normalize a `--chrome` value into an absolute path for launch + storage:
+/// trims, expands a leading `~/`, and resolves a single `*` glob segment
+/// (so `~/.cloakbrowser/chromium-*/chrome` works quoted as well as expanded
+/// by the shell — the resolved absolute path is what gets persisted).
+fn resolve_chrome_path(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    if s.is_empty() {
+        return s;
+    }
+    if s == "~" || s.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        s = format!("{home}{}", &s[1..]);
+    }
+    if !s.contains('*') && !s.contains('?') && !s.contains('[') {
+        return s;
+    }
+    match expand_glob_segment(&s) {
+        Some(resolved) => resolved,
+        None => s,
+    }
+}
+
+/// Resolve the first path segment containing a glob metacharacter by listing
+/// its parent dir and picking the newest (lexicographically last) match.
+/// Enough for versioned layouts like `chromium-*/chrome`; returns `None`
+/// when nothing matches (caller keeps the literal, launch reports it).
+fn expand_glob_segment(pattern: &str) -> Option<String> {
+    use std::path::PathBuf;
+    let is_abs = pattern.starts_with('/');
+    let parts: Vec<&str> = pattern.split('/').collect();
+    let wild_idx = parts.iter().position(|p| p.contains('*') || p.contains('?') || p.contains('['))?;
+    let parent_parts = &parts[..wild_idx];
+    let parent = if parent_parts.is_empty() || (parent_parts.len() == 1 && parent_parts[0].is_empty()) {
+        PathBuf::from("/")
+    } else {
+        let mut p = PathBuf::new();
+        if is_abs {
+            p.push("/");
+        }
+        for part in parent_parts {
+            if part.is_empty() {
+                continue;
+            }
+            p.push(part);
+        }
+        p
+    };
+    let entries = std::fs::read_dir(&parent).ok()?;
+    let mut hits: Vec<String> = vec![];
+    for e in entries.filter_map(|x| x.ok()) {
+        let name = e.file_name().to_string_lossy().to_string();
+        if segment_matches(parts[wild_idx], &name) {
+            // Plain lexicographic max = newest version.
+            hits.push(name);
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort();
+    let best = hits.last().unwrap();
+    let mut out = PathBuf::from(&parent);
+    out.push(best);
+    for part in &parts[wild_idx + 1..] {
+        out.push(part);
+    }
+    Some(out.to_string_lossy().to_string())
+}
+
+/// `*` / `?` segment match (no character classes — enough for our patterns).
+fn segment_matches(pattern: &str, name: &str) -> bool {
+    fn rec(p: &[u8], n: &[u8]) -> bool {
+        if p.is_empty() {
+            return n.is_empty();
+        }
+        match p[0] {
+            b'*' => {
+                // Collapse consecutive stars, then try every split.
+                let mut pi = 1;
+                while pi < p.len() && p[pi] == b'*' {
+                    pi += 1;
+                }
+                for ni in 0..=n.len() {
+                    if rec(&p[pi..], &n[ni..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            b'?' => !n.is_empty() && rec(&p[1..], &n[1..]),
+            c => !n.is_empty() && n[0] == c && rec(&p[1..], &n[1..]),
+        }
+    }
+    rec(pattern.as_bytes(), name.as_bytes())
 }
 
 /// Build the chromiumoxide config for `launch` (shared by startup and
@@ -111,6 +280,11 @@ fn build_browser_config(launch: &LaunchConfig) -> Result<BrowserConfig, String> 
     }
     if !launch.headed {
         // Headless is the default (no visible window); --headed opts out.
+        // Explicit `--headless=new`: the old `--headless` flag was removed in
+        // Chrome 132 — newer Chrome ignores it and opens a *visible* window
+        // (seen on Windows). The new headless mode is a full browser without
+        // a visible window and behaves like headed for automation.
+        cfg = cfg.new_headless_mode();
     } else {
         cfg = cfg.with_head();
     }
@@ -3018,9 +3192,11 @@ async fn install_fresh_browser(
     BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     {
         let mut launch_guard = s.launch.lock().await;
-        launch_guard.chrome = launch.chrome;
+        launch_guard.chrome = launch.chrome.clone();
         launch_guard.profile = launch.profile;
     }
+    // Remember the switch so the next `lb web` (no --chrome flag) keeps it.
+    save_persisted_chrome(launch.chrome.as_deref());
     {
         let mut t = s.tabs.lock().await;
         t.map.clear();
@@ -3264,6 +3440,98 @@ fn detect_chrome() -> Option<String> {
     None
 }
 
+/// True when `ip` is a Tailscale address: the 100.64.0.0/10 CGNAT range
+/// (first octet 100, second 64–127). Used to spot the tailnet address among
+/// local interface addresses.
+fn is_tailscale_ip(ip: &str) -> bool {
+    let ip = ip.trim().split('/').next().unwrap_or("").trim();
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let mut nums = [0u8; 4];
+    for (i, p) in parts.iter().enumerate() {
+        match p.parse::<u8>() {
+            // Reject leading-zero / empty weirdness only implicitly: parse ok.
+            Ok(n) if !p.is_empty() => nums[i] = n,
+            _ => return false,
+        }
+    }
+    nums[0] == 100 && (64..=127).contains(&nums[1])
+}
+
+/// Pull every Tailscale-range IPv4 out of free-form command output
+/// (`ip addr`, `ifconfig`, `ipconfig`, `hostname -I`, …). Tokens may carry
+/// CIDR suffixes (`100.x.y.z/32`) or trailing punctuation — strip those.
+fn scrape_tailscale_ips(text: &str) -> Vec<String> {
+    let mut out = vec![];
+    for raw in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '/')) {
+        if raw.is_empty() {
+            continue;
+        }
+        let cand = raw.split('/').next().unwrap_or("").trim_matches('.');
+        if is_tailscale_ip(cand) && !out.contains(&cand.to_string()) {
+            out.push(cand.to_string());
+        }
+    }
+    out
+}
+
+/// This machine's Tailscale IPv4 (e.g. `100.90.12.34`), if Tailscale is up.
+/// Best-effort and fast: `tailscale ip -4` first, then scrape local interface
+/// listings for the 100.64.0.0/10 range. Returns None when Tailscale is
+/// absent/down. Every step is a short-lived local command; failures are
+/// silently ignored (no tailnet → no extra URL line, nothing else changes).
+fn tailscale_ipv4() -> Option<String> {
+    // 1. Exact: `tailscale ip -4` prints our address (one per line).
+    if let Ok(out) = std::process::Command::new("tailscale").args(["ip", "-4"]).output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            for line in s.lines() {
+                let ip = line.trim();
+                if is_tailscale_ip(ip) {
+                    return Some(ip.to_string());
+                }
+            }
+            // `tailscale ip` with no args also works on old CLIs — but the
+            // scrape below covers us anyway.
+        }
+    }
+    // 2. Fallback: scrape interface addresses (works even when the CLI is
+    // missing but the tailnet interface is up, e.g. via the GUI client).
+    #[cfg(windows)]
+    {
+        if let Ok(out) = std::process::Command::new("ipconfig").output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout);
+                if let Some(ip) = scrape_tailscale_ips(&s).into_iter().next() {
+                    return Some(ip);
+                }
+            }
+        }
+        return None;
+    }
+    #[cfg(not(windows))]
+    {
+        for argv in [
+            ["ip", "-4", "-o", "addr", "show"].as_slice(),
+            ["ifconfig"].as_slice(),
+            ["hostname", "-I"].as_slice(),
+        ] {
+            let (prog, args) = argv.split_first().unwrap();
+            if let Ok(out) = std::process::Command::new(prog).args(args).output() {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout);
+                    if let Some(ip) = scrape_tailscale_ips(&s).into_iter().next() {
+                        return Some(ip);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()> {
     // Normalize: empty string = no passcode. Fall back to LB_PASSWORD for
     // folks coming from OPENCODE_SERVER_PASSWORD-style setups.
@@ -3284,6 +3552,13 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     }
     let launch = LaunchConfig::from_args(&args);
     std::fs::create_dir_all(&launch.profile).ok();
+    // Say which binary is in play: without this a restart that silently falls
+    // back to system Chrome (stale persisted path, missing --chrome) is
+    // mysterious — the Settings → Browser choice should be visible here.
+    match launch_chrome_path(&launch) {
+        Some(p) => tracing::info!("browser binary: {p}"),
+        None => tracing::info!("browser binary: auto-detect (no --chrome, no saved choice)"),
+    }
 
     let cfg = build_browser_config(&launch)
         .map_err(|e| anyhow::anyhow!("invalid browser config: {e}"))?;
@@ -3412,12 +3687,25 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .fallback_service(tower_http::services::ServeDir::new(dist_dir()))
         .with_state(state);
 
-    let addr = format!("127.0.0.1:{}", args.port);
+    // Tailscale: when this machine is on a tailnet, listen on all interfaces
+    // so the UI is reachable via the tailnet address (127.0.0.1 alone would
+    // refuse tailnet connections), and print that URL next to localhost.
+    // Without Tailscale the bind stays loopback-only (no LAN exposure).
+    let ts_ip = tailscale_ipv4();
+    let bind_host = if ts_ip.is_some() { "0.0.0.0" } else { "127.0.0.1" };
+    let addr = format!("{bind_host}:{}", args.port);
+    let local_addr = format!("127.0.0.1:{}", args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
         anyhow::anyhow!(
             "cannot bind {addr}: {e:#} — is another `lb web` already running? (`lb web stop` stops it)"
         )
     })?;
+    if ts_ip.is_some() {
+        tracing::info!("tailscale detected — listening on all interfaces ({bind_host})");
+        if passcode.is_none() {
+            eprintln!("\x1b[1;33m!\tListening on your tailnet without a passcode — any device on your tailnet can drive the browser. Set LB_PASSCODE.\x1b[0m");
+        }
+    }
     // Record our pid so `lb web stop` / `lb web restart` can find us.
     // A stale file from a crashed daemon is tolerated: stop verifies
     // liveness before trusting it.
@@ -3447,22 +3735,25 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         );
     }
     println!("live-browser daemon ready");
-    println!("  UI:  http://{addr}/");
-    println!("  API: http://{addr}/api/status");
+    println!("  UI:  http://{local_addr}/");
+    if let Some(ip) = &ts_ip {
+        println!("  UI (tailscale):  http://{ip}:{}/", args.port);
+    }
+    println!("  API: http://{local_addr}/api/status");
     if passcode.is_some() {
         println!("  auth: passcode protection enabled");
     }
     println!("CLI example:");
     if passcode.is_some() {
-        println!("  lb --server http://{addr} --passcode <code> open https://example.com");
+        println!("  lb --server http://{local_addr} --passcode <code> open https://example.com");
     } else {
-        println!("  lb --server http://{addr} open https://example.com");
+        println!("  lb --server http://{local_addr} open https://example.com");
     }
-    println!("  lb --server http://{addr} snapshot");
-    println!("  lb --server http://{addr} handover \"please log in, then click Done in the UI\"");
+    println!("  lb --server http://{local_addr} snapshot");
+    println!("  lb --server http://{local_addr} handover \"please log in, then click Done in the UI\"");
     println!("  (stop this server with: lb web --port {} stop)", args.port);
     if !args.no_open {
-        open_in_default_browser(&format!("http://{addr}/"));
+        open_in_default_browser(&format!("http://{local_addr}/"));
     }
     // Ctrl-C / SIGTERM: shut down the HTTP server, then close the browser
     // (releasing the profile lock) and remove the pidfile, so `lb web stop`
@@ -3577,5 +3868,114 @@ mod tests {
         // Back and forth stays on the same pair (no `-cloak-cloak` spiral).
         assert_eq!(kind_profile("/tmp/lb-profile-cloak", "cloak"), "/tmp/lb-profile-cloak");
         assert_eq!(kind_profile("/tmp/lb-profile-cloak", "system"), base);
+    }
+
+    fn scratch_prefs(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lb-browser-prefs-test-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("browser.json")
+    }
+
+    #[test]
+    fn browser_prefs_roundtrip() {
+        let path = scratch_prefs("roundtrip");
+        // Missing file -> None (auto-detect).
+        assert_eq!(load_persisted_chrome_from(&path), None);
+        // Save + load an existing binary path.
+        let bin = std::env::temp_dir().join("lb-prefs-fake-chrome");
+        std::fs::write(&bin, "fake").unwrap();
+        let bin_str = bin.to_string_lossy().to_string();
+        save_persisted_chrome_to(&path, Some(&bin_str));
+        assert_eq!(load_persisted_chrome_from(&path), Some(bin_str));
+        // Clear -> None again and file removed.
+        save_persisted_chrome_to(&path, None);
+        assert_eq!(load_persisted_chrome_from(&path), None);
+        assert!(!path.exists());
+        std::fs::remove_file(&bin).ok();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn browser_prefs_ignores_stale_binary() {
+        let path = scratch_prefs("stale");
+        let missing = path.parent().unwrap().join("no-such-chrome");
+        save_persisted_chrome_to(&path, Some(&missing.to_string_lossy()));
+        // File exists but binary doesn't -> fall back to auto-detect.
+        assert_eq!(load_persisted_chrome_from(&path), None);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn browser_prefs_ignores_corrupt_file() {
+        let path = scratch_prefs("corrupt");
+        std::fs::write(&path, "not json{{{").unwrap();
+        assert_eq!(load_persisted_chrome_from(&path), None);
+        std::fs::write(&path, "{\"chrome\":\"\"}").unwrap();
+        assert_eq!(load_persisted_chrome_from(&path), None);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn resolve_chrome_path_plain_and_home() {
+        assert_eq!(resolve_chrome_path("  /usr/bin/chrome  "), "/usr/bin/chrome");
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        assert_eq!(resolve_chrome_path("~/bin/chrome"), format!("{home}/bin/chrome"));
+        assert_eq!(resolve_chrome_path(""), "");
+    }
+
+    #[test]
+    fn resolve_chrome_path_glob_picks_newest() {
+        let root = std::env::temp_dir().join(format!("lb-glob-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("chromium-1")).unwrap();
+        std::fs::create_dir_all(root.join("chromium-2")).unwrap();
+        std::fs::write(root.join("chromium-1").join("chrome"), "a").unwrap();
+        std::fs::write(root.join("chromium-2").join("chrome"), "b").unwrap();
+        let pattern = format!("{}/chromium-*/chrome", root.display());
+        assert_eq!(resolve_chrome_path(&pattern), format!("{}/chromium-2/chrome", root.display()));
+        let nomatch = format!("{}/nomatch-*/chrome", root.display());
+        assert_eq!(resolve_chrome_path(&nomatch), nomatch);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn segment_match_basics() {
+        assert!(segment_matches("chromium-*", "chromium-146.0"));
+        assert!(!segment_matches("chromium-*", "chrome-146.0"));
+        assert!(segment_matches("?", "a"));
+        assert!(!segment_matches("?", ""));
+        assert!(segment_matches("a*b", "aXYZb"));
+    }
+
+    #[test]
+    fn tailscale_ip_range() {
+        // Inside 100.64.0.0/10.
+        assert!(is_tailscale_ip("100.64.0.1"));
+        assert!(is_tailscale_ip("100.127.255.254"));
+        assert!(is_tailscale_ip("100.90.12.34"));
+        assert!(is_tailscale_ip("  100.100.100.100\n"));
+        assert!(is_tailscale_ip("100.72.0.5/32")); // CIDR suffix tolerated
+        // Outside.
+        assert!(!is_tailscale_ip("100.63.255.255"));
+        assert!(!is_tailscale_ip("100.128.0.1"));
+        assert!(!is_tailscale_ip("127.0.0.1"));
+        assert!(!is_tailscale_ip("192.168.1.1"));
+        assert!(!is_tailscale_ip("10.0.0.1"));
+        assert!(!is_tailscale_ip("not-an-ip"));
+        assert!(!is_tailscale_ip(""));
+        assert!(!is_tailscale_ip("100.90.12"));
+    }
+
+    #[test]
+    fn tailscale_scrape_finds_first() {
+        let ip_out = "2: tailscale0    inet 100.90.12.34/32 scope global tailscale0\n3: eth0 inet 192.168.1.5/24 brd";
+        assert_eq!(scrape_tailscale_ips(ip_out), vec!["100.90.12.34".to_string()]);
+        let ipcfg = "   IPv4 Address. . . . . . . . . . . : 100.120.7.9(Preferred)";
+        assert_eq!(scrape_tailscale_ips(ipcfg), vec!["100.120.7.9".to_string()]);
+        assert!(scrape_tailscale_ips("inet 192.168.1.5/24").is_empty());
     }
 }

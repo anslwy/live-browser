@@ -16,6 +16,50 @@
   // reply `304 Not Modified` (headers only) instead of re-sending the JPEG.
   let lastShotHash: string | null = null;
   let openUrl = '';
+  // Address-bar browse history (typed navigations), persisted in localStorage.
+  const HIST_KEY = 'lb-history';
+  const HIST_MAX = 100;
+  function loadHistory(): string[] {
+    try {
+      const raw = localStorage.getItem(HIST_KEY);
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) return arr.filter((x) => typeof x === 'string').slice(0, HIST_MAX);
+    } catch {}
+    return [];
+  }
+  let history: string[] = typeof localStorage !== 'undefined' ? loadHistory() : [];
+  let histOpen = false;
+  let histActive = -1;
+  function saveHistory() {
+    try {
+      localStorage.setItem(HIST_KEY, JSON.stringify(history.slice(0, HIST_MAX)));
+    } catch {}
+  }
+  function pushHistory(url: string) {
+    const u = url.trim();
+    if (!u) return;
+    history = [u, ...history.filter((h) => h !== u)].slice(0, HIST_MAX);
+    saveHistory();
+  }
+  function deleteHistoryItem(url: string) {
+    history = history.filter((h) => h !== url);
+    saveHistory();
+    histActive = -1;
+  }
+  // Dropdown suggestions: substring match on the current input (most recent
+  // first); empty input shows the most recent entries.
+  $: histItems = (() => {
+    const q = openUrl.trim().toLowerCase();
+    const list = q ? history.filter((h) => h.toLowerCase().includes(q)) : history;
+    return list.slice(0, 8);
+  })();
+  async function pickHistory(url: string) {
+    openUrl = url;
+    histOpen = false;
+    histActive = -1;
+    await doOpen();
+  }
   let snapshot: SnapEl[] = [];
   let snapHint = '';
   let snapLoading = false;
@@ -865,6 +909,8 @@
     setTimeout(() => {
       if (document.activeElement === el && addrJustFocused) el.select();
     }, 0);
+    histActive = -1;
+    histOpen = true;
   }
   function addrMouseUp(e: MouseEvent) {
     if (addrJustFocused) {
@@ -872,9 +918,49 @@
       addrJustFocused = false;
     }
   }
+  function addrBlur() {
+    addrJustFocused = false;
+    // Deferred so a mousedown on a suggestion (which precedes blur) still
+    // lands; the dropdown's own mousedown preventDefault covers the rest.
+    setTimeout(() => {
+      histOpen = false;
+      histActive = -1;
+    }, 120);
+  }
+  function addrKeydown(e: KeyboardEvent) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (histOpen && histItems.length > 0) {
+        e.preventDefault();
+        const d = e.key === 'ArrowDown' ? 1 : -1;
+        histActive = (histActive + d + histItems.length) % histItems.length;
+      } else if (e.key === 'ArrowDown') {
+        histOpen = true;
+      }
+      return;
+    }
+    if (e.key === 'Escape') {
+      histOpen = false;
+      histActive = -1;
+      (e.currentTarget as HTMLInputElement).blur();
+      return;
+    }
+    if (e.key === 'Enter') {
+      if (histOpen && histActive >= 0 && histActive < histItems.length) {
+        e.preventDefault();
+        void pickHistory(histItems[histActive]);
+      } else {
+        histOpen = false;
+        histActive = -1;
+        void doOpen();
+      }
+    }
+  }
 
   async function doOpen() {
     if (!openUrl.trim()) return;
+    histOpen = false;
+    histActive = -1;
+    const submitted = openUrl.trim();
     busy = 'open';
     // Navigate the CURRENT tab (Chrome behavior). `lb open` without --tab
     // still opens a new tab — that's the explicit CLI path.
@@ -882,8 +968,9 @@
     await apiFetch('/api/open', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: openUrl.trim(), tab: activeId ?? null })
+      body: JSON.stringify({ url: submitted, tab: activeId ?? null })
     });
+    pushHistory(submitted);
     busy = '';
     await refreshAll();
   }
@@ -1047,7 +1134,55 @@
           <Icon name="external" />
         </span>
       {/if}
-      <input id="addr-bar" class="omnibox" type="text" placeholder="Type a URL or search…" bind:value={openUrl} disabled={busy === 'open'} on:focus={addrFocus} on:mouseup={addrMouseUp} on:blur={() => (addrJustFocused = false)} on:keydown={(e) => e.key === 'Enter' && doOpen()} />
+      <div class="omniboxwrap">
+        <input
+          id="addr-bar"
+          class="omnibox"
+          type="text"
+          placeholder="Type a URL or search…"
+          bind:value={openUrl}
+          disabled={busy === 'open'}
+          on:focus={addrFocus}
+          on:mouseup={addrMouseUp}
+          on:blur={addrBlur}
+          on:input={() => {
+            histOpen = true;
+            histActive = -1;
+          }}
+          on:keydown={addrKeydown}
+          role="combobox"
+          aria-expanded={histOpen && histItems.length > 0}
+          aria-controls="addr-hist"
+          aria-autocomplete="list"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck="false" />
+        {#if histOpen && histItems.length > 0}
+          <ul id="addr-hist" class="histdrop" role="listbox" aria-label="Browse history">
+            {#each histItems as h, i}
+              <li role="option" aria-selected={i === histActive} class:active={i === histActive}>
+                <button
+                  class="histitem"
+                  title={h}
+                  on:mousedown={(e) => e.preventDefault()}
+                  on:click={() => pickHistory(h)}>
+                  <span class="histurl">{h}</span>
+                </button>
+                <button
+                  class="histdel"
+                  title="Remove from history"
+                  aria-label="Remove {h} from history"
+                  on:mousedown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                  on:click|stopPropagation={() => deleteHistoryItem(h)}>×</button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
       <button class="iconplain gearbtn" on:click={toggleSettings} title="Settings — appearance and browser" aria-label="Settings" aria-expanded={settingsOpen}>
         <Icon name="gear" />
       </button>

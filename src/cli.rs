@@ -319,7 +319,8 @@ pub struct DaemonArgs {
     /// HTTP port for API + Svelte UI
     #[arg(long, env = "LB_PORT", default_value_t = 8765)]
     pub port: u16,
-    /// Chrome executable (defaults to auto-detect)
+    /// Chrome executable (defaults to auto-detect; the last choice —
+    /// this flag or Settings → Browser — is remembered for the next start)
     #[arg(long, env = "LB_CHROME")]
     pub chrome: Option<String>,
     /// Run headless: no visible browser window (this is the default).
