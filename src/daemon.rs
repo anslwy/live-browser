@@ -64,6 +64,108 @@ struct AppState {
     log: Arc<Mutex<Vec<LogEntry>>>,
     /// Optional passcode guarding the HTTP API. `None`/empty = open server.
     passcode: Option<String>,
+    /// HTTP port this daemon serves (for actionable restart hints).
+    port: u16,
+    /// Directory browser downloads are saved to (see `Browser.setDownloadBehavior`).
+    download_dir: String,
+}
+
+// ---------------------------------------------------------------------------
+// Failure helpers: timeouts + dead-browser detection
+// ---------------------------------------------------------------------------
+
+/// Bound for a single CDP round-trip. Without this, one wedged renderer
+/// (JS dialog, crashed target) hangs the awaiting endpoint forever — and
+/// because some endpoints fan out over tabs, one bad tab used to wedge
+/// the whole daemon (`/api/tabs`, `/api/close`, …).
+const CDP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Tighter bound for per-tab probes inside fan-out endpoints.
+const TAB_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// True when `e` looks like a dead transport (covers chromiumoxide's
+/// "send failed because receiver is gone"). Ambiguous on its own: a dropped
+/// *session* (one closed tab) reports the same as a dead browser — callers
+/// must consult [`browser_alive`] to tell them apart.
+fn is_transport_gone_msg(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("receiver is gone")
+        || m.contains("send failed")
+        || m.contains("event loop is terminated")
+        || m.contains("connection closed")
+        || m.contains("broken pipe")
+}
+
+/// Whether the browser connection is up, as observed by the background
+/// handler task. One process runs one daemon, so a process-global flag is
+/// sufficient — and it is what lets error mapping distinguish "one tab died"
+/// (close it, carry on) from "the browser died" (restart, tabs are lost).
+static BROWSER_ALIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+fn browser_alive() -> bool {
+    BROWSER_ALIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn mark_browser_dead() {
+    BROWSER_ALIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Recovery text for a dead tab: close it and carry on — with the escalation
+/// in case the whole browser is actually down.
+fn tab_gone_msg(port: u16) -> String {
+    format!(
+        "this tab's page is gone (renderer closed or crashed — Alt+F4 and window.close() do this) — \
+         `lb close` it and `lb open` a fresh tab. \
+         If every tab fails this way, the browser itself is down: restart with `lb web --port {port} restart`"
+    )
+}
+
+/// True when `e` looks like a dead *tab* (renderer closed/crashed — e.g.
+/// Alt+F4, `window.close()`), including dropped session channels while the
+/// browser itself is still alive.
+fn is_tab_gone_msg(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("session with given id")
+        || m.contains("no target with given id")
+        || m.contains("target crashed")
+        || m.contains("cannot find target")
+        || m.contains("no such target")
+        || m.contains("target closed")
+        || (is_transport_gone_msg(&m) && browser_alive())
+}
+
+/// Old name kept for the explicit browser-death probe: true only for
+/// transport errors observed while the browser is known to be down.
+fn is_browser_gone_msg(msg: &str) -> bool {
+    is_transport_gone_msg(msg) && !browser_alive()
+}
+
+/// Actionable replacement for raw transport errors: tells the user the
+/// browser process is gone and exactly how to recover (instead of
+/// `send failed because receiver is gone`, which means nothing).
+fn gone_err(port: u16) -> serde_json::Value {
+    serde_json::json!({ "ok": false,
+        "error": format!("browser process died — restart it with `lb web --port {port} restart` (open tabs will be lost)") })
+}
+
+/// Map a CDP failure into a user-facing error string: dead-tab errors name
+/// the recovery (`lb close` + fresh tab), dead-browser errors point at
+/// `lb web restart`, everything else passes through (truncated).
+fn friendly_cdp_error(port: u16, context: &str, e: impl std::fmt::Display) -> String {
+    let raw = format!("{e:#}");
+    tracing::warn!("CDP failure ({context}): {}", raw.chars().take(300).collect::<String>());
+    if is_tab_gone_msg(&raw) {
+        return tab_gone_msg(port);
+    }
+    if is_browser_gone_msg(&raw) {
+        return gone_err(port)
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("browser process died")
+            .to_string();
+    }
+    let short: String = raw.chars().take(400).collect();
+    format!("{context}: {short}")
 }
 
 // ---------------------------------------------------------------------------
@@ -289,21 +391,80 @@ fn err(msg: String) -> Json<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// JS-dialog guard: alert()/confirm()/prompt() used to wedge the tab (and,
+// via fan-out endpoints, the whole daemon) with no recovery. Every page gets
+// a background task that auto-dismisses dialogs and logs them, so automation
+// can always proceed. Humans driving via `lb web --headed` see the dismissal
+// in the action log.
+// ---------------------------------------------------------------------------
+
+/// Attach the auto-dismiss guard to `page`. Safe to call on every new tab.
+fn spawn_dialog_guard(page: Page, log: Arc<Mutex<Vec<LogEntry>>>, tab_id: u32) {
+    tokio::spawn(async move {
+        use chromiumoxide::cdp::browser_protocol::page::EventJavascriptDialogOpening;
+        let mut events = match page.event_listener::<EventJavascriptDialogOpening>().await {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        use futures::StreamExt;
+        while let Some(ev) = events.next().await {
+            let kind = format!("{:?}", ev.r#type).to_lowercase();
+            // beforeunload is accepted (lets the pending navigation proceed);
+            // alert/confirm/prompt are dismissed (equivalent to Cancel/Esc).
+            let accept = kind.contains("beforeunload");
+            let msg: String = ev.message.chars().take(200).collect();
+            let params = chromiumoxide::cdp::browser_protocol::page::HandleJavaScriptDialogParams::new(accept);
+            let _ = tokio::time::timeout(Duration::from_secs(5), page.execute(params)).await;
+            let entry = LogEntry {
+                at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                action: "dialog".into(),
+                detail: format!(
+                    "tab {tab_id}: auto-{} {kind} dialog: {msg}",
+                    if accept { "accepted" } else { "dismissed" }
+                )
+                .chars()
+                .take(300)
+                .collect(),
+            };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut l = log.lock().await;
+                l.push(entry);
+                if l.len() > 200 {
+                    let n = l.len() - 200;
+                    l.drain(..n);
+                }
+            });
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot / interaction JS
 // ---------------------------------------------------------------------------
 
 const SNAPSHOT_JS: &str = r#"(() => {
   document.querySelectorAll('[data-lb-ref]').forEach(e => e.removeAttribute('data-lb-ref'));
-  const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [onclick], summary');
+  // data-lb-* inside same-origin iframes is namespaced per frame so a ref
+  // query can be resolved without collisions.
+  try {
+    document.querySelectorAll('iframe').forEach(f => {
+      try {
+        const d = f.contentDocument;
+        if (d) d.querySelectorAll('[data-lb-ref]').forEach(e => e.removeAttribute('data-lb-ref'));
+      } catch (e) { /* cross-origin: skip */ }
+    });
+  } catch (e) {}
+  const SELECTOR = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [onclick], summary';
   const out = [];
   let ref = 1;
-  for (const el of els) {
-    if (out.length >= 200) break;
+  const push = (el, frame, dx, dy) => {
+    if (out.length >= 200) return;
     try {
       const rect = el.getBoundingClientRect();
-      const style = window.getComputedStyle(el);
-      if (style.display === 'none' || style.visibility === 'hidden') continue;
-      if (rect.width === 0 && rect.height === 0 && rect.top === 0 && rect.left === 0) continue;
+      const style = (el.ownerDocument.defaultView || window).getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return;
+      if (rect.width === 0 && rect.height === 0 && rect.top === 0 && rect.left === 0) return;
       el.setAttribute('data-lb-ref', String(ref));
       let name = el.getAttribute('aria-label')
         || (el.innerText || '')
@@ -321,6 +482,9 @@ const SNAPSHOT_JS: &str = r#"(() => {
         href: el.getAttribute('href') || '',
         placeholder: el.getAttribute('placeholder') || '',
         value: (el.value !== undefined ? String(el.value).slice(0, 80) : ''),
+        frame: frame,
+        x: Math.round((rect.left + rect.width / 2 + dx) * 10) / 10,
+        y: Math.round((rect.top + rect.height / 2 + dy) * 10) / 10,
         options: (el.tagName === 'SELECT'
           ? Array.from(el.options).map(o => ({
               value: o.value,
@@ -330,10 +494,99 @@ const SNAPSHOT_JS: &str = r#"(() => {
           : [])
       });
       ref++;
-    } catch (e) { continue; }
-  }
+    } catch (e) {}
+  };
+  document.querySelectorAll(SELECTOR).forEach(el => push(el, '', 0, 0));
+  // Same-origin iframes: cross-origin frames throw on contentDocument access
+  // and are skipped (their elements still work via lb click-at with UI coords).
+  try {
+    document.querySelectorAll('iframe').forEach((f, i) => {
+      try {
+        const d = f.contentDocument;
+        if (!d) return;
+        const r = f.getBoundingClientRect();
+        d.querySelectorAll(SELECTOR).forEach(el => push(el, 'iframe[' + i + ']', r.left, r.top));
+      } catch (e) { /* cross-origin: skip */ }
+    });
+  } catch (e) {}
   return out;
 })()"#;
+
+/// Resolve a snapshot ref to viewport coordinates, searching the main
+/// document *and* same-origin iframes. Used as the fallback when a
+/// main-frame CSS lookup fails (iframe elements have their
+/// `data-lb-ref` inside the frame document).
+const REF_COORDS_JS: &str = r#"((want) => {
+  const inDoc = (doc, dx, dy) => {
+    const el = doc.querySelector('[data-lb-ref="' + want + '"]');
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return [r.left + r.width / 2 + dx, r.top + r.height / 2 + dy];
+  };
+  const pt = inDoc(document, 0, 0);
+  if (pt) return pt;
+  const frames = document.querySelectorAll('iframe');
+  for (let i = 0; i < frames.length; i++) {
+    try {
+      const d = frames[i].contentDocument;
+      if (!d) continue;
+      const r = frames[i].getBoundingClientRect();
+      const hit = inDoc(d, r.left, r.top);
+      if (hit) return hit;
+    } catch (e) { /* cross-origin: skip */ }
+  }
+  return null;
+})"#;
+
+/// Focus the element behind a snapshot ref (main frame or same-origin
+/// iframe), optionally clearing it first. Returns "ok", "not-found", or
+/// an "error: …" string. Powers type/click fallbacks for framed elements.
+const FOCUS_REF_JS: &str = r#"((want, clear) => {
+  const inDoc = (doc) => doc.querySelector('[data-lb-ref="' + want + '"]');
+  let el = inDoc(document);
+  if (!el) {
+    const frames = document.querySelectorAll('iframe');
+    for (let i = 0; i < frames.length; i++) {
+      try {
+        const d = frames[i].contentDocument;
+        if (!d) continue;
+        el = inDoc(d);
+        if (el) break;
+      } catch (e) { /* cross-origin: skip */ }
+    }
+  }
+  if (!el) return 'not-found';
+  try {
+    el.scrollIntoView({ block: 'center' });
+    el.focus();
+    if (clear && 'value' in el) {
+      el.value = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return 'ok';
+  } catch (e) { return 'error: ' + e; }
+})"#;
+
+/// Presence probe for `lb wait`: true when the target exists. Accepts a
+/// snapshot ref ("12"), a `css=` selector, or plain CSS.
+const WAIT_PROBE_PREFIX: &str = r#"((target) => {
+  let sel = target.trim();
+  if (!sel.startsWith('css=')) {
+    if (/^\d+$/.test(sel)) sel = '[data-lb-ref="' + sel + '"]';
+  } else {
+    sel = sel.slice(4);
+  }
+  if (document.querySelector(sel)) return true;
+  const frames = document.querySelectorAll('iframe');
+  for (let i = 0; i < frames.length; i++) {
+    try {
+      const d = frames[i].contentDocument;
+      if (d && d.querySelector(sel)) return true;
+    } catch (e) {}
+  }
+  return false;
+})"#;
 
 /// Resolve a CLI target to a CSS selector.
 /// - `css:.foo` -> `.foo`
@@ -374,8 +627,16 @@ async fn api_status(
     Query(q): Query<TabQuery>,
 ) -> Json<serde_json::Value> {
     let (tab_id, page) = tab!(&s, q.tab);
-    let url = page_url(&page).await;
-    let title = page_title(&page).await;
+    // Bounded reads: a wedged renderer must not hang even the status call.
+    // Falls back to the last known URL so status stays useful.
+    let url = match tokio::time::timeout(TAB_PROBE_TIMEOUT, page.url()).await {
+        Ok(Ok(Some(u))) => u,
+        _ => s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.last_url.clone()).unwrap_or_default(),
+    };
+    let title = match tokio::time::timeout(TAB_PROBE_TIMEOUT, page.get_title()).await {
+        Ok(Ok(Some(t))) => t,
+        _ => String::new(),
+    };
     let t = s.tabs.lock().await;
     let ts = t.map.get(&tab_id).unwrap();
     Json(serde_json::json!({
@@ -396,19 +657,55 @@ struct OpenReq {
     #[serde(default)]
     tab: Option<u32>,
     url: String,
+    /// Navigate the active tab in place instead of opening a new tab
+    /// (same as passing the active tab id explicitly).
+    #[serde(default)]
+    here: bool,
 }
 /// Omnibox-style normalization: full URLs pass through, bare domains get
 /// https://, and anything else becomes a Google search.
-fn normalize_open_url(input: &str) -> String {
+fn normalize_open_url(input: &str) -> Result<String, String> {
     let t = input.trim();
-    if t.contains("://") || t.starts_with("about:") || t.starts_with("data:") || t.starts_with("file:") {
-        return t.to_string();
+    if t.is_empty() {
+        return Err("empty url".into());
+    }
+    // Anything with whitespace is free text, never a URL — even when it
+    // contains "://" (e.g. `ht!tp://bad url`). The old code passed such
+    // input straight to `page.goto`, which hung until the client timed out.
+    if t.contains("://") {
+        if t.chars().any(|c| c.is_whitespace()) {
+            return Ok(format!("https://www.google.com/search?q={}", urlencode_query(t)));
+        }
+        let scheme = t.split("://").next().unwrap_or("");
+        let scheme_ok =
+            !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.');
+        if !scheme_ok {
+            return Err(format!(
+                "malformed URL {t:?} — scheme {scheme:?} is invalid (need e.g. https://…)"
+            ));
+        }
+        return Ok(t.to_string());
+    }
+    if t.starts_with("about:") || t.starts_with("data:") || t.starts_with("file:") {
+        if t.chars().any(|c| c.is_whitespace()) {
+            return Err(format!("malformed URL {t:?} — URLs cannot contain spaces"));
+        }
+        return Ok(t.to_string());
     }
     let single_token = !t.chars().any(|c| c.is_whitespace());
     if single_token && (t.contains('.') || t.starts_with("localhost") || t.contains(':')) {
-        return format!("https://{t}");
+        // `host:port` without a scheme still navigates; anything with a
+        // colon that isn't host:port-shaped is almost certainly a typo.
+        if t.contains(':') && !t.starts_with("localhost") {
+            let parts: Vec<&str> = t.split(':').collect();
+            let host_ok = !parts[0].is_empty() && parts.len() == 2 && !parts[1].is_empty();
+            if !host_ok {
+                return Err(format!("malformed URL {t:?} — did you mean https://{t}?"));
+            }
+        }
+        return Ok(format!("https://{t}"));
     }
-    format!("https://www.google.com/search?q={}", urlencode_query(t))
+    Ok(format!("https://www.google.com/search?q={}", urlencode_query(t)))
 }
 
 fn urlencode_query(s: &str) -> String {
@@ -428,14 +725,35 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
     if input.is_empty() {
         return err("empty url".into());
     }
-    let url = normalize_open_url(&input);
-    // With an explicit tab: navigate it in place. Without: open a new tab.
-    let (tab_id, page) = match b.tab {
+    let url = match normalize_open_url(&input) {
+        Ok(u) => u,
+        Err(e) => return err(e),
+    };
+    // With an explicit tab (or --here): navigate it in place.
+    // Without: open a new tab (pass --here to reuse the active one —
+    // otherwise repeated `lb open` calls pile up tabs).
+    let tab_sel = b.tab.or(if b.here {
+        Some(s.tabs.lock().await.active)
+    } else {
+        None
+    });
+    let (tab_id, page) = match tab_sel {
         Some(id) => tab!(&s, Some(id)),
         None => {
-            let page = match s.browser.lock().await.new_page(&url).await {
-                Ok(p) => p,
-                Err(e) => return err(format!("new tab failed: {e:#}")),
+            let new_page = {
+                let browser = s.browser.lock().await;
+                match tokio::time::timeout(CDP_TIMEOUT, browser.new_page(&url)).await {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(e)) => {
+                        return err(friendly_cdp_error(s.port, "new tab failed", e));
+                    }
+                    Err(_) => {
+                        return err(format!(
+                            "new tab timed out after {}s — the browser may be wedged (a JS dialog blocks it?); check `lb log`",
+                            CDP_TIMEOUT.as_secs()
+                        ));
+                    }
+                }
             };
             // Scope the lock: it must be released before open_navigate,
             // which locks again (holding it across the call deadlocks).
@@ -446,7 +764,7 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
                 t.map.insert(
                     id,
                     TabState {
-                        page: page.clone(),
+                        page: new_page.clone(),
                         handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
                         zoom: 1.0,
                         cursor: CursorState::default(),
@@ -457,7 +775,8 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
                 id
             };
             s.push_log("open/tab", &format!("tab {id} <- {url}"));
-            return open_navigate(&s, id, page, &url).await;
+            spawn_dialog_guard(new_page.clone(), s.log.clone(), id);
+            return open_navigate(&s, id, new_page, &url).await;
         }
     };
     s.push_log("open", &format!("tab {tab_id} <- {url}"));
@@ -521,15 +840,19 @@ async fn api_snapshot(
     let (tab_id, page) = tab!(&s, q.tab);
     let url = page_url(&page).await;
     let title = page_title(&page).await;
-    match page.evaluate(SNAPSHOT_JS).await {
-        Ok(eval) => match eval.into_value::<serde_json::Value>() {
+    match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await {
+        Ok(Ok(eval)) => match eval.into_value::<serde_json::Value>() {
             Ok(elements) => Json(serde_json::json!({
                 "ok": true, "tab": tab_id, "url": url, "title": title, "elements": elements,
                 "hint": "click with `lb click <ref>`, type with `lb type <ref> <text>`. Re-run snapshot after navigation."
             })),
             Err(e) => err(format!("decode snapshot failed: {e:#}")),
         },
-        Err(e) => err(format!("snapshot failed (page still loading?): {e:#}")),
+        Ok(Err(e)) => err(friendly_cdp_error(s.port, "snapshot failed (page still loading?)", e)),
+        Err(_) => err(format!(
+            "snapshot timed out after {}s — the page may be stuck (heavy load, infinite loop). Try `lb reload --tab {tab_id}` (global --tab flag) or `lb eval` instead",
+            CDP_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -646,44 +969,155 @@ struct ClickReq {
     /// "human" when triggered from the web UI; anything else = agent.
     #[serde(default)]
     by: String,
+    /// "single" (default), "double" or "right".
+    #[serde(default = "default_click_kind")]
+    kind: String,
+}
+fn default_click_kind() -> String {
+    "single".to_string()
 }
 async fn api_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> Json<serde_json::Value> {
     let sel = target_to_selector(&b.target);
     let (tab_id, page) = tab!(&s, b.tab);
-    s.push_log("click", &format!("tab {tab_id} <- {sel}"));
+    let kind = b.kind.to_lowercase();
+    if kind != "single" && kind != "double" && kind != "right" {
+        return err(format!("unknown click kind: {:?} (use single, double or right)", b.kind));
+    }
+    s.push_log("click", &format!("tab {tab_id} <- {sel} [{kind}]"));
+    let label = if kind == "single" { String::new() } else { format!(" [{kind}]") };
     // Ensure refs exist (snapshot tags elements) — but only for numeric refs.
     // Raw `css=` selectors don't need DOM re-tagging; skipping the full
     // SNAPSHOT_JS scan here saves a costly layout-forcing evaluate.
     if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
-        let _ = page.evaluate(SNAPSHOT_JS).await;
+        let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
     }
-    match page.find_element(&sel).await {
-        Ok(el) => {
-            // Report the click point for the UI's fake cursor.
-            let center_js = format!(
-                "(() => {{ const el = document.querySelector({}); if (!el) return null; const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }})()",
-                serde_json::to_string(&sel).unwrap()
-            );
-            if let Ok(ev) = page.evaluate(center_js.as_str()).await {
-                if let Ok(pt) = ev.into_value::<Vec<f64>>() {
-                    if pt.len() == 2 {
-                        s.set_cursor(tab_id, pt[0], pt[1], "click", &b.by).await;
+    let do_click = async {
+        match page.find_element(&sel).await {
+            Ok(el) => {
+                // Report the click point for the UI's fake cursor.
+                let center_js = format!(
+                    "(() => {{ const el = document.querySelector({}); if (!el) return null; const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }})()",
+                    serde_json::to_string(&sel).unwrap()
+                );
+                if let Ok(ev) = page.evaluate(center_js.as_str()).await {
+                    if let Ok(pt) = ev.into_value::<Vec<f64>>() {
+                        if pt.len() == 2 {
+                            s.set_cursor(tab_id, pt[0], pt[1], "click", &b.by).await;
+                        }
                     }
                 }
-            }
-            match el.click().await {
-                Ok(_) => {
-                    // Brief settle so SPAs commit DOM updates; the caller
-                    // (UI poll / next snapshot) observes the rest. Kept short
-                    // on purpose — this sleep is on the latency hot path.
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    ok(&format!("clicked {sel}"))
+                let res: Result<(), String> = if kind == "double" {
+                    el.click_with(chromiumoxide::types::ClickOptions::builder().click_count(2).build()).await.map(|_| ()).map_err(|e| format!("{e:#}"))
+                } else if kind == "right" {
+                    right_click_element(&page, &el).await
+                } else {
+                    el.click().await.map(|_| ()).map_err(|e| format!("{e:#}"))
+                };
+                match res {
+                    Ok(_) => {
+                        // Brief settle so SPAs commit DOM updates; the caller
+                        // (UI poll / next snapshot) observes the rest. Kept short
+                        // on purpose — this sleep is on the latency hot path.
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        Ok(format!("clicked {sel}{label}"))
+                    }
+                    Err(e) => Err(friendly_cdp_error(s.port, "click failed", e)),
                 }
-                Err(e) => err(format!("click failed: {e:#}")),
+            }
+            Err(_) => {
+                // Main-frame lookup failed: the element may live in a
+                // same-origin iframe (snapshot tags those too). Resolve its
+                // viewport coordinates and click there instead.
+                match ref_coords(&page, &b.target).await {
+                    Some((x, y)) => {
+                        s.set_cursor(tab_id, x, y, "click", &b.by).await;
+                        let point = chromiumoxide::layout::Point::new(x, y);
+                        let res: Result<(), String> = if kind == "double" {
+                            page.click_with(point, chromiumoxide::types::ClickOptions::builder().click_count(2).build()).await.map(|_| ()).map_err(|e| format!("{e:#}"))
+                        } else if kind == "right" {
+                            right_click_point(&page, point).await
+                        } else {
+                            page.click(point).await.map(|_| ()).map_err(|e| format!("{e:#}"))
+                        };
+                        match res {
+                            Ok(_) => {
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                                Ok(format!("clicked {sel}{label} (via coordinates — element is inside an iframe)"))
+                            }
+                            Err(e) => Err(friendly_cdp_error(s.port, "click failed", e)),
+                        }
+                    }
+                    None => Err(format!(
+                        "element not found for `{sel}` (run `lb snapshot` first)"
+                    )),
+                }
             }
         }
-        Err(e) => err(format!("element not found for `{sel}` (run `lb snapshot` first): {e:#}")),
+    };
+    match tokio::time::timeout(CDP_TIMEOUT, do_click).await {
+        Ok(Ok(msg)) => ok(&msg),
+        Ok(Err(e)) => err(e),
+        Err(_) => err(format!(
+            "click timed out after {}s — the page may be stuck; retry or reload",
+            CDP_TIMEOUT.as_secs()
+        )),
     }
+}
+
+/// Viewport coordinates of a snapshot ref (main frame or same-origin
+/// iframe), or None when the ref doesn't exist.
+async fn ref_coords(page: &Page, target: &str) -> Option<(f64, f64)> {
+    let t = target.trim();
+    if t.starts_with("css=") {
+        return None;
+    }
+    let js = format!("{REF_COORDS_JS}({})", serde_json::to_string(t).unwrap());
+    let ev = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(js.as_str())).await.ok()?.ok()?;
+    let pt: Vec<f64> = ev.into_value().ok()?;
+    if pt.len() == 2 && pt[0].is_finite() && pt[1].is_finite() {
+        Some((pt[0], pt[1]))
+    } else {
+        None
+    }
+}
+
+/// Right-click at a viewport point via raw CDP mouse events.
+async fn right_click_point(page: &Page, point: chromiumoxide::layout::Point) -> Result<(), String> {
+    use chromiumoxide::cdp::browser_protocol::input::{DispatchMouseEventParams, DispatchMouseEventType, MouseButton};
+    page.execute(
+        DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MousePressed)
+            .x(point.x)
+            .y(point.y)
+            .button(MouseButton::Right)
+            .buttons(2)
+            .build()
+            .unwrap(),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("{e:#}"))?;
+    page.execute(
+        DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MouseReleased)
+            .x(point.x)
+            .y(point.y)
+            .button(MouseButton::Right)
+            .buttons(0)
+            .build()
+            .unwrap(),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("{e:#}"))?;
+    Ok(())
+}
+
+/// Right-click an element: resolve its clickable point, then dispatch.
+async fn right_click_element(page: &Page, el: &chromiumoxide::Element) -> Result<(), String> {
+    el.scroll_into_view().await.map_err(|e| format!("{e:#}"))?;
+    let pt = el.clickable_point().await.map_err(|e| format!("{e:#}"))?;
+    right_click_point(page, chromiumoxide::layout::Point::new(pt.x, pt.y)).await
 }
 
 #[derive(Deserialize)]
@@ -695,60 +1129,137 @@ struct TypeReq {
     text: String,
     #[serde(default)]
     submit: bool,
+    /// Keep existing content and append (default clears the field first).
+    #[serde(default)]
+    append: bool,
 }
 async fn api_type(State(s): State<AppState>, Json(b): Json<TypeReq>) -> Json<serde_json::Value> {
     let sel = target_to_selector(&b.target);
     let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("type", &format!("{sel} <- {:?}", b.text));
-    if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
-        let _ = page.evaluate(SNAPSHOT_JS).await;
-    }
-    let el = match page.find_element(&sel).await {
-        Ok(el) => el,
-        Err(e) => return err(format!("element not found for `{sel}`: {e:#}")),
+    let run = async {
+        if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
+            let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
+        }
+        match page.find_element(&sel).await {
+            Ok(el) => type_into_element(&page, &el, &sel, &b.text, b.submit, b.append).await,
+            Err(_) => {
+                // Main-frame lookup failed — the element may live in a
+                // same-origin iframe. Focus it via JS, then drive it with
+                // trusted input (works across frame boundaries).
+                let focus_js = format!(
+                    "{FOCUS_REF_JS}({}, {})",
+                    serde_json::to_string(b.target.trim()).unwrap(),
+                    if b.append { "false" } else { "true" }
+                );
+                let focused = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(focus_js.as_str())).await;
+                match focused {
+                    Ok(Ok(ev)) => match ev.into_value::<String>() {
+                        Ok(which) if which == "ok" => {
+                            insert_text(&page, &b.text).await?;
+                            if b.submit {
+                                press_enter(&page).await?;
+                            }
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            Ok(format!("typed into {sel} (inside an iframe)"))
+                        }
+                        _ => Err(format!("element not found for `{sel}` (run `lb snapshot` first)")),
+                    },
+                    _ => Err(format!("element not found for `{sel}` (run `lb snapshot` first)")),
+                }
+            }
+        }
     };
-    if let Err(e) = el.click().await {
-        return err(format!("focus failed: {e:#}"));
+    match tokio::time::timeout(CDP_TIMEOUT, run).await {
+        Ok(Ok(msg)) => ok(&msg),
+        Ok(Err(e)) => err(e),
+        Err(_) => err(format!(
+            "type timed out after {}s — the page may be stuck; retry or reload",
+            CDP_TIMEOUT.as_secs()
+        )),
     }
-    // Clear existing content via JS, then type (typing triggers real key events).
-    let clear_js = format!(
-        "(() => {{ const el = document.querySelector({}); if (el) {{ el.focus(); if ('value' in el) {{ el.value=''; el.dispatchEvent(new Event('input', {{bubbles:true}})); }} }} }})()",
-        serde_json::to_string(&sel).unwrap()
-    );
-    let _ = page.evaluate(clear_js.as_str()).await;
+}
+
+/// Core keystroke path for an already-resolved main-frame element.
+async fn type_into_element(
+    page: &Page,
+    el: &chromiumoxide::Element,
+    sel: &str,
+    text: &str,
+    submit: bool,
+    append: bool,
+) -> Result<String, String> {
+    if let Err(e) = el.click().await {
+        return Err(format!("focus failed: {e:#}"));
+    }
+    if !append {
+        // Clear existing content via JS, then type (typing triggers real key events).
+        let clear_js = format!(
+            "(() => {{ const el = document.querySelector({}); if (el) {{ el.focus(); if ('value' in el) {{ el.value=''; el.dispatchEvent(new Event('input', {{bubbles:true}})); }} }} }})()",
+            serde_json::to_string(&sel).unwrap()
+        );
+        let _ = page.evaluate(clear_js.as_str()).await;
+    }
     // Type line-by-line: '\n' has no key definition, so press Enter between
     // lines. Leading whitespace is stripped and left to the editor's
     // auto-indent (typing it verbatim would double-indent); electric
     // characters like `}` re-indent themselves in code editors.
     // Single-line text keeps its exact spacing.
-    if !b.text.contains('\n') {
-        if let Err(e) = el.type_str(&b.text).await {
-            return err(format!("type failed: {e:#}"));
+    if !text.contains('\n') {
+        if let Err(e) = el.type_str(text).await {
+            return Err(format!("type failed: {e:#}"));
         }
     } else {
         let mut first = true;
-        for line in b.text.replace('\t', "    ").split('\n') {
+        for line in text.replace('\t', "    ").split('\n') {
             if !first {
                 if let Err(e) = el.press_key("Enter").await {
-                    return err(format!("newline failed: {e:#}"));
+                    return Err(format!("newline failed: {e:#}"));
                 }
             }
             first = false;
             let content = line.trim_start();
             if !content.is_empty() {
                 if let Err(e) = el.type_str(content).await {
-                    return err(format!("type failed: {e:#}"));
+                    return Err(format!("type failed: {e:#}"));
                 }
             }
         }
     }
-    if b.submit {
-        if let Err(e) = el.press_key("Enter").await {
-            return err(format!("submit (Enter) failed: {e:#}"));
-        }
+    if submit {
+        press_enter(page).await?;
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    ok(&format!("typed into {sel}"))
+    Ok(format!("typed into {sel}"))
+}
+
+/// Trusted bulk-text insertion at the current cursor (survives newlines and
+/// any characters; also drives the frame-focused fallback path).
+async fn insert_text(page: &Page, text: &str) -> Result<(), String> {
+    use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
+    if text.is_empty() {
+        return Ok(());
+    }
+    page.execute(InsertTextParams::new(text.to_string()))
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("type failed: {e:#}"))
+}
+
+async fn press_enter(page: &Page) -> Result<(), String> {
+    use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+    let params = DispatchKeyEventParams::builder()
+        .r#type(DispatchKeyEventType::RawKeyDown)
+        .key("Enter".to_string())
+        .code("Enter".to_string())
+        .windows_virtual_key_code(13)
+        .native_virtual_key_code(13)
+        .build()
+        .unwrap();
+    page.execute(params)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("submit (Enter) failed: {e:#}"))
 }
 
 #[derive(Deserialize)]
@@ -761,16 +1272,223 @@ struct PressReq {
 async fn api_press(State(s): State<AppState>, Json(b): Json<PressReq>) -> Json<serde_json::Value> {
     let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("press", &b.key);
-    match page.find_element("body").await {
-        Ok(el) => match el.press_key(b.key.as_str()).await {
-            Ok(_) => {
-                tokio::time::sleep(Duration::from_millis(80)).await;
-                ok(&format!("pressed {}", b.key))
-            }
-            Err(e) => err(format!("press failed: {e:#}")),
-        },
-        Err(e) => err(format!("press failed (no body?): {e:#}")),
+    let run = async {
+        // Modifier chords ("ctrl+c", "ctrl+shift+t", "alt+F4", "cmd+v"):
+        // split into modifiers + final key and dispatch raw CDP key events.
+        if b.key.contains('+') {
+            return press_chord(&page, &b.key)
+                .await
+                .map_err(|e| friendly_cdp_error(s.port, "press failed", e));
+        }
+        match tokio::time::timeout(CDP_TIMEOUT, page.find_element("body")).await {
+            Ok(Ok(el)) => match tokio::time::timeout(CDP_TIMEOUT, el.press_key(b.key.as_str())).await {
+                Ok(Ok(_)) => {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    Ok(format!("pressed {}", b.key))
+                }
+                Ok(Err(e)) => Err(friendly_cdp_error(s.port, "press failed", e)),
+                Err(_) => Err(press_timeout()),
+            },
+            _ => Err(press_timeout()),
+        }
+    };
+    match tokio::time::timeout(CDP_TIMEOUT, run).await {
+        Ok(Ok(msg)) => ok(&msg),
+        Ok(Err(e)) => err(e),
+        Err(_) => err(press_timeout()),
     }
+}
+
+fn press_timeout() -> String {
+    format!(
+        "press timed out after {}s — the page may be stuck; retry or reload",
+        CDP_TIMEOUT.as_secs()
+    )
+}
+
+/// (CDP key, code, Windows virtual-key code) for keys usable in chords and
+/// single presses. Letters/digits are derived programmatically; this covers
+/// the named non-printables.
+fn named_key(key: &str) -> Option<(&'static str, &'static str, i64)> {
+    Some(match key {
+        "Enter" => ("Enter", "Enter", 13),
+        "Tab" => ("Tab", "Tab", 9),
+        "Escape" | "Esc" => ("Escape", "Escape", 27),
+        "Backspace" => ("Backspace", "Backspace", 8),
+        "Delete" | "Del" => ("Delete", "Delete", 46),
+        " " | "Space" | "Spacebar" => (" ", "Space", 32),
+        "ArrowLeft" | "Left" => ("ArrowLeft", "ArrowLeft", 37),
+        "ArrowUp" | "Up" => ("ArrowUp", "ArrowUp", 38),
+        "ArrowRight" | "Right" => ("ArrowRight", "ArrowRight", 39),
+        "ArrowDown" | "Down" => ("ArrowDown", "ArrowDown", 40),
+        "Home" => ("Home", "Home", 36),
+        "End" => ("End", "End", 35),
+        "PageUp" => ("PageUp", "PageUp", 33),
+        "PageDown" => ("PageDown", "PageDown", 34),
+        "F1" => ("F1", "F1", 112),
+        "F2" => ("F2", "F2", 113),
+        "F3" => ("F3", "F3", 114),
+        "F4" => ("F4", "F4", 115),
+        "F5" => ("F5", "F5", 116),
+        "F6" => ("F6", "F6", 117),
+        "F7" => ("F7", "F7", 118),
+        "F8" => ("F8", "F8", 119),
+        "F9" => ("F9", "F9", 120),
+        "F10" => ("F10", "F10", 121),
+        "F11" => ("F11", "F11", 122),
+        "F12" => ("F12", "F12", 123),
+        _ => return None,
+    })
+}
+
+/// Resolve a single key to (key, code, key_code, text): printable ASCII
+/// first (letters/digits/punctuation via US layout rules), then named keys.
+fn resolve_key(key: &str) -> Option<(String, String, i64, Option<String>)> {
+    if key.chars().count() == 1 {
+        let c = key.chars().next().unwrap();
+        if c.is_ascii_alphabetic() {
+            let upper = c.to_ascii_uppercase();
+            return Some((upper.to_string(), format!("Key{upper}"), upper as i64, Some(key.to_string())));
+        }
+        if c.is_ascii_digit() {
+            return Some((key.to_string(), format!("Digit{key}"), c as i64, Some(key.to_string())));
+        }
+        if c.is_ascii_graphic() || c == ' ' {
+            return Some((key.to_string(), String::new(), 0, Some(key.to_string())));
+        }
+        return None;
+    }
+    named_key(key).map(|(k, code, kc)| (k.to_string(), code.to_string(), kc, None))
+}
+
+/// Press a modifier chord: e.g. "ctrl+c", "ctrl+shift+t", "alt+F4".
+/// Modifier names: ctrl/control, alt, shift, meta/cmd/command/win.
+async fn press_chord(page: &Page, chord: &str) -> Result<String, String> {
+    use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+    let parts: Vec<&str> = chord.split('+').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    if parts.len() < 2 {
+        return Err(format!("malformed chord {chord:?} — use e.g. ctrl+c"));
+    }
+    let mut mask: i64 = 0;
+    let mut mods: Vec<(&str, &str, i64)> = vec![];
+    for m in &parts[..parts.len() - 1] {
+        let lower = m.to_lowercase();
+        let def = match lower.as_str() {
+            "ctrl" | "control" => {
+                mask |= 2;
+                ("Control", "ControlLeft", 17)
+            }
+            "alt" | "option" => {
+                mask |= 1;
+                ("Alt", "AltLeft", 18)
+            }
+            "shift" => {
+                mask |= 8;
+                ("Shift", "ShiftLeft", 16)
+            }
+            "meta" | "cmd" | "command" | "win" | "super" => {
+                mask |= 4;
+                ("Meta", "MetaLeft", 91)
+            }
+            _ => return Err(format!("unknown modifier {m:?} in {chord:?} (use ctrl, alt, shift, meta)")),
+        };
+        mods.push(def);
+    }
+    let key_part = parts[parts.len() - 1];
+    // A trailing modifier ("ctrl+shift") just taps the modifiers together.
+    let key_def = match parts[parts.len() - 1].to_lowercase().as_str() {
+        "ctrl" | "control" | "alt" | "option" | "shift" | "meta" | "cmd" | "command" | "win" | "super" => {
+            let lower = parts[parts.len() - 1].to_lowercase();
+            let def = match lower.as_str() {
+                "alt" | "option" => {
+                    mask |= 1;
+                    ("Alt", "AltLeft", 18)
+                }
+                "ctrl" | "control" => {
+                    mask |= 2;
+                    ("Control", "ControlLeft", 17)
+                }
+                "meta" | "cmd" | "command" | "win" | "super" => {
+                    mask |= 4;
+                    ("Meta", "MetaLeft", 91)
+                }
+                _ => {
+                    mask |= 8;
+                    ("Shift", "ShiftLeft", 16)
+                }
+            };
+            mods.push(def);
+            None
+        }
+        _ => Some(resolve_key(key_part).ok_or_else(|| {
+            format!("unknown key {key_part:?} in {chord:?} (letters, digits, Enter, Tab, F1–F12, arrows, …)")
+        })?),
+    };
+    let down = |key: &str, code: &str, kc: i64, modifiers: i64, text: Option<String>| {
+        let mut cmd = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::RawKeyDown)
+            .modifiers(modifiers)
+            .key(key.to_string())
+            .windows_virtual_key_code(kc)
+            .native_virtual_key_code(kc);
+        if !code.is_empty() {
+            cmd = cmd.code(code.to_string());
+        }
+        if let Some(t) = text {
+            cmd = cmd.text(t.clone()).unmodified_text(t);
+        }
+        cmd.build().unwrap()
+    };
+    let up = |key: &str, code: &str, kc: i64, modifiers: i64| {
+        let mut cmd = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::KeyUp)
+            .modifiers(modifiers)
+            .key(key.to_string())
+            .windows_virtual_key_code(kc)
+            .native_virtual_key_code(kc);
+        if !code.is_empty() {
+            cmd = cmd.code(code.to_string());
+        }
+        cmd.build().unwrap()
+    };
+    // Modifier key-downs first (each sees the modifiers pressed so far).
+    let mut seen: i64 = 0;
+    for (k, code, kc) in &mods {
+        seen |= match *k {
+            "Alt" => 1,
+            "Control" => 2,
+            "Meta" => 4,
+            _ => 8,
+        };
+        page.execute(down(k, code, *kc, seen, None))
+            .await
+            .map_err(|e| format!("press failed: {e:#}"))?;
+    }
+    if let Some((k, code, kc, text)) = key_def {
+        // With Ctrl held, the key must NOT carry text (else it types "c"
+        // instead of Copy); without Ctrl, text makes it printable.
+        let with_text = if mask & 2 != 0 { None } else { text };
+        page.execute(down(&k, &code, kc, mask, with_text))
+            .await
+            .map_err(|e| format!("press failed: {e:#}"))?;
+        page.execute(up(&k, &code, kc, mask))
+            .await
+            .map_err(|e| format!("press failed: {e:#}"))?;
+    }
+    for (k, code, kc) in mods.iter().rev() {
+        let rest = mask
+            & !(match *k {
+                "Alt" => 1,
+                "Control" => 2,
+                "Meta" => 4,
+                _ => 8,
+            });
+        page.execute(up(k, code, *kc, rest))
+            .await
+            .map_err(|e| format!("press failed: {e:#}"))?;
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    Ok(format!("pressed {chord}"))
 }
 
 #[derive(Deserialize)]
@@ -783,13 +1501,77 @@ struct EvalReq {
 async fn api_eval(State(s): State<AppState>, Json(b): Json<EvalReq>) -> Json<serde_json::Value> {
     let (tab_id, page) = tab!(&s, b.tab);
     s.push_log("eval", &b.js);
-    match page.evaluate(b.js.as_str()).await {
-        Ok(r) => match r.into_value::<serde_json::Value>() {
+    match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(b.js.as_str())).await {
+        Ok(Ok(r)) => match r.into_value::<serde_json::Value>() {
             Ok(v) => Json(serde_json::json!({ "ok": true, "tab": tab_id, "result": v })),
             Err(_) => Json(serde_json::json!({ "ok": true, "result": "(non-JSON value — side effects applied)" })),
         },
-        Err(e) => err(format!("eval failed: {e:#}")),
+        Ok(Err(e)) => err(friendly_js_error(s.port, e)),
+        Err(_) => err(format!(
+            "eval timed out after {}s — the page may be blocked (check `lb log` for auto-dismissed dialogs)",
+            CDP_TIMEOUT.as_secs()
+        )),
     }
+}
+
+/// Turn a `page.evaluate` failure into something a human/agent can act on.
+/// chromiumoxide surfaces JS exceptions as a Rust-Debug dump of
+/// `ExceptionDetails` (unreadable); extract the JS `description`
+/// (`SyntaxError: …`, `ReferenceError: …`) when present.
+fn friendly_js_error(port: u16, e: impl std::fmt::Debug + std::fmt::Display) -> String {
+    let disp = format!("{e:#}");
+    tracing::warn!("CDP failure (eval): {}", disp.chars().take(300).collect::<String>());
+    let display = disp.as_str();
+    if is_tab_gone_msg(display) {
+        return tab_gone_msg(port);
+    }
+    if is_browser_gone_msg(display) {
+        return gone_err(port)
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("browser process died")
+            .to_string();
+    }
+    let debug = format!("{e:?}");
+    for key in ["description: Some(\"", "text: \""] {
+        if let Some(start) = debug.find(key) {
+            let rest = &debug[start + key.len()..];
+            // Description is a Rust-escaped string; unescape the basics.
+            let mut out = String::new();
+            let mut chars = rest.chars();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    closed = true;
+                    break;
+                }
+                if c == '\\' {
+                    match chars.next() {
+                        Some('n') => out.push('\n'),
+                        Some('t') => out.push('\t'),
+                        Some('r') => out.push('\r'),
+                        Some('"') => out.push('"'),
+                        Some('\\') => out.push('\\'),
+                        Some(o) => {
+                            out.push('\\');
+                            out.push(o);
+                        }
+                        None => break,
+                    }
+                } else {
+                    out.push(c);
+                }
+                if out.len() > 500 {
+                    break;
+                }
+            }
+            if closed && !out.is_empty() {
+                return format!("eval failed: {out}");
+            }
+        }
+    }
+    let short: String = display.chars().take(400).collect();
+    format!("eval failed: {short}")
 }
 
 #[derive(Deserialize)]
@@ -830,9 +1612,19 @@ async fn api_nav(State(s): State<AppState>, Json(b): Json<NavReq>) -> Json<serde
         "back" => "history.back()",
         "forward" => "history.forward()",
         "reload" => "location.reload()",
-        other => return err(format!("unknown nav action: {other}")),
+        other => return err(format!("unknown nav action: {other} (use back, forward or reload)")),
     };
-    let _ = page.evaluate(js).await;
+    match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(js)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return err(friendly_cdp_error(s.port, &format!("navigated {}", b.action), e)),
+        Err(_) => {
+            return err(format!(
+                "nav {} timed out after {}s — the page is likely still navigating; re-check `lb status`",
+                b.action,
+                CDP_TIMEOUT.as_secs()
+            ));
+        }
+    }
     tokio::time::sleep(Duration::from_millis(150)).await;
     let zoom = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.zoom).unwrap_or(1.0);
     apply_zoom(&page, zoom).await;
@@ -849,6 +1641,9 @@ struct ClickAtReq {
     /// "human" when triggered from the web UI; anything else = agent.
     #[serde(default)]
     by: String,
+    /// "single" (default), "double" or "right".
+    #[serde(default = "default_click_kind")]
+    kind: String,
 }
 /// Click at viewport CSS-pixel coordinates (used by the clickable screenshot).
 async fn api_click_at(State(s): State<AppState>, Json(b): Json<ClickAtReq>) -> Json<serde_json::Value> {
@@ -856,15 +1651,29 @@ async fn api_click_at(State(s): State<AppState>, Json(b): Json<ClickAtReq>) -> J
         return err("invalid coordinates".into());
     }
     let (tab_id, page) = tab!(&s, b.tab);
-    s.push_log("click-at", &format!("{}, {}", b.x.round(), b.y.round()));
+    let kind = b.kind.to_lowercase();
+    if kind != "single" && kind != "double" && kind != "right" {
+        return err(format!("unknown click kind: {:?} (use single, double or right)", b.kind));
+    }
+    s.push_log("click-at", &format!("{}, {} [{kind}]", b.x.round(), b.y.round()));
     s.set_cursor(tab_id, b.x, b.y, "click", &b.by).await;
     let point = chromiumoxide::layout::Point::new(b.x, b.y);
-    match page.click(point).await {
-        Ok(_) => {
+    let run = async {
+        if kind == "double" {
+            page.click_with(point, chromiumoxide::types::ClickOptions::builder().click_count(2).build()).await.map(|_| ()).map_err(|e| format!("{e:#}"))
+        } else if kind == "right" {
+            right_click_point(&page, point).await
+        } else {
+            page.click(point).await.map(|_| ()).map_err(|e| format!("{e:#}"))
+        }
+    };
+    match tokio::time::timeout(CDP_TIMEOUT, run).await {
+        Ok(Ok(_)) => {
             tokio::time::sleep(Duration::from_millis(120)).await;
             ok("clicked")
         }
-        Err(e) => err(format!("click failed: {e:#}")),
+        Ok(Err(e)) => err(friendly_cdp_error(s.port, "click failed", e)),
+        Err(_) => err(format!("click timed out after {}s", CDP_TIMEOUT.as_secs())),
     }
 }
 
@@ -885,12 +1694,13 @@ async fn api_scroll(State(s): State<AppState>, Json(b): Json<ScrollReq>) -> Json
     let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("scroll", &format!("{}, {}", b.dx, b.dy));
     let js = format!("window.scrollBy({}, {})", b.dx, b.dy);
-    match page.evaluate(js.as_str()).await {
-        Ok(_) => {
+    match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(js.as_str())).await {
+        Ok(Ok(_)) => {
             tokio::time::sleep(Duration::from_millis(60)).await;
             ok("scrolled")
         }
-        Err(e) => err(format!("scroll failed: {e:#}")),
+        Ok(Err(e)) => err(friendly_cdp_error(s.port, "scroll failed", e)),
+        Err(_) => err(format!("scroll timed out after {}s", CDP_TIMEOUT.as_secs())),
     }
 }
 
@@ -955,8 +1765,8 @@ async fn api_select(State(s): State<AppState>, Json(b): Json<SelectReq>) -> Json
         serde_json::to_string(&sel).unwrap(),
         serde_json::to_string(&b.value).unwrap()
     );
-    match page.evaluate(call.as_str()).await {
-        Ok(r) => match r.into_value::<serde_json::Value>() {
+    match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(call.as_str())).await {
+        Ok(Ok(r)) => match r.into_value::<serde_json::Value>() {
             Ok(v) => {
                 if v.get("error").and_then(|x| x.as_str()).is_some() {
                     // Fall back to keyboard-driving the native control.
@@ -968,7 +1778,8 @@ async fn api_select(State(s): State<AppState>, Json(b): Json<SelectReq>) -> Json
             }
             Err(e) => err(format!("decode select failed: {e:#}")),
         },
-        Err(e) => err(format!("select failed: {e:#}")),
+        Ok(Err(e)) => err(friendly_cdp_error(s.port, "select failed", e)),
+        Err(_) => err(format!("select timed out after {}s", CDP_TIMEOUT.as_secs())),
     }
 }
 
@@ -1051,10 +1862,14 @@ fn default_zoom_action() -> String {
 }
 async fn api_zoom(State(s): State<AppState>, Json(b): Json<ZoomReq>) -> Json<serde_json::Value> {
     let (tab_id, page) = tab!(&s, b.tab);
+    let action = b.action.to_lowercase();
+    if action != "in" && action != "out" && action != "reset" {
+        return err(format!("unknown zoom action: {:?} (use in, out or reset)", b.action));
+    }
     let zoom = {
         let mut t = s.tabs.lock().await;
         let ts = t.map.get_mut(&tab_id).unwrap();
-        ts.zoom = step_zoom(ts.zoom, b.action.as_str());
+        ts.zoom = step_zoom(ts.zoom, action.as_str());
         ts.zoom
     };
     s.push_log("zoom", &format!("tab {tab_id} -> {zoom}"));
@@ -1080,12 +1895,13 @@ async fn api_insert(State(s): State<AppState>, Json(b): Json<InsertReq>) -> Json
     }
     let (_tab_id, page) = tab!(&s, b.tab);
     s.push_log("insert", &format!("{} chars", b.text.chars().count()));
-    match page.execute(InsertTextParams::new(b.text)).await {
-        Ok(_) => {
+    match tokio::time::timeout(CDP_TIMEOUT, page.execute(InsertTextParams::new(b.text))).await {
+        Ok(Ok(_)) => {
             tokio::time::sleep(Duration::from_millis(60)).await;
             ok("inserted")
         }
-        Err(e) => err(format!("insert failed: {e:#}")),
+        Ok(Err(e)) => err(friendly_cdp_error(s.port, "insert failed", e)),
+        Err(_) => err(format!("insert timed out after {}s", CDP_TIMEOUT.as_secs())),
     }
 }
 
@@ -1121,26 +1937,305 @@ async fn api_type_raw(State(s): State<AppState>, Json(b): Json<TypeRawReq>) -> J
 }
 
 #[derive(Deserialize)]
+struct WaitReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
+    /// Snapshot ref ("12"), `css=` selector or plain CSS to wait for.
+    target: String,
+    /// Poll interval seconds is fixed (0.5s); total wait budget:
+    #[serde(default = "default_wait_timeout")]
+    timeout: u64,
+    /// When true, wait until the target *disappears* instead of appears.
+    #[serde(default)]
+    gone: bool,
+}
+fn default_wait_timeout() -> u64 {
+    15
+}
+/// Block (server-side polling) until an element appears — or disappears with
+/// `"gone": true`. Replaces agent sleep/retry loops and kills the
+/// snapshot-right-after-navigation race.
+async fn api_wait(State(s): State<AppState>, Json(b): Json<WaitReq>) -> Json<serde_json::Value> {
+    let (tab_id, page) = tab!(&s, b.tab);
+    let budget = b.timeout.clamp(1, 120);
+    let probe_js = format!(
+        "{WAIT_PROBE_PREFIX}({})",
+        serde_json::to_string(&b.target).unwrap()
+    );
+    s.push_log(
+        "wait",
+        &format!("tab {tab_id} <- {:?}{}", b.target, if b.gone { " (gone)" } else { "" }),
+    );
+    // Tag refs first so waiting on a snapshot ref works right after navigation.
+    let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
+    let start = std::time::Instant::now();
+    loop {
+        let present = match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(probe_js.as_str())).await {
+            Ok(Ok(ev)) => ev.into_value::<bool>().unwrap_or(false),
+            Ok(Err(e)) => {
+                let msg = format!("{e:#}");
+                if is_tab_gone_msg(&msg) {
+                    return err(tab_gone_msg(s.port));
+                }
+                if is_browser_gone_msg(&msg) {
+                    return Json(gone_err(s.port));
+                }
+                false
+            }
+            Err(_) => false,
+        };
+        if present != b.gone {
+            let after = start.elapsed().as_secs_f64();
+            return Json(serde_json::json!({ "ok": true, "tab": tab_id,
+                "message": format!("wait satisfied after {after:.1}s ({} {})",
+                    b.target, if b.gone { "gone" } else { "present" }) }));
+        }
+        if start.elapsed().as_secs() >= budget {
+            return err(format!(
+                "wait timed out after {budget}s: {:?} never {} (page may still be loading — raise --timeout or re-check `lb snapshot`)",
+                b.target,
+                if b.gone { "disappeared" } else { "appeared" }
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[derive(Deserialize)]
+struct ContentReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
+    /// Snapshot ref, `css=` selector or plain CSS. Default: whole page body.
+    #[serde(default)]
+    target: Option<String>,
+    /// Max characters returned (default 8000, cap 100000).
+    #[serde(default = "default_content_max")]
+    max: usize,
+}
+fn default_content_max() -> usize {
+    8000
+}
+
+/// Shared implementation for /api/text and /api/html.
+async fn read_content(
+    s: &AppState,
+    tab: Option<u32>,
+    target: &Option<String>,
+    max: usize,
+    kind: &str,
+) -> Json<serde_json::Value> {
+    let (tab_id, page) = tab!(s, tab);
+    let max = max.clamp(1, 100_000);
+    let prop = if kind == "text" { "\"innerText\"" } else { "\"outerHTML\"" };
+    let js = match target {
+        Some(t) => {
+            let sel = target_to_selector(t);
+            format!(
+                "(() => {{ const el = document.querySelector({sel}); if (el) return el[{prop}]; \
+                 const frames = document.querySelectorAll('iframe'); \
+                 for (const f of frames) {{ try {{ const d = f.contentDocument; if (d) {{ const hit = d.querySelector({sel}); if (hit) return hit[{prop}]; }} }} catch (e) {{}} }} \
+                 return null; }})()",
+                sel = serde_json::to_string(&sel).unwrap()
+            )
+        }
+        None => format!("document.body ? document.body[{prop}] : document.documentElement[{prop}]"),
+    };
+    match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(js.as_str())).await {
+        Ok(Ok(ev)) => match ev.into_value::<Option<String>>() {
+            Ok(Some(content)) => {
+                let truncated = content.len() > max;
+                let clipped: String = content.chars().take(max).collect();
+                Json(serde_json::json!({ "ok": true, "tab": tab_id,
+                    "content": clipped, "truncated": truncated, "chars": content.len() }))
+            }
+            _ => err(format!(
+                "no such element (run `lb snapshot` first){}",
+                target.as_ref().map(|t| format!(": {t}")).unwrap_or_default()
+            )),
+        },
+        Ok(Err(e)) => err(friendly_cdp_error(s.port, &format!("{kind} failed"), e)),
+        Err(_) => err(format!("{kind} timed out after {}s", CDP_TIMEOUT.as_secs())),
+    }
+}
+
+async fn api_text(State(s): State<AppState>, Json(b): Json<ContentReq>) -> Json<serde_json::Value> {
+    s.push_log(
+        "text",
+        &format!("tab {} <- {}", b.tab.unwrap_or(0), b.target.as_deref().unwrap_or("body")),
+    );
+    read_content(&s, b.tab, &b.target, b.max, "text").await
+}
+
+async fn api_html(State(s): State<AppState>, Json(b): Json<ContentReq>) -> Json<serde_json::Value> {
+    s.push_log(
+        "html",
+        &format!("tab {} <- {}", b.tab.unwrap_or(0), b.target.as_deref().unwrap_or("body")),
+    );
+    read_content(&s, b.tab, &b.target, b.max, "html").await
+}
+
+#[derive(Deserialize)]
+struct UploadReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
+    /// Snapshot ref or CSS selector of an `<input type=file>`.
+    target: String,
+    /// Local file path to attach (must exist on the machine running `lb web`).
+    file: String,
+}
+/// Attach a local file to a file input via CDP `DOM.setFileInputFiles` —
+/// the only automation-safe way (typing a path into the input does nothing).
+async fn api_upload(State(s): State<AppState>, Json(b): Json<UploadReq>) -> Json<serde_json::Value> {
+    use chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams;
+    let sel = target_to_selector(&b.target);
+    let (_tab_id, page) = tab!(&s, b.tab);
+    let abs = match std::fs::canonicalize(&b.file) {
+        Ok(p) => p,
+        Err(_) => return err(format!("file not found: {:?} (path is resolved on the `lb web` machine)", b.file)),
+    };
+    if !abs.is_file() {
+        return err(format!("not a file: {}", abs.display()));
+    }
+    s.push_log("upload", &format!("{sel} <- {}", abs.display()));
+    let run = async {
+        if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
+            let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
+        }
+        let el = page
+            .find_element(&sel)
+            .await
+            .map_err(|_| format!("element not found for `{sel}` (run `lb snapshot` first)"))?;
+        // Refuse non-file inputs with a clear message instead of a silent no-op.
+        let kind_js = format!(
+            "(() => {{ const el = document.querySelector({}); if (!el) return 'missing'; return (el.tagName + '/' + (el.getAttribute('type') || '')).toLowerCase(); }})()",
+            serde_json::to_string(&sel).unwrap()
+        );
+        let kind: String = page
+            .evaluate(kind_js.as_str())
+            .await
+            .map_err(|e| format!("upload probe failed: {e:#}"))?
+            .into_value()
+            .unwrap_or_default();
+        if kind != "input/file" {
+            return Err(format!("`{sel}` is {kind}, not a file input (need <input type=file>)"));
+        }
+        let params = SetFileInputFilesParams::builder()
+            .files(vec![abs.to_string_lossy().to_string()])
+            .backend_node_id(el.backend_node_id)
+            .build()
+            .map_err(|e| format!("upload failed to build request: {e:?}"))?;
+        page.execute(params)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("upload failed: {e:#}"))?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        Ok(format!("attached {} to {sel}", abs.display()))
+    };
+    match tokio::time::timeout(CDP_TIMEOUT, run).await {
+        Ok(Ok(msg)) => ok(&msg),
+        Ok(Err(e)) => err(e),
+        Err(_) => err(format!("upload timed out after {}s", CDP_TIMEOUT.as_secs())),
+    }
+}
+
+/// Files downloaded through the browser (see download behavior set at
+/// startup), newest first. Downloads previously fired and vanished with no
+/// feedback; now they land here and are listable.
+async fn api_downloads(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let dir = s.download_dir.clone();
+    let mut files = vec![];
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            // Skip in-progress Chromium downloads.
+            if path.extension().and_then(|x| x.to_str()) == Some("crdownload") {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            files.push(serde_json::json!({
+                "name": entry.file_name().to_string_lossy(),
+                "bytes": bytes,
+                "modified": modified,
+                "path": path.to_string_lossy(),
+            }));
+        }
+    }
+    files.sort_by(|a, b| {
+        b.get("modified").and_then(|x| x.as_u64()).cmp(&a.get("modified").and_then(|x| x.as_u64()))
+    });
+    Json(serde_json::json!({ "ok": true, "dir": dir, "files": files }))
+}
+
+#[derive(Deserialize)]
 struct HoverReq {
     /// Tab id (default: active tab).
     #[serde(default)]
     tab: Option<u32>,
-    x: f64,
-    y: f64,
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
+    /// Snapshot ref or CSS selector to hover instead of coordinates
+    /// (resolves main-frame and same-origin iframe elements).
+    #[serde(default)]
+    target: Option<String>,
 }
 /// Move the mouse without clicking (drives :hover states, tooltips, menus).
 /// Deliberately unlogged — hover fires continuously.
 async fn api_hover(State(s): State<AppState>, Json(b): Json<HoverReq>) -> Json<serde_json::Value> {
-    if !b.x.is_finite() || !b.y.is_finite() || b.x < 0.0 || b.y < 0.0 {
+    let (_tab_id, page) = tab!(&s, b.tab);
+    let (x, y) = match (&b.target, b.x, b.y) {
+        (Some(t), _, _) => {
+            let sel = target_to_selector(t);
+            // Ensure refs exist (snapshot tags elements) — same as click.
+            if !t.trim().starts_with("css=") && t.trim().parse::<u32>().is_ok() {
+                let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
+            }
+            // Main-frame fast path: bounding rect via JS.
+            let rect_js = format!(
+                "(() => {{ const el = document.querySelector({}); if (!el) return null; const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }})()",
+                serde_json::to_string(&sel).unwrap()
+            );
+            let direct: Option<(f64, f64)> =
+                match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(rect_js.as_str())).await {
+                    Ok(Ok(ev)) => ev.into_value::<Vec<f64>>().ok().and_then(|pt| {
+                        (pt.len() == 2 && pt[0].is_finite() && pt[1].is_finite()).then_some((pt[0], pt[1]))
+                    }),
+                    _ => None,
+                };
+            match direct.or(ref_coords(&page, t).await) {
+                Some(pt) => pt,
+                None => return err(format!("element not found for `{sel}` (run `lb snapshot` first)")),
+            }
+        }
+        (None, Some(x), Some(y)) => (x, y),
+        _ => return err("hover needs x+y coordinates or a target (see `lb hover --help`)".into()),
+    };
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
         return err("invalid coordinates".into());
     }
-    let (_tab_id, page) = tab!(&s, b.tab);
-    match page
-        .move_mouse(chromiumoxide::layout::Point::new(b.x, b.y))
-        .await
+    match tokio::time::timeout(
+        CDP_TIMEOUT,
+        page.move_mouse(chromiumoxide::layout::Point::new(x, y)),
+    )
+    .await
     {
-        Ok(_) => Json(serde_json::json!({ "ok": true })),
-        Err(e) => err(format!("hover failed: {e:#}")),
+        Ok(Ok(_)) => Json(serde_json::json!({ "ok": true })),
+        Ok(Err(e)) => err(friendly_cdp_error(s.port, "hover failed", e)),
+        Err(_) => err(format!("hover timed out after {}s", CDP_TIMEOUT.as_secs())),
     }
 }
 
@@ -1165,23 +2260,27 @@ async fn api_wheel(State(s): State<AppState>, Json(b): Json<WheelReq>) -> Json<s
         return err("invalid wheel params".into());
     }
     let (_tab_id, page) = tab!(&s, b.tab);
-    if let Err(e) = page.move_mouse(chromiumoxide::layout::Point::new(b.x, b.y)).await {
-        return err(format!("mouse move failed: {e:#}"));
-    }
-    let params = DispatchMouseEventParams::builder()
-        .r#type(DispatchMouseEventType::MouseWheel)
-        .x(b.x)
-        .y(b.y)
-        .delta_x(b.dx)
-        .delta_y(b.dy)
-        .build()
-        .unwrap();
-    match page.execute(params).await {
-        Ok(_) => {
+    let run = async {
+        if let Err(e) = page.move_mouse(chromiumoxide::layout::Point::new(b.x, b.y)).await {
+            return Err(format!("mouse move failed: {e:#}"));
+        }
+        let params = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MouseWheel)
+            .x(b.x)
+            .y(b.y)
+            .delta_x(b.dx)
+            .delta_y(b.dy)
+            .build()
+            .unwrap();
+        page.execute(params).await.map(|_| ()).map_err(|e| format!("wheel failed: {e:#}"))
+    };
+    match tokio::time::timeout(CDP_TIMEOUT, run).await {
+        Ok(Ok(_)) => {
             tokio::time::sleep(Duration::from_millis(60)).await;
             ok("wheeled")
         }
-        Err(e) => err(format!("wheel failed: {e:#}")),
+        Ok(Err(e)) => err(e),
+        Err(_) => err(format!("wheel timed out after {}s", CDP_TIMEOUT.as_secs())),
     }
 }
 
@@ -1279,13 +2378,14 @@ async fn api_drag(State(s): State<AppState>, Json(b): Json<DragReq>) -> Json<ser
             .await?;
         anyhow::Ok(())
     };
-    match run.await {
-        Ok(()) => {
+    match tokio::time::timeout(CDP_TIMEOUT + Duration::from_secs(10), run).await {
+        Ok(Ok(())) => {
             s.set_cursor(tab_id, b.x2, b.y2, "drag", &b.by).await;
             tokio::time::sleep(Duration::from_millis(120)).await;
             ok("dragged")
         }
-        Err(e) => err(format!("drag failed: {e:#}")),
+        Ok(Err(e)) => err(friendly_cdp_error(s.port, "drag failed", e)),
+        Err(_) => err(format!("drag timed out after {}s", (CDP_TIMEOUT + Duration::from_secs(10)).as_secs())),
     }
 }
 
@@ -1296,12 +2396,13 @@ async fn api_metrics(
 ) -> Json<serde_json::Value> {
     let (_tab_id, page) = tab!(&s, q.tab);
     const METRICS_JS: &str = "({w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio || 1, sx: window.scrollX, sy: window.scrollY})";
-    match page.evaluate(METRICS_JS).await {
-        Ok(r) => match r.into_value::<serde_json::Value>() {
+    match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(METRICS_JS)).await {
+        Ok(Ok(r)) => match r.into_value::<serde_json::Value>() {
             Ok(m) => Json(serde_json::json!({ "ok": true, "metrics": m })),
             Err(e) => err(format!("decode metrics failed: {e:#}")),
         },
-        Err(e) => err(format!("metrics failed: {e:#}")),
+        Ok(Err(e)) => err(friendly_cdp_error(s.port, "metrics failed", e)),
+        Err(_) => err(format!("metrics timed out after {}s", CDP_TIMEOUT.as_secs())),
     }
 }
 
@@ -1385,6 +2486,11 @@ async fn api_log(State(s): State<AppState>) -> Json<serde_json::Value> {
 }
 
 /// List all tabs with basic info for quick overview.
+///
+/// Each tab is probed with a short timeout and falls back to its last known
+/// URL: one wedged renderer (JS dialog, crashed target) must never hang the
+/// whole listing — that used to brick `lb list`, `lb close` and `lb web link`
+/// daemon-wide (stale tabs are flagged so callers can see it).
 async fn api_tabs(State(s): State<AppState>) -> Json<serde_json::Value> {
     // Snapshot ids first so we don't hold the lock across CDP calls.
     let (ids, active) = {
@@ -1393,20 +2499,29 @@ async fn api_tabs(State(s): State<AppState>) -> Json<serde_json::Value> {
     };
     let mut tabs = vec![];
     for id in ids {
-        let page = match s.tabs.lock().await.map.get(&id).map(|ts| ts.page.clone()) {
-            Some(p) => p,
-            None => continue,
+        let (page, last_url, handover_active) = {
+            let t = s.tabs.lock().await;
+            match t.map.get(&id) {
+                Some(ts) => (ts.page.clone(), ts.last_url.clone(), ts.handover.active),
+                None => continue,
+            }
         };
-        let url = page_url(&page).await;
-        let title = page_title(&page).await;
-        let t = s.tabs.lock().await;
-        let ts = t.map.get(&id).unwrap();
+        let probe = async {
+            let url = tokio::time::timeout(TAB_PROBE_TIMEOUT, page.url()).await.ok()?.ok()??;
+            let title = tokio::time::timeout(TAB_PROBE_TIMEOUT, page.get_title()).await.ok()?.ok()?;
+            Some((url, title))
+        };
+        let (url, title, stale) = match tokio::time::timeout(TAB_PROBE_TIMEOUT * 2, probe).await {
+            Ok(Some((u, t))) => (u, t.unwrap_or_default(), false),
+            _ => (last_url, String::new(), true),
+        };
         tabs.push(serde_json::json!({
             "id": id,
             "active": id == active,
             "title": title,
             "url": url,
-            "handover": ts.handover.active,
+            "handover": handover_active,
+            "stale": stale,
         }));
     }
     tabs.sort_by_key(|t| t["id"].as_u64().unwrap_or(0));
@@ -1421,23 +2536,33 @@ struct CloseReq {
 }
 async fn api_close(State(s): State<AppState>, Json(b): Json<CloseReq>) -> Json<serde_json::Value> {
     let (tab_id, _page) = tab!(&s, b.tab);
+    // Drop the tab from our map first, then close the target in the
+    // background with a timeout: a wedged renderer must not hang the close
+    // (this used to make a poisoned tab unkillable).
     let removed = s.tabs.lock().await.map.remove(&tab_id);
     match removed {
         Some(ts) => {
-            let url = page_url(&ts.page).await;
-            let _ = ts.page.close().await;
+            let url = if ts.last_url.is_empty() { "(unknown url)".to_string() } else { ts.last_url.clone() };
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(10), ts.page.close()).await;
+            });
             s.push_log("close", &format!("tab {tab_id} ({url})"));
             // Never leave the daemon tabless: open a fresh blank tab.
             let mut t = s.tabs.lock().await;
             if t.map.is_empty() {
                 drop(t);
-                match s.browser.lock().await.new_page("about:blank").await {
-                    Ok(page) => {
+                let fresh = {
+                    let browser = s.browser.lock().await;
+                    tokio::time::timeout(CDP_TIMEOUT, browser.new_page("about:blank")).await
+                };
+                match fresh {
+                    Ok(Ok(fresh_page)) => {
                         let mut t = s.tabs.lock().await;
                         let id = t.next_id;
                         t.next_id += 1;
+                        spawn_dialog_guard(fresh_page.clone(), s.log.clone(), id);
                         t.map.insert(id, TabState {
-                            page,
+                            page: fresh_page,
                             handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
                             zoom: 1.0,
                             cursor: CursorState::default(),
@@ -1446,7 +2571,8 @@ async fn api_close(State(s): State<AppState>, Json(b): Json<CloseReq>) -> Json<s
                         t.active = id;
                         return ok(&format!("closed tab {tab_id}; opened fresh tab {id}"));
                     }
-                    Err(e) => return err(format!("closed tab {tab_id} but fresh tab failed: {e:#}")),
+                    Ok(Err(e)) => return err(friendly_cdp_error(s.port, &format!("closed tab {tab_id} but fresh tab failed"), e)),
+                    Err(_) => return err(format!("closed tab {tab_id} but the fresh tab timed out — browser may be dead; restart with `lb web --port {} restart`", s.port)),
                 }
             }
             if t.active == tab_id {
@@ -1466,7 +2592,7 @@ async fn api_activate(State(s): State<AppState>, Json(b): Json<ActivateReq>) -> 
     let (tab_id, page) = tab!(&s, Some(b.tab));
     s.tabs.lock().await.active = tab_id;
     // Best-effort: bring to front so a headed window follows the switch.
-    let _ = page.bring_to_front().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), page.bring_to_front()).await;
     s.push_log("activate", &format!("tab {tab_id}"));
     ok(&format!("tab {tab_id} active"))
 }
@@ -1754,13 +2880,18 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .await
         .context("failed to launch Chrome — try --chrome /path/to/chrome or --no-sandbox")?;
 
-    // Drive the browser handler in the background.
+    // Drive the browser handler in the background. When this loop ends the
+    // browser connection is dead — record it so CDP error mapping can tell
+    // "browser died" (restart) apart from "one tab died" (close the tab).
+    BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     tokio::spawn(async move {
         while let Some(h) = handler.next().await {
             if h.is_err() {
                 break;
             }
         }
+        mark_browser_dead();
+        tracing::warn!("browser handler ended — the browser process is gone");
     });
 
     let start_url = args.url.clone().unwrap_or_else(|| "about:blank".into());
@@ -1773,7 +2904,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     tabs_map.insert(
         1u32,
         TabState {
-            page,
+            page: page.clone(),
             handover: HandoverState {
                 active: false,
                 message: String::new(),
@@ -1785,15 +2916,36 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
             last_url: start_url.clone(),
         },
     );
+    let log: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(vec![LogEntry {
+        at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        action: "daemon".into(),
+        detail: "browser launched".into(),
+    }]));
+    // Auto-dismiss JS dialogs on the first tab (alert/confirm/prompt stall
+    // the renderer and used to wedge the whole daemon — see spawn_dialog_guard).
+    spawn_dialog_guard(page, log.clone(), 1);
+    // Route browser downloads into a visible dir instead of the void.
+    let download_dir = std::path::PathBuf::from(&profile).join("downloads").to_string_lossy().to_string();
+    std::fs::create_dir_all(&download_dir).ok();
+    {
+        use chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorParams;
+        use chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorBehavior;
+        let params = SetDownloadBehaviorParams::builder()
+            .behavior(SetDownloadBehaviorBehavior::Allow)
+            .download_path(download_dir.clone())
+            .events_enabled(true)
+            .build()
+            .unwrap();
+        // Best-effort: downloads still work with default behavior if this fails.
+        let _ = browser.execute(params).await;
+    }
     let state = AppState {
         tabs: Arc::new(Mutex::new(Tabs { map: tabs_map, active: 1, next_id: 2 })),
         browser: Arc::new(Mutex::new(browser)),
-        log: Arc::new(Mutex::new(vec![LogEntry {
-            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            action: "daemon".into(),
-            detail: "browser launched".into(),
-        }])),
+        log,
         passcode: passcode.clone(),
+        port: args.port,
+        download_dir,
     };
     // Kept for shutdown: closing the browser releases the profile lock so
     // the next `lb web` starts clean (no orphaned Chrome).
@@ -1823,6 +2975,11 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .route("/api/press", post(api_press))
         .route("/api/eval", post(api_eval))
         .route("/api/nav", post(api_nav))
+        .route("/api/wait", post(api_wait))
+        .route("/api/text", post(api_text))
+        .route("/api/html", post(api_html))
+        .route("/api/upload", post(api_upload))
+        .route("/api/downloads", get(api_downloads))
         .route("/api/handover", get(api_handover_get))
         .route("/api/handover/request", post(api_handover_request))
         .route("/api/handover/claim", post(api_handover_claim))

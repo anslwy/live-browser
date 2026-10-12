@@ -58,8 +58,13 @@ async fn get(server: &str, passcode: Option<&str>, path: &str) -> Result<Value> 
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Ok(unauthorized_value());
     }
-    let v: Value = res.json().await.context("invalid daemon response")?;
-    Ok(v)
+    let status = res.status();
+    let body = res.text().await.context("invalid daemon response")?;
+    if !status.is_success() {
+        let snippet: String = body.chars().take(200).collect();
+        anyhow::bail!("daemon error (HTTP {status}): {snippet}");
+    }
+    serde_json::from_str(&body).context("invalid daemon response")
 }
 
 async fn post(server: &str, passcode: Option<&str>, path: &str, body: Value) -> Result<Value> {
@@ -71,8 +76,13 @@ async fn post(server: &str, passcode: Option<&str>, path: &str, body: Value) -> 
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Ok(unauthorized_value());
     }
-    let v: Value = res.json().await.context("invalid daemon response")?;
-    Ok(v)
+    let status = res.status();
+    let text = res.text().await.context("invalid daemon response")?;
+    if !status.is_success() {
+        let snippet: String = text.chars().take(200).collect();
+        anyhow::bail!("daemon error (HTTP {status}): {snippet}");
+    }
+    serde_json::from_str(&text).context("invalid daemon response")
 }
 
 fn check_ok(v: &Value, json: bool) -> Result<()> {
@@ -99,12 +109,12 @@ fn check_ok(v: &Value, json: bool) -> Result<()> {
     }
 }
 
-pub async fn open(server: &str, passcode: Option<&str>, url: &str, tab: Option<u32>, json: bool) -> Result<()> {
+pub async fn open(server: &str, passcode: Option<&str>, url: &str, tab: Option<u32>, here: bool, json: bool) -> Result<()> {
     let v = post(
         server,
         passcode,
         "/api/open",
-        serde_json::json!({ "url": url, "tab": tab }),
+        serde_json::json!({ "url": url, "tab": tab, "here": here }),
     )
     .await?;
     check_ok(&v, json)
@@ -146,7 +156,7 @@ pub async fn status(server: &str, passcode: Option<&str>, tab: Option<u32>, json
 
 pub async fn snapshot(server: &str, passcode: Option<&str>, tab: Option<u32>, json: bool, full: bool) -> Result<()> {
     let v = get(server, passcode, &format!("/api/snapshot{}", tq(tab))).await?;
-    if json || full {
+    if json {
         print_json(&v);
         return Ok(());
     }
@@ -165,24 +175,50 @@ pub async fn snapshot(server: &str, passcode: Option<&str>, tab: Option<u32>, js
     let empty = vec![];
     let els = v.get("elements").and_then(|x| x.as_array()).unwrap_or(&empty);
     if els.is_empty() {
-        println!("(no interactive elements found — page may still be loading; try `lb snapshot` again or `lb shot`)");
+        println!("(no interactive elements found — page may still be loading; try `lb wait <target>` or `lb snapshot` again)");
     }
     for el in els {
         let r = el.get("ref").and_then(|x| x.as_u64()).unwrap_or(0);
         let tag = el.get("tag").and_then(|x| x.as_str()).unwrap_or("?");
         let name = el.get("name").and_then(|x| x.as_str()).unwrap_or("");
         let href = el.get("href").and_then(|x| x.as_str()).unwrap_or("");
-        if href.is_empty() {
-            println!("[{r}] {tag} \"{name}\"");
-        } else {
-            println!("[{r}] {tag} \"{name}\" -- {href}");
+        if !full {
+            if href.is_empty() {
+                println!("[{r}] {tag} \"{name}\"");
+            } else {
+                println!("[{r}] {tag} \"{name}\" -- {href}");
+            }
+            continue;
         }
+        // --full: one detailed line per element (type/value/frame/coords).
+        let typ = el.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        let value = el.get("value").and_then(|x| x.as_str()).unwrap_or("");
+        let frame = el.get("frame").and_then(|x| x.as_str()).unwrap_or("");
+        let x = el.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let y = el.get("y").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let mut extra = vec![];
+        if !typ.is_empty() {
+            extra.push(format!("type={typ}"));
+        }
+        if !value.is_empty() {
+            extra.push(format!("value={value:?}"));
+        }
+        if !frame.is_empty() {
+            extra.push(format!("frame={frame}"));
+        }
+        extra.push(format!("@{x:.0},{y:.0}"));
+        let mut line = format!("[{r}] {tag} \"{name}\"");
+        if !href.is_empty() {
+            line += &format!(" -- {href}");
+        }
+        line += &format!(" ({})", extra.join(" "));
+        println!("{line}");
     }
     Ok(())
 }
 
 pub async fn shot(server: &str, passcode: Option<&str>, tab: Option<u32>, out: Option<&str>) -> Result<()> {
-    let out = out.unwrap_or("screenshot.png");
+    let out = out.unwrap_or("screenshot.jpg");
     let url = api(server, &format!("/api/screenshot{}", tq(tab)));
     let res = with_auth(http().get(&url), passcode)
         .send()
@@ -213,41 +249,60 @@ pub async fn shot(server: &str, passcode: Option<&str>, tab: Option<u32>, out: O
             }
         }
         tokio::fs::write(out, &bytes).await?;
-        println!("saved {} ({} bytes) — live view: {}/", out, bytes.len(), server.trim_end_matches('/'));
+        // The daemon captures JPEG (q70); say so, and nudge `.png` names.
+        let note = if out.ends_with(".png") {
+            " (note: data is JPEG despite the .png name — prefer .jpg)"
+        } else {
+            ""
+        };
+        println!("saved {out} ({} bytes JPEG) — live view: {}/{note}", bytes.len(), server.trim_end_matches('/'));
     }
     Ok(())
 }
 
-pub async fn click(server: &str, passcode: Option<&str>, target: &str, tab: Option<u32>, json: bool) -> Result<()> {
+pub async fn click(server: &str, passcode: Option<&str>, target: &str, kind: &str, tab: Option<u32>, json: bool) -> Result<()> {
     let v = post(
         server,
         passcode,
         "/api/click",
-        serde_json::json!({ "target": target, "tab": tab }),
+        serde_json::json!({ "target": target, "kind": kind, "tab": tab }),
     )
     .await?;
     check_ok(&v, json)
 }
 
-pub async fn click_at(server: &str, passcode: Option<&str>, x: f64, y: f64, tab: Option<u32>, json: bool) -> Result<()> {
+pub async fn click_at(server: &str, passcode: Option<&str>, x: f64, y: f64, kind: &str, tab: Option<u32>, json: bool) -> Result<()> {
     let v = post(
         server,
         passcode,
         "/api/click-at",
-        serde_json::json!({ "x": x, "y": y, "tab": tab }),
+        serde_json::json!({ "x": x, "y": y, "kind": kind, "tab": tab }),
     )
     .await?;
     check_ok(&v, json)
 }
 
-pub async fn hover(server: &str, passcode: Option<&str>, x: f64, y: f64, tab: Option<u32>, json: bool) -> Result<()> {
-    let v = post(
-        server,
-        passcode,
-        "/api/hover",
-        serde_json::json!({ "x": x, "y": y, "tab": tab }),
-    )
-    .await?;
+#[allow(clippy::too_many_arguments)]
+pub async fn hover(
+    server: &str,
+    passcode: Option<&str>,
+    x: Option<f64>,
+    y: Option<f64>,
+    target: Option<&str>,
+    tab: Option<u32>,
+    json: bool,
+) -> Result<()> {
+    let mut body = serde_json::json!({ "tab": tab });
+    if let Some(t) = target {
+        body["target"] = serde_json::Value::String(t.to_string());
+    }
+    if let Some(x) = x {
+        body["x"] = serde_json::json!(x);
+    }
+    if let Some(y) = y {
+        body["y"] = serde_json::json!(y);
+    }
+    let v = post(server, passcode, "/api/hover", body).await?;
     if json {
         print_json(&v);
         return Ok(());
@@ -327,12 +382,14 @@ pub async fn zoom(server: &str, passcode: Option<&str>, action: &str, tab: Optio
     check_ok(&v, json)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn type_text(
     server: &str,
     passcode: Option<&str>,
     target: &str,
     text: &str,
     submit: bool,
+    append: bool,
     tab: Option<u32>,
     json: bool,
 ) -> Result<()> {
@@ -340,7 +397,7 @@ pub async fn type_text(
         server,
         passcode,
         "/api/type",
-        serde_json::json!({ "target": target, "text": text, "submit": submit, "tab": tab }),
+        serde_json::json!({ "target": target, "text": text, "submit": submit, "append": append, "tab": tab }),
     )
     .await?;
     check_ok(&v, json)
@@ -483,8 +540,113 @@ pub async fn claim(server: &str, passcode: Option<&str>, message: &str, tab: Opt
     check_ok(&v, json)
 }
 
-pub async fn log(server: &str, passcode: Option<&str>, json: bool) -> Result<()> {
-    let v = get(server, passcode, "/api/log").await?;
+pub async fn wait(
+    server: &str,
+    passcode: Option<&str>,
+    target: &str,
+    timeout: u64,
+    gone: bool,
+    tab: Option<u32>,
+    json: bool,
+) -> Result<()> {
+    let v = post(
+        server,
+        passcode,
+        "/api/wait",
+        serde_json::json!({ "target": target, "timeout": timeout, "gone": gone, "tab": tab }),
+    )
+    .await?;
+    check_ok(&v, json)
+}
+
+pub async fn content(
+    server: &str,
+    passcode: Option<&str>,
+    kind: &str,
+    target: Option<&str>,
+    max: usize,
+    tab: Option<u32>,
+    json: bool,
+) -> Result<()> {
+    let v = post(
+        server,
+        passcode,
+        &format!("/api/{kind}"),
+        serde_json::json!({ "target": target, "max": max, "tab": tab }),
+    )
+    .await?;
+    if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+        if json {
+            print_json(&v);
+        } else {
+            if let Some(c) = v.get("content").and_then(|x| x.as_str()) {
+                println!("{c}");
+            }
+            if v.get("truncated").and_then(|x| x.as_bool()) == Some(true) {
+                let n = v.get("chars").and_then(|x| x.as_u64()).unwrap_or(0);
+                eprintln!("(truncated to {max} of {n} chars — raise --max or use --json)");
+            }
+        }
+        Ok(())
+    } else {
+        let e = v.get("error").and_then(|x| x.as_str()).unwrap_or("failed");
+        if json {
+            print_json(&v);
+        } else {
+            eprintln!("error: {e}");
+        }
+        std::process::exit(1);
+    }
+}
+
+pub async fn upload(
+    server: &str,
+    passcode: Option<&str>,
+    target: &str,
+    file: &str,
+    tab: Option<u32>,
+    json: bool,
+) -> Result<()> {
+    let v = post(
+        server,
+        passcode,
+        "/api/upload",
+        serde_json::json!({ "target": target, "file": file, "tab": tab }),
+    )
+    .await?;
+    check_ok(&v, json)
+}
+
+pub async fn downloads(server: &str, passcode: Option<&str>, json: bool) -> Result<()> {
+    let v = get(server, passcode, "/api/downloads").await?;
+    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        eprintln!(
+            "error: {}",
+            v.get("error").and_then(|x| x.as_str()).unwrap_or("downloads failed")
+        );
+        std::process::exit(1);
+    }
+    if json {
+        print_json(&v);
+        return Ok(());
+    }
+    let dir = v.get("dir").and_then(|x| x.as_str()).unwrap_or("");
+    println!("download dir: {dir}");
+    let empty = vec![];
+    let files = v.get("files").and_then(|x| x.as_array()).unwrap_or(&empty);
+    if files.is_empty() {
+        println!("(no downloads yet)");
+        return Ok(());
+    }
+    for f in files {
+        let name = f.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+        let bytes = f.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+        println!("{bytes:>10}  {name}");
+    }
+    Ok(())
+}
+
+pub async fn log(server: &str, passcode: Option<&str>, json: bool) -> Result<()> {    let v = get(server, passcode, "/api/log").await?;
     if json {
         print_json(&v);
     } else {

@@ -91,19 +91,25 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Update { force } => update::update(force).await,
-        Commands::Open { url, json } => client::open(&server, pass, &url, tab, json).await,
+        Commands::Open { url, here, json } => client::open(&server, pass, &url, tab, here, json).await,
         Commands::Status { json } => client::status(&server, pass, tab, json).await,
         Commands::List { json } => client::list(&server, pass, json).await,
         Commands::Close { tab: t, json } => client::close(&server, pass, t.or(tab), json).await,
         Commands::Use { tab: t, json } => client::use_tab(&server, pass, t, json).await,
         Commands::Snapshot { json, full } => client::snapshot(&server, pass, tab, json, full).await,
         Commands::Shot { out } => client::shot(&server, pass, tab, Some(out.as_str())).await,
-        Commands::Click { target, json } => client::click(&server, pass, &target, tab, json).await,
-        Commands::ClickAt { x, y, json } => client::click_at(&server, pass, x, y, tab, json).await,
-        Commands::Hover { x, y, json } => client::hover(&server, pass, x, y, tab, json).await,
+        Commands::Click { target, double, right, json } => {
+            let kind = if double { "double" } else if right { "right" } else { "single" };
+            client::click(&server, pass, &target, kind, tab, json).await
+        }
+        Commands::ClickAt { x, y, double, right, json } => {
+            let kind = if double { "double" } else if right { "right" } else { "single" };
+            client::click_at(&server, pass, x, y, kind, tab, json).await
+        }
+        Commands::Hover { x, y, on, json } => client::hover(&server, pass, x, y, on.as_deref(), tab, json).await,
         Commands::Scroll { dx, dy, json } => client::scroll(&server, pass, dx, dy, tab, json).await,
-        Commands::Wheel { x, y, dy, dx, json } => {
-            client::wheel(&server, pass, x, y, dx, dy, tab, json).await
+        Commands::Wheel { x, y, dy, dx, dy_flag, dx_flag, json } => {
+            client::wheel(&server, pass, x, y, dx_flag.unwrap_or(dx), dy_flag.unwrap_or(dy), tab, json).await
         }
         Commands::Drag { x1, y1, x2, y2, steps, json } => {
             client::drag(&server, pass, x1, y1, x2, y2, steps, tab, json).await
@@ -113,8 +119,9 @@ async fn main() -> Result<()> {
             target,
             text,
             submit,
+            append,
             json,
-        } => client::type_text(&server, pass, &target, &text, submit, tab, json).await,
+        } => client::type_text(&server, pass, &target, &text, submit, append, tab, json).await,
         Commands::Press { key, json } => client::press(&server, pass, &key, tab, json).await,
         Commands::Select { target, value, json } => {
             client::select(&server, pass, &target, &value, tab, json).await
@@ -130,6 +137,19 @@ async fn main() -> Result<()> {
         Commands::HandoverDone { json } => client::handover_done(&server, pass, tab, json).await,
         Commands::Claim { message, json } => client::claim(&server, pass, &message, tab, json).await,
         Commands::Log { json } => client::log(&server, pass, json).await,
+        Commands::Wait { target, timeout, gone, json } => {
+            client::wait(&server, pass, &target, timeout, gone, tab, json).await
+        }
+        Commands::Text { target, max, json } => {
+            client::content(&server, pass, "text", target.as_deref(), max, tab, json).await
+        }
+        Commands::Html { target, max, json } => {
+            client::content(&server, pass, "html", target.as_deref(), max, tab, json).await
+        }
+        Commands::Upload { target, file, json } => {
+            client::upload(&server, pass, &target, &file, tab, json).await
+        }
+        Commands::Downloads { json } => client::downloads(&server, pass, json).await,
         Commands::Mcp => mcp::run(server, passcode, tab).await,
     }
 }

@@ -86,11 +86,13 @@ pub async fn latest_tag() -> Result<String> {
 }
 
 /// Human one-liner comparing this binary with `latest`.
+/// Names both versions so a stale "already latest" vs. a startup "update
+/// available" can never contradict each other silently.
 pub fn status_line(latest: &str) -> String {
     if is_newer(CURRENT, latest) {
         format!("update available: {latest} (you have v{CURRENT}) — run `lb update`")
     } else {
-        format!("already on the latest release (v{CURRENT})")
+        format!("already on the latest release (you have v{CURRENT}; latest is {latest})")
     }
 }
 
