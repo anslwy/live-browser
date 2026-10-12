@@ -149,7 +149,14 @@ pub async fn binary_version(path: &str) -> Option<String> {
 /// connection dropping before the first tab). Runs BEFORE the running browser
 /// is touched, so a dud is rejected with its own stderr attached while the
 /// old browser is still up.
+///
+/// Success is the DOM dump appearing on stdout — NOT process exit:
+/// CloakBrowser on macOS prints `<html>…</html>` then hangs instead of
+/// exiting when `--user-data-dir` is given (system Chrome exits cleanly), so
+/// waiting for exit via `output()` always times out and blocks switching.
 pub async fn smoke_test_headless(binary: &str, no_sandbox: bool) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
     let dir = std::env::temp_dir().join(format!("lb-smoke-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -165,25 +172,89 @@ pub async fn smoke_test_headless(binary: &str, no_sandbox: bool) -> Result<()> {
     if no_sandbox {
         args.push("--no-sandbox".to_string());
     }
-    let run = tokio::time::timeout(
-        std::time::Duration::from_secs(45),
-        tokio::process::Command::new(binary).args(&args).output(),
-    )
-    .await;
+    let mut child = tokio::process::Command::new(binary)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawn {binary}"))?;
+    let mut stdout = child.stdout.take().context("capture smoke stdout")?;
+    let mut stderr = child.stderr.take().context("capture smoke stderr")?;
+
+    // Watch stdout for the dump marker; drain stderr alongside so a chatty
+    // child can never block on a full pipe. Bounded at 45s like before.
+    let watched = async {
+        let mut out: Vec<u8> = Vec::with_capacity(4096);
+        let mut err: Vec<u8> = Vec::with_capacity(4096);
+        let mut tmp_out = [0u8; 4096];
+        let mut tmp_err = [0u8; 4096];
+        let mut stdout_eof = false;
+        let mut stderr_eof = false;
+        loop {
+            tokio::select! {
+                n = stdout.read(&mut tmp_out), if !stdout_eof => {
+                    let n = n.with_context(|| "read smoke stdout")?;
+                    if n == 0 {
+                        stdout_eof = true;
+                    } else {
+                        out.extend_from_slice(&tmp_out[..n]);
+                        if out.len() > 512 * 1024 {
+                            anyhow::bail!("smoke run produced >512KiB without a DOM dump");
+                        }
+                        let s = String::from_utf8_lossy(&out);
+                        if s.contains("</html>") || s.contains("<html") {
+                            return Ok::<_, anyhow::Error>((out, err));
+                        }
+                    }
+                }
+                n = stderr.read(&mut tmp_err), if !stderr_eof => {
+                    let n = n.with_context(|| "read smoke stderr")?;
+                    if n == 0 {
+                        stderr_eof = true;
+                    } else if err.len() < 64 * 1024 {
+                        err.extend_from_slice(&tmp_err[..n]);
+                    }
+                }
+                status = child.wait() => {
+                    let status = status.with_context(|| "wait smoke")?;
+                    if status.success() {
+                        return Ok((out, err));
+                    }
+                    let tail = tail_bytes(&err, &out);
+                    anyhow::bail!("smoke run exited {status}: {tail}");
+                }
+            }
+            if stdout_eof && stderr_eof {
+                // Both pipes closed without a marker or exit (shouldn't
+                // happen — wait() should have fired); fall through to wait.
+                let status = child.wait().await.with_context(|| "wait smoke eof")?;
+                if status.success() {
+                    return Ok((out, err));
+                }
+                let tail = tail_bytes(&err, &out);
+                anyhow::bail!("smoke run exited {status}: {tail}");
+            }
+        }
+    };
+    let run = tokio::time::timeout(std::time::Duration::from_secs(45), watched).await;
+    // Reap the child (it may still be hanging post-dump — the Cloak case)
+    // before removing the throwaway profile (Windows locks it while live).
+    let _ = child.kill().await;
+    let _ = child.wait().await;
     std::fs::remove_dir_all(&dir).ok();
     match run {
         Err(_) => anyhow::bail!("smoke run timed out after 45s (first launch can be slow — retry)"),
-        Ok(Err(e)) => anyhow::bail!("smoke run failed to spawn: {e:#}"),
-        Ok(Ok(o)) if o.status.success() => Ok(()),
-        Ok(Ok(o)) => anyhow::bail!("smoke run exited {}: {}", o.status, output_tail(&o)),
+        Ok(Err(e)) => anyhow::bail!("smoke run failed: {e:#}"),
+        Ok(Ok(_)) => Ok(()),
     }
 }
 
 /// Last ~1500 chars of stderr (else stdout) for error display.
-fn output_tail(o: &std::process::Output) -> String {
-    let err = String::from_utf8_lossy(&o.stderr);
+fn tail_bytes(stderr: &[u8], stdout: &[u8]) -> String {
+    let err = String::from_utf8_lossy(stderr);
     let src = if err.trim().is_empty() {
-        String::from_utf8_lossy(&o.stdout)
+        String::from_utf8_lossy(stdout)
     } else {
         err
     };

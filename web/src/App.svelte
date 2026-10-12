@@ -1121,7 +1121,7 @@
               {#if browsers.download.phase === 'error'}
                 <p class="mono" style="color:var(--danger);margin:6px 0 0"><Icon name="warn" /> {browsers.download.message}</p>
               {/if}
-              <p class="muted setnote">Switching relaunches the browser in place — open tabs reset, logins persist.</p>
+              <p class="muted setnote">Switching relaunches the browser in place — open tabs reset, logins persist per browser (System Chrome and CloakBrowser keep separate profiles).</p>
             {:else if browsersErr}
               <p class="mono" style="color:var(--danger);margin:6px 0 0"><Icon name="warn" /> {browsersErr}</p>
             {:else}

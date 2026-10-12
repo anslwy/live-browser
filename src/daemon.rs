@@ -2759,8 +2759,9 @@ async fn api_activate(State(s): State<AppState>, Json(b): Json<ActivateReq>) -> 
 // ---------------------------------------------------------------------------
 // Browser manager (Settings → Browser): list / download / switch the Chrome
 // binary without restarting the daemon process. Switching relaunches the
-// browser in-process on the same profile — open tabs are lost (same as a
-// restart), logins/cookies persist.
+// browser in-process — open tabs are lost (same as a restart). Profiles are
+// per browser kind (`<profile>` vs `<profile>-cloak`), so each kind keeps its
+// own logins/cookies across switches.
 // ---------------------------------------------------------------------------
 
 /// Effective chrome path for `launch` (explicit `--chrome`, else auto-detect).
@@ -2866,10 +2867,16 @@ struct BrowsersUseReq {
 
 /// Switch the running browser in-process: pre-validate the target (version +
 /// headless smoke run) while the old browser is still up, then close the old
-/// browser, launch the new one on the same profile, and reset to a single
-/// blank tab. Bounded throughout; ANY post-close failure rolls back to the
-/// previous binary, so the daemon is never left browserless and the UI never
-/// claims a switch that didn't happen.
+/// browser, launch the new one, and reset to a single blank tab. Bounded
+/// throughout; ANY post-close failure rolls back to the previous binary, so
+/// the daemon is never left browserless and the UI never claims a switch
+/// that didn't happen.
+///
+/// Profiles are per browser kind (`<profile>` for system, `<profile>-cloak`
+/// for CloakBrowser): the two builds are usually months apart (e.g. system
+/// Chrome 155 vs free Cloak 145) and the older build trap-crashes on a profile
+/// the newer one has touched, so sharing one dir makes system→cloak switches
+/// fail. Each kind keeps its own logins across switches instead.
 async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseReq>) -> Json<serde_json::Value> {
     let kind = b.kind.trim().to_lowercase();
     let target: String = match kind.as_str() {
@@ -2917,16 +2924,29 @@ async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseRe
     }
     let mut launch = s.launch.lock().await.clone();
     let previous = launch.chrome.clone();
+    let previous_profile = launch.profile.clone();
     launch.chrome = Some(target.clone());
+    // Per-kind profile (see fn docs): deterministic so repeated switches are
+    // stable (system <-> base, cloak <-> base-cloak). A first switch to Cloak
+    // starts fresh there — log in again once, it persists afterwards.
+    launch.profile = kind_profile(&launch.profile, &kind);
+    let profile_fresh = !std::path::Path::new(&launch.profile).exists();
+    std::fs::create_dir_all(&launch.profile).ok();
     match launch_with_page(&launch).await {
         Ok((nb, page)) => {
             install_fresh_browser(&s, &mut browser, launch.clone(), nb, page).await;
             s.push_log("browser", &format!("now using {target} (tabs reset)"));
-            Json(serde_json::json!({ "ok": true, "message": format!("now using {target} (open tabs were reset)") }))
+            let tabs_note = "open tabs were reset";
+            if profile_fresh {
+                Json(serde_json::json!({ "ok": true, "message": format!("now using {target} ({tabs_note}; fresh {kind} profile — please log in again)") }))
+            } else {
+                Json(serde_json::json!({ "ok": true, "message": format!("now using {target} ({tabs_note})") }))
+            }
         }
         Err(stage) => {
             // Roll back so the daemon is never left browserless.
             launch.chrome = previous;
+            launch.profile = previous_profile;
             match launch_with_page(&launch).await {
                 Ok((rb, page)) => {
                     let prev = launch.chrome.clone().unwrap_or_default();
@@ -2940,6 +2960,24 @@ async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseRe
                 }
             }
         }
+    }
+}
+
+/// Profile dir for a browser kind, derived from the daemon's base profile:
+/// system uses the base dir itself, CloakBrowser a `-cloak` sibling. Stable
+/// across repeated switches (system <-> base, cloak <-> base-cloak) and
+/// respectful of an explicit `--profile *-cloak` dir.
+fn kind_profile(base: &str, kind: &str) -> String {
+    if kind == "cloak" {
+        if base.ends_with("-cloak") {
+            base.to_string()
+        } else {
+            format!("{base}-cloak")
+        }
+    } else if base.ends_with("-cloak") {
+        base.trim_end_matches("-cloak").to_string()
+    } else {
+        base.to_string()
     }
 }
 
@@ -2978,7 +3016,11 @@ async fn install_fresh_browser(
 ) {
     **browser_guard = nb;
     BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-    s.launch.lock().await.chrome = launch.chrome;
+    {
+        let mut launch_guard = s.launch.lock().await;
+        launch_guard.chrome = launch.chrome;
+        launch_guard.profile = launch.profile;
+    }
     {
         let mut t = s.tabs.lock().await;
         t.map.clear();
@@ -3523,5 +3565,17 @@ mod tests {
             Some(home.join("web").join("dist"))
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Per-kind profiles are deterministic: repeated system<->cloak switches
+    /// land on the same two dirs, so each kind keeps its own logins.
+    #[test]
+    fn kind_profile_is_stable_across_switches() {
+        let base = "/tmp/lb-profile";
+        assert_eq!(kind_profile(base, "system"), base);
+        assert_eq!(kind_profile(base, "cloak"), "/tmp/lb-profile-cloak");
+        // Back and forth stays on the same pair (no `-cloak-cloak` spiral).
+        assert_eq!(kind_profile("/tmp/lb-profile-cloak", "cloak"), "/tmp/lb-profile-cloak");
+        assert_eq!(kind_profile("/tmp/lb-profile-cloak", "system"), base);
     }
 }
