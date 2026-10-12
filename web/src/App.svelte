@@ -621,12 +621,12 @@
   async function newTab() {
     busy = 'newtab';
     try {
-      // Always a blank tab (Chrome behavior) — the address bar holds the
+      // Always a New Tab page (Chrome behavior) — the address bar holds the
       // current URL now, so it can't double as the new-tab source.
       await apiFetch('/api/open', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: 'about:blank' })
+        body: JSON.stringify({ url: 'chrome://new-tab-page/' })
       });
     } finally {
       busy = '';
@@ -1098,7 +1098,7 @@
             on:mousedown|stopPropagation={() => {}}>×</span>
         </button>
       {/each}
-      <button class="tabnew" on:click={newTab} disabled={busy === 'newtab'} title="New blank tab" aria-label="New tab"><Icon name="plus" /></button>
+      <button class="tabnew" on:click={newTab} disabled={busy === 'newtab'} title="New tab" aria-label="New tab"><Icon name="plus" /></button>
     </div>
   {/if}
 
@@ -1125,7 +1125,7 @@
       <button class="iconplain" on:click={() => nav('back')} title="Back"><Icon name="arrow-left" /></button>
       <button class="iconplain" on:click={() => nav('reload')} title="Reload"><Icon name="reload" /></button>
       <button class="iconplain" on:click={() => nav('forward')} title="Forward"><Icon name="arrow-right" /></button>
-      {#if status?.url && !status.url.startsWith('about:') && !status.url.startsWith('chrome-error')}
+      {#if status?.url && !status.url.startsWith('about:') && !status.url.startsWith('chrome:') && !status.url.startsWith('chrome-error')}
         <a class="iconplain" href={status.url} target="_blank" rel="noreferrer" title="Open this page in your own browser">
           <Icon name="external" />
         </a>
