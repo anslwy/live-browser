@@ -1,4 +1,4 @@
-**One browser, two drivers — you and your agent, in the same tab, at the same time.**
+**Live browser for you and your agent to control and view the tab, at the same time.**
 
 Drive any page from the CLI (`lb click`, `lb type`, `lb snapshot`, …) while
 watching the live view — and grab control yourself for logins, captchas, and
@@ -11,10 +11,43 @@ agent drives via CLI  ──►  lb web (Chrome via CDP + JSON API)
                                      │
 user watches + takes over ──►  web UI (live screenshot, handover banner)
 ```
-## Install (Linux x86_64, macOS arm64/x86_64, Windows x86_64)
 
-One line — installs a browser (Chromium/Chrome) plus the latest prebuilt
-`lb` release into `~/.local` (Windows: `%LOCALAPPDATA%\live-browser`):
+## The core loop (why this exists)
+
+```sh
+# 1. Remote agent opens a page (in place — plain `lb open` opens a NEW tab each time)
+lb open --here https://example.com
+
+# 2. User watches the running page live at the web ui
+
+# 3. Agent reads + acts
+lb snapshot            # [ref] tag "name" list of interactive elements
+lb shot                # JPEG screenshot
+lb wait 7              # block until element [7] appears (kills load races)
+lb click 3
+lb hover --on 5        # hover element [5] (menus, tooltips)
+lb type 1 "ada@example.com" --submit
+
+# 4. Agent hits a login wall → asks the human to take over.
+#    This blocks until the human clicks "Done" in the web UI.
+lb handover "please log in, then click Done in the UI"
+
+# 5. Human logs in using the real browser window, clicks Done.
+#    Normally it's hard to unblock this since the browser is running on a server
+#    You need to either give credential in the prompt or setup remote desktop 
+
+# 6. Agent re-reads the (now logged-in) tab and continues
+lb snapshot
+lb click 7
+...
+```
+
+## Quickstart (Paste this to your agent e.g. OpenCode / OpenClaw)
+```
+Set up live-browser on this machine by following https://raw.githubusercontent.com/anslwy/live-browser/main/docs/agent-setup.md: install the `lb` CLI if missing, start `lb web` on port 8765, add `lb mcp` as an MCP server to my agent config, then verify with `lb status` and report back the live web UI URL.
+```
+
+## Manual Install (If you prefer to setup the CLI & WebUI & MCP yourself)
 
 Linux / macOS:
 
@@ -35,50 +68,26 @@ export PATH="$HOME/.local/bin:$PATH"  # if not already set
 lb web --port 8765
 ```
 
-Prefer building from source (installs Rust + Node toolchains, clones and
-compiles — takes a few minutes)?
+## MCP (`lb mcp`)
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/anslwy/live-browser/main/install.sh | bash -s -- --from-source
+The same actions as JSON-RPC tools on stdio — for opencode, Claude Code, etc.
+The daemon must be running (`lb web`); `lb mcp` is a stateless bridge to it
+(`handover_request` returns immediately — poll `handover_status` instead of
+blocking like `lb handover` does). `tab_link` returns a shareable UI link
+(`/?tabId=N`) that opens the UI focused on that tab.
+
+```json
+"mcp": {
+  "live-browser": {
+    "type": "local",
+    "command": ["lb", "mcp"],
+    "environment": { "LB_SERVER": "http://127.0.0.1:8765" },
+    "enabled": true
+  }
+}
 ```
 
-## The core loop (why this exists)
-
-```sh
-# 1. Agent opens a page (in place — plain `lb open` opens a NEW tab each time)
-lb open --here https://example.com
-
-# 2. User watches the running page live at http://127.0.0.1:8765/
-
-# 3. Agent reads + acts
-lb snapshot            # [ref] tag "name" list of interactive elements
-lb snapshot --full     # ...plus type/value/frame/coords per element
-lb shot                # JPEG screenshot
-lb wait 7              # block until element [7] appears (kills load races)
-lb text                # visible page text (articles, results, messages)
-lb click 3
-lb click 4 --double    # double-click / --right for context menu
-lb hover --on 5        # hover element [5] (menus, tooltips)
-lb type 1 "ada@example.com" --submit
-lb press ctrl+a        # chords: ctrl+c, ctrl+shift+t, alt+F4, cmd+v
-lb upload 9 ./id.pdf   # attach a file to an <input type=file>
-lb downloads           # files fetched through the browser
-
-# 4. Agent hits a login wall → asks the human to take over.
-#    This blocks until the human clicks "Done" in the web UI.
-lb handover "please log in, then click Done in the UI"
-
-# 5. Human logs in using the real browser window, clicks Done.
-
-# 6. Agent re-reads the (now logged-in) tab and continues
-lb snapshot
-lb click 7
-```
-
-The browser profile persists (`~/.cache/live-browser/profile`), so logins/cookies survive
-daemon restarts.
-
-## Setup (developing from a checkout)
+## Development
 
 Requires Chrome/Chromium and Node (for the UI build).
 
@@ -114,7 +123,9 @@ lb web --port 8765 restart
 ## Bot-walled sites (403s)
 
 Some sites (CloudFront WAF, x.com, …) block stock automated Chrome. When a
-site 403s, point `lb` at a stealth Chromium via the existing `--chrome`
+site 403s, try go to the web UI: the gear icon next to the address bar → Browser section lists and select CloakBrowser.
+
+You can also manually point `lb` at a stealth Chromium via the existing `--chrome`
 flag — it is an opt-in dependency, not bundled:
 
 ```sh
@@ -123,17 +134,10 @@ flag — it is an opt-in dependency, not bundled:
 npm install cloakbrowser && npx cloakbrowser install
 # `npx cloakbrowser info` shows the exact binary path (versioned dir):
 lb web --port 8765 --chrome ~/.cloakbrowser/chromium-*/chrome
-# Tip: --headed (visible window) also looks less bot-like than headless.
-# Or in the web UI: the gear icon in the address bar → Browser section lists
-# System Chrome vs CloakBrowser, downloads CloakBrowser with progress, and
-# switches the running browser in place (open tabs reset, logins persist per browser).
-# The choice is remembered (`~/.cache/live-browser/browser.json`), so the
-# next `lb web` without `--chrome` keeps it; `--chrome` overrides and re-saves.
-# A saved choice that no longer starts falls back to system Chrome (clearing
-# the saved choice) instead of wedging startup — each engine keeps its own
-# profile dir, so per-browser logins survive the round-trip.
 ```
 
+## Passcode
+By default all devices in the same network can view and control the web UI. It's better to setup `LB_PASSCODE` if more than one person will be using the network.
 ```sh
 LB_PASSCODE=secret lb web --port 8765          # set it (env preferred over --passcode flag, which leaks via `ps`)
 LB_PASSCODE=secret lb status                      # every CLI command needs the same value
@@ -202,26 +206,7 @@ Notes:
   frames stay invisible — use `lb click-at` with UI coordinates there.
 - **Downloads** land in `<profile>/downloads` (`lb downloads` lists them).
 
-## MCP (`lb mcp`)
-
-The same actions as JSON-RPC tools on stdio — for opencode, Claude Code, etc.
-The daemon must be running (`lb web`); `lb mcp` is a stateless bridge to it
-(`handover_request` returns immediately — poll `handover_status` instead of
-blocking like `lb handover` does). `tab_link` returns a shareable UI link
-(`/?tabId=N`) that opens the UI focused on that tab.
-
-```json
-"mcp": {
-  "live-browser": {
-    "type": "local",
-    "command": ["lb", "mcp"],
-    "environment": { "LB_SERVER": "http://127.0.0.1:8765" },
-    "enabled": true
-  }
-}
-```
-
-## Web UI (http://127.0.0.1:8765/)
+## Web UI (http://127.0.0.1:8765/ by default)
 
 - **Live page view** — always-on coalesced polling (no blink, no scroll jump).
   **Click** the screenshot to click · **drag** on it to drag (select text, sliders, resize panes) ·
