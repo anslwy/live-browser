@@ -29,9 +29,12 @@ pub enum Commands {
     #[command(visible_alias = "daemon")]
     Web(WebArgs),
 
-    /// Open a URL in the running browser
+    /// Open a URL in the running browser (new tab by default; --here reuses the active tab)
     Open {
         url: String,
+        /// Navigate the active tab in place instead of opening a new tab
+        #[arg(long)]
+        here: bool,
         #[arg(long)]
         json: bool,
     },
@@ -61,19 +64,25 @@ pub enum Commands {
     Snapshot {
         #[arg(long)]
         json: bool,
-        /// Include href/value details (default prints compact lines)
+        /// Detailed lines (type/value/frame/coordinates) instead of compact ones
         #[arg(long)]
         full: bool,
     },
-    /// Save a PNG screenshot (also viewable live in the web UI)
+    /// Save a JPEG screenshot (also viewable live in the web UI)
     Shot {
-        /// Output file (default: screenshot.png). Use `-` to print base64 to stdout.
-        #[arg(long, default_value = "screenshot.png")]
+        /// Output file (default: screenshot.jpg). Use `-` to print base64 to stdout.
+        #[arg(long, default_value = "screenshot.jpg")]
         out: String,
     },
     /// Click an element by snapshot ref (e.g. `12`) or CSS (`css=.login`)
     Click {
         target: String,
+        /// Double-click instead of single-click
+        #[arg(long, conflicts_with = "right")]
+        double: bool,
+        /// Right-click (context menu) instead of left-click
+        #[arg(long, conflicts_with = "double")]
+        right: bool,
         #[arg(long)]
         json: bool,
     },
@@ -81,13 +90,23 @@ pub enum Commands {
     ClickAt {
         x: f64,
         y: f64,
+        /// Double-click instead of single-click
+        #[arg(long, conflicts_with = "right")]
+        double: bool,
+        /// Right-click (context menu) instead of left-click
+        #[arg(long, conflicts_with = "double")]
+        right: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Move the mouse (hover: menus, tooltips, highlights)
+    /// Move the mouse (hover: menus, tooltips, highlights).
+    /// Give x y coordinates, or --on <ref|css> to hover an element.
     Hover {
-        x: f64,
-        y: f64,
+        x: Option<f64>,
+        y: Option<f64>,
+        /// Snapshot ref (e.g. `12`) or CSS selector (`css=.menu`) to hover
+        #[arg(long, conflicts_with_all = ["x", "y"])]
+        on: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -100,7 +119,9 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Wheel-scroll whatever is under the point (inner containers included)
+    /// Wheel-scroll whatever is under the point (inner containers included).
+    /// Deltas can be positional (`lb wheel 400 300 500`) or flags
+    /// (`lb wheel 400 300 --dy 500`); flags win when both are given.
     Wheel {
         x: f64,
         y: f64,
@@ -108,6 +129,12 @@ pub enum Commands {
         dy: f64,
         #[arg(default_value_t = 0.0)]
         dx: f64,
+        /// Vertical wheel delta (overrides positional DY)
+        #[arg(long = "dy")]
+        dy_flag: Option<f64>,
+        /// Horizontal wheel delta (overrides positional DX)
+        #[arg(long = "dx")]
+        dx_flag: Option<f64>,
         #[arg(long)]
         json: bool,
     },
@@ -130,13 +157,16 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Type text into an element by ref or CSS
+    /// Type text into an element by ref or CSS (clears first; --append keeps content)
     Type {
         target: String,
         text: String,
         /// Press Enter after typing
         #[arg(long)]
         submit: bool,
+        /// Append to existing content instead of clearing first
+        #[arg(long)]
+        append: bool,
         #[arg(long)]
         json: bool,
     },
@@ -153,9 +183,56 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Press a key (Enter, Tab, Escape, ArrowDown, ...)
+    /// Press a key (Enter, Tab, Escape, ArrowDown, ...) or a chord (ctrl+c, ctrl+shift+t, alt+F4)
     Press {
         key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait until an element appears (or disappears with --gone) — polls server-side
+    Wait {
+        /// Snapshot ref (`12`), `css=` selector or plain CSS
+        target: String,
+        /// Max seconds to wait (default 15, max 120)
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+        /// Wait until the target disappears instead of appears
+        #[arg(long)]
+        gone: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read visible text of the page (or one element) — for "read the article" tasks
+    Text {
+        /// Snapshot ref, `css=` selector or plain CSS (default: whole body)
+        target: Option<String>,
+        /// Max characters returned (default 8000)
+        #[arg(long, default_value_t = 8000)]
+        max: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read HTML of the page (or one element) — for tables/structures snapshot can't see
+    Html {
+        /// Snapshot ref, `css=` selector or plain CSS (default: whole body)
+        target: Option<String>,
+        /// Max characters returned (default 8000)
+        #[arg(long, default_value_t = 8000)]
+        max: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach a local file to an <input type=file> (path is resolved on the `lb web` machine)
+    Upload {
+        /// Snapshot ref or CSS selector of the file input
+        target: String,
+        /// Local file path to attach
+        file: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List files downloaded through the browser (newest first)
+    Downloads {
         #[arg(long)]
         json: bool,
     },

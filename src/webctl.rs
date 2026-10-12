@@ -103,24 +103,51 @@ fn resolve_profile(profile: Option<&str>) -> String {
         .unwrap_or_else(crate::daemon::default_profile_dir)
 }
 
-/// Pids whose command line mentions `profile` and looks like a browser
-/// (Chrome/Chromium/headless_shell) — never our own process.
+/// Pids whose command line shows them as a browser using exactly `profile`
+/// as its `--user-data-dir` — never our own process.
+///
+/// Matched on the exact `--user-data-dir=<profile>` (or two-token) argument,
+/// not a substring: the default profile `…/live-browser/profile` is a string
+/// prefix of a sibling daemon's `…/live-browser/profile-serve`, and a
+/// substring match would SIGKILL the wrong daemon's browser on `lb web stop`.
 fn profile_browser_pids(profile: &str) -> Vec<u32> {
     let me = std::process::id();
     process_list()
         .into_iter()
         .filter(|(pid, args)| {
             *pid != me
-                && args.contains(profile)
                 && {
                     let lower = args.to_lowercase();
-                    lower.contains("chrome")
+                    (lower.contains("chrome")
                         || lower.contains("chromium")
-                        || lower.contains("headless_shell")
+                        || lower.contains("headless_shell"))
+                        && user_data_dir(args) == Some(profile.to_string())
                 }
         })
         .map(|(pid, _)| pid)
         .collect()
+}
+
+/// Value of the `--user-data-dir` argument in a process command line, if any
+/// (handles both `--user-data-dir=X` and `--user-data-dir X` spellings).
+fn user_data_dir(args: &str) -> Option<String> {
+    let mut tokens = args.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        if let Some(v) = tok.strip_prefix("--user-data-dir=") {
+            let v = v.trim_matches('"').trim_matches('\'');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        } else if tok == "--user-data-dir" {
+            if let Some(next) = tokens.next() {
+                let v = next.trim_matches('"').trim_matches('\'');
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// All processes as (pid, full command line).
@@ -353,5 +380,40 @@ pub fn ensure_not_running(port: u16) -> Result<()> {
             Ok(())
         }
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_data_dir_parsing() {
+        assert_eq!(
+            user_data_dir("/opt/google/chrome/chrome --user-data-dir=/home/u/.cache/live-browser/profile --headless"),
+            Some("/home/u/.cache/live-browser/profile".to_string())
+        );
+        assert_eq!(
+            user_data_dir("chrome --user-data-dir /tmp/p --headless"),
+            Some("/tmp/p".to_string())
+        );
+        assert_eq!(user_data_dir("chrome --headless --no-sandbox"), None);
+    }
+
+    /// Regression test: the default profile `…/live-browser/profile` must NOT
+    /// match a sibling daemon's `…/live-browser/profile-serve` (exact
+    /// `--user-data-dir` comparison, never substring).
+    #[test]
+    fn profile_match_is_exact() {
+        let sibling =
+            "/opt/google/chrome/chrome --user-data-dir=/home/u/.cache/live-browser/profile-serve --headless";
+        assert_ne!(
+            user_data_dir(sibling),
+            Some("/home/u/.cache/live-browser/profile".to_string())
+        );
+        assert_eq!(
+            user_data_dir(sibling),
+            Some("/home/u/.cache/live-browser/profile-serve".to_string())
+        );
     }
 }

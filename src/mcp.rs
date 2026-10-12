@@ -147,22 +147,46 @@ pub struct OpenArgs {
     pub url: String,
     #[serde(default)]
     pub tab: Option<u32>,
+    /// Navigate the active tab in place instead of opening a new tab.
+    #[serde(default)]
+    pub here: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ClickArgs {
     /// Snapshot ref (e.g. "12") or CSS selector ("css=.login").
     pub target: String,
+    /// "single" (default), "double" or "right".
+    #[serde(default)]
+    pub kind: Option<String>,
     #[serde(default)]
     pub tab: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PointArgs {
+pub struct ClickAtArgs {
     /// Viewport X in CSS pixels.
     pub x: f64,
     /// Viewport Y in CSS pixels.
     pub y: f64,
+    /// "single" (default), "double" or "right".
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub tab: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HoverArgs {
+    /// Viewport X in CSS pixels (ignored when target is given).
+    #[serde(default)]
+    pub x: Option<f64>,
+    /// Viewport Y in CSS pixels (ignored when target is given).
+    #[serde(default)]
+    pub y: Option<f64>,
+    /// Snapshot ref or CSS selector to hover (menus, tooltips).
+    #[serde(default)]
+    pub target: Option<String>,
     #[serde(default)]
     pub tab: Option<u32>,
 }
@@ -224,6 +248,9 @@ pub struct TypeArgs {
     /// Press Enter after typing (default false).
     #[serde(default)]
     pub submit: bool,
+    /// Append to existing content instead of clearing first (default false).
+    #[serde(default)]
+    pub append: bool,
     #[serde(default)]
     pub tab: Option<u32>,
 }
@@ -248,7 +275,7 @@ pub struct SelectArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PressArgs {
-    /// Key name: Enter, Tab, Escape, ArrowDown, ...
+    /// Key name (Enter, Tab, Escape, ArrowDown, ...) or chord (ctrl+c, ctrl+shift+t, alt+F4, cmd+v).
     pub key: String,
     #[serde(default)]
     pub tab: Option<u32>,
@@ -296,13 +323,49 @@ pub struct ActivateArgs {
     pub tab: u32,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WaitArgs {
+    /// Snapshot ref, css= selector or plain CSS to wait for.
+    pub target: String,
+    /// Max seconds to wait (default 15, max 120).
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    /// Wait until the target disappears instead of appears.
+    #[serde(default)]
+    pub gone: bool,
+    #[serde(default)]
+    pub tab: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ContentArgs {
+    /// Snapshot ref, css= selector or plain CSS (default: whole body).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Max characters returned (default 8000).
+    #[serde(default)]
+    pub max: Option<usize>,
+    #[serde(default)]
+    pub tab: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UploadArgs {
+    /// Snapshot ref or CSS selector of an <input type=file>.
+    pub target: String,
+    /// Local file path to attach (resolved on the `lb web` machine).
+    pub file: String,
+    #[serde(default)]
+    pub tab: Option<u32>,
+}
+
 // ---------------------------------------------------------------------------
 // Tools (one per CLI command; back/forward/reload share `navigate`)
 // ---------------------------------------------------------------------------
 
 #[tool_router]
 impl LbMcp {
-    #[tool(description = "Navigate the tab to a URL (plain text searches Google).")]
+    #[tool(description = "Navigate to a URL: opens a new tab by default (plain text searches Google). Pass here=true to reuse the active tab.")]
     async fn open(
         &self,
         Parameters(a): Parameters<OpenArgs>,
@@ -310,7 +373,7 @@ impl LbMcp {
         let v = self
             .post_json(
                 "/api/open",
-                serde_json::json!({ "url": a.url, "tab": self.tab(a.tab) }),
+                serde_json::json!({ "url": a.url, "tab": self.tab(a.tab), "here": a.here }),
             )
             .await?;
         Ok(Self::daemon_result(v))
@@ -382,13 +445,13 @@ impl LbMcp {
         }
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
         Ok(CallToolResult::success(vec![
-            ContentBlock::image(b64, "image/png"),
-            ContentBlock::text(format!("screenshot ({} bytes)", bytes.len())),
+            ContentBlock::image(b64, "image/jpeg"),
+            ContentBlock::text(format!("screenshot ({} bytes JPEG)", bytes.len())),
         ]))
     }
 
     #[tool(
-        description = "Click an element by snapshot ref (e.g. \"12\") or CSS selector (\"css=.login\")."
+        description = "Click an element by snapshot ref (e.g. \"12\") or CSS selector (\"css=.login\"). Works for same-origin iframe elements too. Set kind to double/right for double- or right-click."
     )]
     async fn click(
         &self,
@@ -397,35 +460,35 @@ impl LbMcp {
         let v = self
             .post_json(
                 "/api/click",
-                serde_json::json!({ "target": a.target, "tab": self.tab(a.tab) }),
+                serde_json::json!({ "target": a.target, "kind": a.kind.unwrap_or_else(|| "single".into()), "tab": self.tab(a.tab) }),
             )
             .await?;
         Ok(Self::daemon_result(v))
     }
 
-    #[tool(description = "Click at viewport coordinates in CSS pixels.")]
+    #[tool(description = "Click at viewport coordinates in CSS pixels. Set kind to double/right for double- or right-click.")]
     async fn click_at(
         &self,
-        Parameters(a): Parameters<PointArgs>,
+        Parameters(a): Parameters<ClickAtArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let v = self
             .post_json(
                 "/api/click-at",
-                serde_json::json!({ "x": a.x, "y": a.y, "tab": self.tab(a.tab) }),
+                serde_json::json!({ "x": a.x, "y": a.y, "kind": a.kind.unwrap_or_else(|| "single".into()), "tab": self.tab(a.tab) }),
             )
             .await?;
         Ok(Self::daemon_result(v))
     }
 
-    #[tool(description = "Move the mouse to viewport coordinates (hover states, tooltips, menus).")]
+    #[tool(description = "Move the mouse: hover an element by snapshot ref/CSS (target) or move to viewport coordinates x/y (hover states, tooltips, menus).")]
     async fn hover(
         &self,
-        Parameters(a): Parameters<PointArgs>,
+        Parameters(a): Parameters<HoverArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let v = self
             .post_json(
                 "/api/hover",
-                serde_json::json!({ "x": a.x, "y": a.y, "tab": self.tab(a.tab) }),
+                serde_json::json!({ "x": a.x, "y": a.y, "target": a.target, "tab": self.tab(a.tab) }),
             )
             .await?;
         Ok(Self::daemon_result(v))
@@ -507,7 +570,7 @@ impl LbMcp {
     }
 
     #[tool(
-        description = "Type text into an element by snapshot ref or CSS. Set submit=true to press Enter afterwards."
+        description = "Type text into an element by snapshot ref or CSS. Clears first unless append=true. Set submit=true to press Enter afterwards."
     )]
     async fn type_text(
         &self,
@@ -518,7 +581,7 @@ impl LbMcp {
                 "/api/type",
                 serde_json::json!({
                     "target": a.target, "text": a.text,
-                    "submit": a.submit, "tab": self.tab(a.tab),
+                    "submit": a.submit, "append": a.append, "tab": self.tab(a.tab),
                 }),
             )
             .await?;
@@ -555,7 +618,7 @@ impl LbMcp {
         Ok(Self::daemon_result(v))
     }
 
-    #[tool(description = "Press a key: Enter, Tab, Escape, ArrowDown, ...")]
+    #[tool(description = "Press a key (Enter, Tab, Escape, ArrowDown, ...) or a modifier chord (ctrl+c, ctrl+shift+t, alt+F4, cmd+v).")]
     async fn press(
         &self,
         Parameters(a): Parameters<PressArgs>,
@@ -726,6 +789,86 @@ impl LbMcp {
         let v = self.get_json("/api/log").await?;
         Ok(Self::daemon_result(v))
     }
+
+    #[tool(description = "Wait until an element appears (or disappears with gone=true): polls server-side. Replaces sleep/retry loops after navigation.")]
+    async fn wait(
+        &self,
+        Parameters(a): Parameters<WaitArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let v = self
+            .post_json(
+                "/api/wait",
+                serde_json::json!({
+                    "target": a.target,
+                    "timeout": a.timeout.unwrap_or(15),
+                    "gone": a.gone,
+                    "tab": self.tab(a.tab),
+                }),
+            )
+            .await?;
+        Ok(Self::daemon_result(v))
+    }
+
+    #[tool(description = "Visible text of the page (or one element by ref/CSS). For reading articles, results, messages.")]
+    async fn text(
+        &self,
+        Parameters(a): Parameters<ContentArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let v = self
+            .post_json(
+                "/api/text",
+                serde_json::json!({
+                    "target": a.target,
+                    "max": a.max.unwrap_or(8000),
+                    "tab": self.tab(a.tab),
+                }),
+            )
+            .await?;
+        Ok(Self::daemon_result(v))
+    }
+
+    #[tool(description = "HTML of the page (or one element by ref/CSS). For tables and structures the snapshot can't see.")]
+    async fn html(
+        &self,
+        Parameters(a): Parameters<ContentArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let v = self
+            .post_json(
+                "/api/html",
+                serde_json::json!({
+                    "target": a.target,
+                    "max": a.max.unwrap_or(8000),
+                    "tab": self.tab(a.tab),
+                }),
+            )
+            .await?;
+        Ok(Self::daemon_result(v))
+    }
+
+    #[tool(description = "Attach a local file to an <input type=file> (path is resolved on the `lb web` machine).")]
+    async fn upload(
+        &self,
+        Parameters(a): Parameters<UploadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let v = self
+            .post_json(
+                "/api/upload",
+                serde_json::json!({
+                    "target": a.target, "file": a.file, "tab": self.tab(a.tab),
+                }),
+            )
+            .await?;
+        Ok(Self::daemon_result(v))
+    }
+
+    #[tool(description = "Files downloaded through the browser (newest first).")]
+    async fn downloads(
+        &self,
+        Parameters(_): Parameters<NoArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let v = self.get_json("/api/downloads").await?;
+        Ok(Self::daemon_result(v))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -735,7 +878,8 @@ impl ServerHandler for LbMcp {
             .with_instructions(
                 "Live Browser: drive the shared browser tab. Typical loop: \
                  status -> snapshot -> click/type_text -> snapshot. \
-                 Use screenshot when layout/coordinates matter. \
+                 Use wait after navigation instead of guessing load timing; \
+                 use text/html to read page content; use screenshot when layout/coordinates matter. \
                  For logins/captchas use handover_request, poll handover_status, then snapshot again. \
                  Use tab_link to get a shareable UI link (/?tabId=N) that opens the UI on a specific tab.",
             )

@@ -45,16 +45,24 @@ curl -fsSL https://raw.githubusercontent.com/anslwy/live-browser/main/install.sh
 ## The core loop (why this exists)
 
 ```sh
-# 1. Agent opens a page
-lb open https://example.com
+# 1. Agent opens a page (in place — plain `lb open` opens a NEW tab each time)
+lb open --here https://example.com
 
 # 2. User watches the running page live at http://127.0.0.1:8765/
 
 # 3. Agent reads + acts
 lb snapshot            # [ref] tag "name" list of interactive elements
-lb shot                # PNG screenshot
+lb snapshot --full     # ...plus type/value/frame/coords per element
+lb shot                # JPEG screenshot
+lb wait 7              # block until element [7] appears (kills load races)
+lb text                # visible page text (articles, results, messages)
 lb click 3
+lb click 4 --double    # double-click / --right for context menu
+lb hover --on 5        # hover element [5] (menus, tooltips)
 lb type 1 "ada@example.com" --submit
+lb press ctrl+a        # chords: ctrl+c, ctrl+shift+t, alt+F4, cmd+v
+lb upload 9 ./id.pdf   # attach a file to an <input type=file>
+lb downloads           # files fetched through the browser
 
 # 4. Agent hits a login wall → asks the human to take over.
 #    This blocks until the human clicks "Done" in the web UI.
@@ -126,30 +134,54 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb web --port N restart` | Stop (if running) and start a new server |
 | `lb web --port N link [tab]` | Print a shareable UI link for a tab (`/?tabId=N`, default: active) |
 | `lb update [--force]` | Update to the latest release (reports when already current) |
-| `lb open <URL\|text>` | Navigate the tab (plain text searches Google) |
+| `lb open <URL\|text> [--here]` | New tab with URL (plain text searches Google); `--here` reuses the active tab |
 | `lb status` | URL, title, handover state |
-| `lb snapshot` | Interactive elements as `[ref] tag "name"` (`--json` for full JSON) |
-| `lb shot [--out f.png]` | Save screenshot (`--out -` prints base64) |
-| `lb click <ref\|css=…>` | Click by snapshot ref or CSS selector |
-| `lb click-at <x> <y>` | Click at viewport coordinates (CSS pixels) |
-| `lb hover <x> <y>` | Move mouse (hover states, tooltips, menus) |
-| `lb type <ref> <text> [--submit]` | Type into an input (Enter with `--submit`) |
-| `lb press <key>` | Key press (`Enter`, `Tab`, `Escape`, …) |
+| `lb list` | All tabs (stale tabs flagged when a renderer is wedged) |
+| `lb close [tab]` | Close a tab (never hangs, even on wedged pages) |
+| `lb use <tab>` | Switch the active tab |
+| `lb snapshot [--full]` | Interactive elements as `[ref] tag "name"` (`--json` for full JSON, `--full` for type/value/frame/coords) |
+| `lb shot [--out f.jpg]` | Save a JPEG screenshot (`--out -` prints base64) |
+| `lb click <ref\|css=…> [--double\|--right]` | Click by snapshot ref or CSS selector (same-origin iframes included) |
+| `lb click-at <x> <y> [--double\|--right]` | Click at viewport coordinates (CSS pixels) |
+| `lb hover <x> <y> \| --on <ref\|css=…>` | Move mouse (hover states, tooltips, menus) |
+| `lb type <ref> <text> [--submit] [--append]` | Type into an input (Enter with `--submit`; `--append` keeps content) |
+| `lb press <key\|chord>` | Key press (`Enter`, `F5`, …) or chord (`ctrl+c`, `ctrl+shift+t`, `alt+F4`) |
+| `lb wait <ref\|css=…> [--timeout s] [--gone]` | Block until an element appears (or disappears) |
+| `lb text [ref\|css=…] [--max N]` | Visible text of the page or one element |
+| `lb html [ref\|css=…] [--max N]` | HTML of the page or one element |
+| `lb upload <ref> <file>` | Attach a local file to an `<input type=file>` |
+| `lb downloads` | Files downloaded through the browser (newest first) |
 | `lb scroll [dx] [dy]` | Scroll the page (default: down 600px) |
-| `lb wheel <x> <y> [--dy N] [--dx N]` | Trackpad-style scroll of whatever is under the point (inner containers too) |
+| `lb wheel <x> <y> [dy] [dx] [--dy N] [--dx N]` | Trackpad-style scroll of whatever is under the point (inner containers too; flags override positionals) |
 | `lb drag <x1> <y1> <x2> <y2>` | Mouse drag — text selection, sliders, resize handles, DnD |
 | `lb insert <text>` | Fast paste at the cursor (focus target first) |
+| `lb select <ref> <value>` | Set a dropdown option by value or visible text |
 | `lb zoom [in\|out\|reset]` | Page zoom for small viewports (persists across navigations) |
-| `lb eval <js>` | Run JS, print JSON-ified result |
+| `lb eval <js>` | Run JS, print JSON-ified result (JS errors reported readably) |
 | `lb back / forward / reload` | History navigation |
 | `lb handover "msg" [--timeout s]` | Request human takeover, block until Done |
 | `lb claim ["msg"]` | Claim control as human (same as UI "Take control") |
 | `lb handover-done` | End handover (human scripts/tests) |
 | `lb mcp` | MCP server on stdio (below) — same actions as the CLI, for agents |
-| `lb log` | Recent action log |
+| `lb log` | Recent action log (includes auto-dismissed JS dialogs) |
 
 Targets accept a snapshot ref (`lb click 12`) or a raw CSS selector
 (`lb click css=.login-button`).
+
+Notes:
+
+- **Tabs:** `lb open` without `--here` (or `--tab`) opens a *new* tab every
+  time. Reuse the active tab with `lb open --here <url>` (or navigate a
+  specific one with `--tab N`), or you will pile up tabs.
+- **JS dialogs** (`alert`/`confirm`/`prompt`) are auto-dismissed by the
+  daemon (logged as `dialog` in `lb log`) so one popup can never wedge a
+  tab or the daemon. `beforeunload` is accepted.
+- **Screenshots are JPEG** (quality 70), not PNG — despite any `.png`
+  filename you choose. Default output is `screenshot.jpg`.
+- **Snapshots pierce same-origin iframes** (flagged `frame=iframe[0]` in
+  `--full`/`--json`, with viewport `@x,y` coordinates). Truly cross-origin
+  frames stay invisible — use `lb click-at` with UI coordinates there.
+- **Downloads** land in `<profile>/downloads` (`lb downloads` lists them).
 
 ## MCP (`lb mcp`)
 
@@ -189,8 +221,8 @@ Dev mode: `cd web && npm run dev` (proxies `/api` to the daemon on :8765).
 ## API (for scripts)
 
 `GET /api/status`, `POST /api/open`, `GET /api/snapshot`, `GET /api/screenshot` (JPEG),
-`GET /api/metrics`, `POST /api/click|click-at|hover|type|type-raw|insert|press|key|eval|nav|scroll|wheel|drag|zoom`,
-`GET /api/handover`, `POST /api/handover/request|claim|done`,
+`GET /api/metrics`, `POST /api/click|click-at|hover|type|type-raw|insert|press|key|eval|nav|scroll|wheel|drag|zoom|select|wait|text|html|upload`,
+`GET /api/downloads`, `GET /api/handover`, `POST /api/handover/request|claim|done`,
 `GET /api/log`. All POSTs take/return JSON with `{ok: …}`.
 
 ## Layout
