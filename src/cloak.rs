@@ -72,11 +72,20 @@ pub fn archive_name() -> Result<String> {
     Ok(format!("cloakbrowser-{}{}", platform_tag()?, archive_ext()))
 }
 
-fn binary_file_name() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "chrome.exe"
+/// Binary location inside `chromium-{version}/`, mirroring the wrapper's
+/// `getBinaryPath`: macOS ships an app bundle
+/// (`Chromium.app/Contents/MacOS/Chromium`), Windows a `chrome.exe`,
+/// Linux a `chrome` — the darwin tarball has no top-level `chrome`.
+fn binary_rel_path() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from("Chromium.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("Chromium")
+    } else if cfg!(target_os = "windows") {
+        PathBuf::from("chrome.exe")
     } else {
-        "chrome"
+        PathBuf::from("chrome")
     }
 }
 
@@ -94,7 +103,7 @@ pub fn cache_dir() -> PathBuf {
 pub fn binary_path(version: &str) -> PathBuf {
     cache_dir()
         .join(format!("chromium-{version}"))
-        .join(binary_file_name())
+        .join(binary_rel_path())
 }
 
 fn is_executable(p: &std::path::Path) -> bool {
@@ -140,7 +149,8 @@ pub struct InstalledCloak {
     pub path: String,
 }
 
-/// Every `chromium-*/chrome` in the cache with an executable bit.
+/// Every installed `chromium-*` in the cache whose platform binary exists
+/// and is executable.
 pub fn installed() -> Vec<InstalledCloak> {
     let dir = cache_dir();
     let entries = std::fs::read_dir(&dir).map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>()).unwrap_or_default();
@@ -151,7 +161,7 @@ pub fn installed() -> Vec<InstalledCloak> {
             Some(v) if !v.starts_with('.') && !v.contains("partial") && !v.contains("stale") => v.to_string(),
             _ => continue,
         };
-        let bin = e.path().join(binary_file_name());
+        let bin = e.path().join(binary_rel_path());
         if is_executable(&bin) {
             out.push(InstalledCloak { version, path: bin.to_string_lossy().to_string() });
         }
@@ -341,16 +351,24 @@ fn extract_staged(archive: &std::path::Path, staging: &std::path::Path, binary_r
         tar.unpack(staging)?;
     }
     // Flatten `archive-root/*` → `staging/*` when the archive has exactly one
-    // top-level directory (tolerates both layouts).
+    // top-level directory (tolerates both layouts) — but NEVER a macOS `.app`
+    // bundle: the bundle structure is the install (mirrors the wrapper).
     let tops: Vec<_> = std::fs::read_dir(staging)?.filter_map(|e| e.ok()).collect();
-    if tops.len() == 1 && tops[0].path().is_dir() {
-        let inner = tops[0].path();
-        let tmp = staging.join(".flatten-tmp");
-        std::fs::rename(&inner, &tmp)?;
-        for e in std::fs::read_dir(&tmp)?.filter_map(|x| x.ok()) {
-            std::fs::rename(e.path(), staging.join(e.file_name()))?;
+    let single_dir = if tops.len() == 1 && tops[0].path().is_dir() {
+        Some(tops[0].path())
+    } else {
+        None
+    };
+    if let Some(inner) = single_dir {
+        let name = inner.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if !name.ends_with(".app") {
+            let tmp = staging.join(".flatten-tmp");
+            std::fs::rename(&inner, &tmp)?;
+            for e in std::fs::read_dir(&tmp)?.filter_map(|x| x.ok()) {
+                std::fs::rename(e.path(), staging.join(e.file_name()))?;
+            }
+            std::fs::remove_dir(&tmp)?;
         }
-        std::fs::remove_dir(&tmp)?;
     }
     #[cfg(unix)]
     {
@@ -460,7 +478,7 @@ pub async fn download_free(version: Option<String>, state: Arc<Mutex<DownloadSta
     let dest = cache.join(format!("chromium-{version}"));
     let staging = cache.join(format!(".lb-staging-{version}"));
     std::fs::remove_dir_all(&staging).ok();
-    let rel = PathBuf::from(binary_file_name());
+    let rel = binary_rel_path();
     let extract_ok = tokio::task::spawn_blocking({
         let (tmp, staging, rel) = (tmp.clone(), staging.clone(), rel.clone());
         move || extract_staged(&tmp, &staging, &rel)
@@ -483,9 +501,12 @@ pub async fn download_free(version: Option<String>, state: Arc<Mutex<DownloadSta
         }
     }
     // Replace any incomplete previous install; then promote staging.
-    let staged_bin = staging.join(binary_file_name());
+    let staged_bin = staging.join(binary_rel_path());
     if !is_executable(&staged_bin) {
-        let m = "archive extracted but the chrome binary is missing".to_string();
+        let m = format!(
+            "archive extracted but the chrome binary is missing (looked for {} — the macOS build ships Chromium.app, older/newer layouts may differ; please report)",
+            binary_rel_path().display()
+        );
         fail(m.clone()).await;
         std::fs::remove_dir_all(&staging).ok();
         anyhow::bail!("{m}");
@@ -493,7 +514,7 @@ pub async fn download_free(version: Option<String>, state: Arc<Mutex<DownloadSta
     if dest.exists() {
         // Keep a complete install if another caller finished it meanwhile;
         // otherwise clear the way for staging.
-        let keep = is_executable(&dest.join(binary_file_name()));
+        let keep = is_executable(&dest.join(binary_rel_path()));
         if keep {
             std::fs::remove_dir_all(&staging).ok();
         } else {
@@ -508,6 +529,14 @@ pub async fn download_free(version: Option<String>, state: Arc<Mutex<DownloadSta
         let m = format!("install failed: {e:#}");
         fail(m.clone()).await;
         anyhow::bail!("{m}");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Best-effort: clear quarantine/provenance xattrs so Gatekeeper
+        // doesn't gate first launch (mirrors the wrapper's removeQuarantine).
+        let _ = std::process::Command::new("xattr")
+            .args(["-cr", &dest.to_string_lossy()])
+            .output();
     }
     let bin = binary_path(&version).to_string_lossy().to_string();
     set(&state, |d| {
@@ -577,5 +606,31 @@ mod tests {
         let staging = dir.join("staging");
         extract_staged(&archive, &staging, PathBuf::from("chrome").as_path()).unwrap();
         assert!(staging.join("chrome").is_file());
+    }
+
+    /// macOS layout: the tarball ships `Chromium.app/…` (no top-level
+    /// `chrome`) — the bundle must NOT be flattened (mirrors the wrapper).
+    #[test]
+    fn extract_tarball_macos_bundle_layout() {
+        let dir = scratch("macbundle");
+        let archive = dir.join("cloakbrowser-darwin-arm64.tar.gz");
+        {
+            let f = std::fs::File::create(&archive).unwrap();
+            let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(gz);
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_size(11);
+            hdr.set_mode(0o755);
+            hdr.set_cksum();
+            tar.append_data(&mut hdr, "Chromium.app/Contents/MacOS/Chromium", b"fake-binary".as_slice())
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let staging = dir.join("staging");
+        let rel = PathBuf::from("Chromium.app").join("Contents").join("MacOS").join("Chromium");
+        extract_staged(&archive, &staging, rel.as_path()).unwrap();
+        assert!(staging.join(&rel).is_file());
+        assert!(staging.join("Chromium.app").is_dir());
+        assert!(!staging.join("Contents").exists());
     }
 }
