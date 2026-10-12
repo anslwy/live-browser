@@ -2804,7 +2804,7 @@ async fn api_browsers(State(s): State<AppState>) -> Json<serde_json::Value> {
         "system": {"path": system_path, "version": system_version},
         "cloak": cloak,
         "latest_free": latest,
-        "fallback_free": crate::cloak::FALLBACK_FREE_VERSION,
+        "fallback_free": crate::cloak::fallback_free_version(),
         "download": dl,
     }))
 }
