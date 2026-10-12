@@ -179,15 +179,87 @@ button.iconbtn .icon {
   height: 1.25em;
   vertical-align: -0.25em;
 }
+.browserbar .omniboxwrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  min-width: 0;
+  margin-left: 6px;
+}
 .browserbar input.omnibox {
   flex: 1;
-  min-width: 200px;
-  margin-left: 6px;
+  min-width: 0;
+  width: 100%;
   background: var(--ghost-bg);
   border: 1px solid transparent;
   color: inherit;
   border-radius: 999px;
   padding: 9px 18px;
+}
+/* Address-bar history autocomplete dropdown. */
+.histdrop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+  max-height: 280px;
+  overflow-y: auto;
+  z-index: 60;
+  text-align: left;
+}
+.histdrop li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+}
+.histdrop li:hover,
+.histdrop li.active {
+  background: var(--ghost-bg);
+}
+.histdrop .histitem {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  padding: 7px 8px;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.histdrop .histurl {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13px;
+}
+/* Delete button pinned to the far right of each history row. */
+.histdrop .histdel {
+  flex: none;
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  width: 26px;
+  height: 26px;
+  line-height: 1;
+  padding: 0;
+  color: inherit;
+  opacity: 0.55;
+  font-size: 16px;
+  cursor: pointer;
+}
+.histdrop .histdel:hover {
+  background: var(--input-border);
+  opacity: 1;
 }
 .browserbar input.omnibox:focus {
   outline: none;

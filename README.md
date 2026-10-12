@@ -127,6 +127,8 @@ lb web --port 8765 --chrome ~/.cloakbrowser/chromium-*/chrome
 # Or in the web UI: the gear icon in the address bar → Browser section lists
 # System Chrome vs CloakBrowser, downloads CloakBrowser with progress, and
 # switches the running browser in place (open tabs reset, logins persist per browser).
+# The choice is remembered (`~/.cache/live-browser/browser.json`), so the
+# next `lb web` without `--chrome` keeps it; `--chrome` overrides and re-saves.
 ```
 
 ```sh
