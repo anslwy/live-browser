@@ -68,6 +68,65 @@ struct AppState {
     port: u16,
     /// Directory browser downloads are saved to (see `Browser.setDownloadBehavior`).
     download_dir: String,
+    /// How the browser was launched — reused for in-process browser switches
+    /// (Settings → Browser) without restarting the daemon process.
+    launch: Arc<Mutex<LaunchConfig>>,
+    /// Background CloakBrowser download progress (Settings → Browser).
+    cloak_dl: Arc<Mutex<crate::cloak::DownloadState>>,
+}
+
+/// The knobs that define the running browser. Cloned out of [`DaemonArgs`]
+/// at startup; [`api_browsers_use`] swaps `chrome` and relaunches.
+#[derive(Debug, Clone)]
+struct LaunchConfig {
+    profile: String,
+    headed: bool,
+    no_sandbox: bool,
+    chrome: Option<String>,
+}
+
+impl LaunchConfig {
+    fn from_args(args: &DaemonArgs) -> Self {
+        Self {
+            profile: args.profile.clone().unwrap_or_else(default_profile_dir),
+            headed: !args.headless_mode(),
+            no_sandbox: args.no_sandbox,
+            chrome: args.chrome.clone(),
+        }
+    }
+}
+
+/// Build the chromiumoxide config for `launch` (shared by startup and
+/// in-process browser switches — keep them identical).
+fn build_browser_config(launch: &LaunchConfig) -> Result<BrowserConfig, String> {
+    let mut cfg = BrowserConfig::builder()
+        .user_data_dir(std::path::PathBuf::from(&launch.profile))
+        .window_size(1280, 900)
+        .launch_timeout(Duration::from_secs(60))
+        .request_timeout(Duration::from_secs(20));
+    if let Some(chrome) = &launch.chrome {
+        cfg = cfg.chrome_executable(chrome.as_str());
+    } else if let Some(detected) = detect_chrome() {
+        cfg = cfg.chrome_executable(detected);
+    }
+    if !launch.headed {
+        // Headless is the default (no visible window); --headed opts out.
+    } else {
+        cfg = cfg.with_head();
+    }
+    if launch.no_sandbox {
+        cfg = cfg.no_sandbox();
+    }
+    // Extra flags are *appended* to chromiumoxide's defaults (which already
+    // include --headless/--no-sandbox handling). Do NOT use
+    // disable_default_args() here — it would drop the --headless flag itself.
+    // NOTE: no --disable-blink-features=AutomationControlled — it breaks
+    // native mouse-drag behaviors (text selection, slider scrub).
+    cfg = cfg.args(vec![
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]);
+    cfg.build().map_err(|e| anyhow::anyhow!(e).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +167,29 @@ fn browser_alive() -> bool {
 
 fn mark_browser_dead() {
     BROWSER_ALIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Generation counter for the browser handler watcher: each (re)launch bumps
+/// it, and a watcher only marks the browser dead when its generation is still
+/// current — so a stale watcher from a switched-out browser can't flag the
+/// new one as dead.
+static BROWSER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Drive a browser's background handler; record death only while current.
+/// Shared by startup and in-process browser switches.
+fn spawn_browser_watcher(mut handler: chromiumoxide::handler::Handler) {
+    let gen = BROWSER_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    tokio::spawn(async move {
+        while let Some(h) = handler.next().await {
+            if h.is_err() {
+                break;
+            }
+        }
+        if BROWSER_GEN.load(std::sync::atomic::Ordering::SeqCst) == gen {
+            mark_browser_dead();
+            tracing::warn!("browser handler ended — the browser process is gone");
+        }
+    });
 }
 
 /// Recovery text for a dead tab: close it and carry on — with the escalation
@@ -2675,6 +2757,231 @@ async fn api_activate(State(s): State<AppState>, Json(b): Json<ActivateReq>) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Browser manager (Settings → Browser): list / download / switch the Chrome
+// binary without restarting the daemon process. Switching relaunches the
+// browser in-process on the same profile — open tabs are lost (same as a
+// restart), logins/cookies persist.
+// ---------------------------------------------------------------------------
+
+/// Effective chrome path for `launch` (explicit `--chrome`, else auto-detect).
+fn launch_chrome_path(launch: &LaunchConfig) -> Option<String> {
+    if let Some(c) = launch.chrome.as_ref().filter(|c| !c.trim().is_empty()) {
+        return Some(c.clone());
+    }
+    detect_chrome()
+}
+
+async fn api_browsers(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let launch = s.launch.lock().await.clone();
+    let current_path = launch_chrome_path(&launch);
+    let current_version = match &current_path {
+        Some(p) => crate::cloak::binary_version(p).await,
+        None => None,
+    };
+    let current_kind = match &current_path {
+        Some(p) if p.contains(".cloakbrowser") || p.contains("cloak") => "cloak",
+        Some(_) => "system",
+        None => "unknown",
+    };
+    let system_path = detect_chrome();
+    let system_version = match &system_path {
+        Some(p) => crate::cloak::binary_version(p).await,
+        None => None,
+    };
+    let cloak = crate::cloak::installed();
+    // Latest free version (cached failure → None; UI falls back to the pin).
+    let latest = tokio::time::timeout(
+        Duration::from_secs(12),
+        crate::cloak::latest_free_version(),
+    )
+    .await
+    .ok()
+    .flatten();
+    let dl = s.cloak_dl.lock().await.clone();
+    Json(serde_json::json!({
+        "ok": true,
+        "current": {"kind": current_kind, "path": current_path, "version": current_version},
+        "system": {"path": system_path, "version": system_version},
+        "cloak": cloak,
+        "latest_free": latest,
+        "fallback_free": crate::cloak::FALLBACK_FREE_VERSION,
+        "download": dl,
+    }))
+}
+
+#[derive(Deserialize)]
+struct BrowsersDownloadReq {
+    /// Free-build version (default: newest discovered, pinned fallback offline).
+    #[serde(default)]
+    version: Option<String>,
+}
+
+async fn api_browsers_download(State(s): State<AppState>, Json(b): Json<BrowsersDownloadReq>) -> Json<serde_json::Value> {
+    {
+        let d = s.cloak_dl.lock().await;
+        if matches!(
+            d.phase,
+            crate::cloak::DlPhase::Downloading | crate::cloak::DlPhase::Verifying | crate::cloak::DlPhase::Extracting
+        ) {
+            return err(format!("a download is already running ({} {})", format!("{:?}", d.phase).to_lowercase(), d.version));
+        }
+    }
+    let version = b.version.clone();
+    let dl = s.cloak_dl.clone();
+    let log = s.log.clone();
+    tokio::spawn(async move {
+        match crate::cloak::download_free(version, dl).await {
+            Ok(path) => {
+                let entry = LogEntry {
+                    at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    action: "browser".into(),
+                    detail: format!("CloakBrowser ready: {path}"),
+                };
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut l = log.lock().await;
+                    l.push(entry);
+                });
+            }
+            Err(e) => tracing::warn!("cloak download failed: {e:#}"),
+        }
+    });
+    s.push_log("browser", "CloakBrowser download started");
+    ok("download started — poll the popup for progress")
+}
+
+async fn api_browsers_download_progress(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let d = s.cloak_dl.lock().await.clone();
+    Json(serde_json::json!({ "ok": true, "download": d, "pct": d.pct() }))
+}
+
+#[derive(Deserialize)]
+struct BrowsersUseReq {
+    /// "system" or "cloak".
+    kind: String,
+    /// For cloak: installed version (default: newest installed).
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// Switch the running browser in-process: validate the target binary, close
+/// the old browser (releasing the profile lock), launch the new one on the
+/// same profile, and reset to a single blank tab. Bounded throughout so the
+/// UI always gets a response; on failure the old browser is relaunched and
+/// the error is reported.
+async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseReq>) -> Json<serde_json::Value> {
+    let kind = b.kind.trim().to_lowercase();
+    let target: String = match kind.as_str() {
+        "system" => match detect_chrome() {
+            Some(p) => p,
+            None => return err("no system Chrome/Chromium found".into()),
+        },
+        "cloak" => {
+            let all = crate::cloak::installed();
+            if all.is_empty() {
+                return err("no CloakBrowser binary installed — download it first".into());
+            }
+            match b.version.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                Some(v) => match all.iter().find(|c| c.version == v) {
+                    Some(c) => c.path.clone(),
+                    None => return err(format!("CloakBrowser {v} is not installed")),
+                },
+                None => all.into_iter().next().map(|c| c.path).unwrap(),
+            }
+        }
+        _ => return err(format!("unknown browser kind {:?} (use system or cloak)", b.kind)),
+    };
+    // Validate before touching the running browser.
+    if tokio::fs::metadata(&target).await.is_err() {
+        return err(format!("browser binary not found: {target}"));
+    }
+    match crate::cloak::binary_version(&target).await {
+        Some(v) => tracing::info!("switching browser to {target} ({v})"),
+        None => return err(format!("{target} would not run (`--version` failed)")),
+    }
+    s.push_log("browser", &format!("switching to {target}"));
+    // Lock ordering (browser → launch → tabs → log) is exclusive to this
+    // endpoint, so holding across the relaunch is deadlock-free.
+    let mut browser = s.browser.lock().await;
+    // Close the old browser first (releases the profile lock).
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(10), browser.close()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), browser.wait()).await;
+    }
+    let mut launch = s.launch.lock().await.clone();
+    let previous = launch.chrome.clone();
+    launch.chrome = Some(target.clone());
+    let new_browser = match build_browser_config(&launch) {
+        Ok(cfg) => match tokio::time::timeout(Duration::from_secs(75), Browser::launch(cfg)).await {
+            Ok(Ok((nb, handler))) => {
+                spawn_browser_watcher(handler);
+                Some(nb)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("browser switch launch failed: {e:#}");
+                None
+            }
+            Err(_) => None,
+        },
+        Err(e) => {
+            tracing::warn!("browser switch config failed: {e}");
+            None
+        }
+    };
+    let nb = match new_browser {
+        Some(nb) => nb,
+        None => {
+            // Roll back to the previous binary so the daemon keeps serving.
+            launch.chrome = previous;
+            match build_browser_config(&launch) {
+                Ok(cfg) => match Browser::launch(cfg).await {
+                    Ok((rb, handler)) => {
+                        spawn_browser_watcher(handler);
+                        *browser = rb;
+                        BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return err("new browser failed to launch — rolled back to the previous one".into());
+                    }
+                    Err(e) => {
+                        mark_browser_dead();
+                        return err(format!("new browser failed AND rollback failed ({e:#}) — restart with `lb web restart`"));
+                    }
+                },
+                Err(e) => return err(format!("rollback config failed: {e}")),
+            }
+        }
+    };
+    // Fresh browser → fresh tabs (single blank tab, like a restart).
+    let page = match nb.new_page("about:blank").await {
+        Ok(p) => p,
+        Err(e) => {
+            return err(format!("switched browser but the first tab failed: {e:#} — reload the UI"));
+        }
+    };
+    *browser = nb;
+    BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    s.launch.lock().await.chrome = launch.chrome.clone();
+    {
+        let mut t = s.tabs.lock().await;
+        t.map.clear();
+        t.map.insert(
+            1u32,
+            TabState {
+                page: page.clone(),
+                handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
+                zoom: 1.0,
+                cursor: CursorState::default(),
+                last_url: "about:blank".into(),
+            },
+        );
+        t.active = 1;
+        t.next_id = 2;
+    }
+    spawn_dialog_guard(page, s.log.clone(), 1);
+    s.push_log("browser", &format!("now using {target} (tabs reset)"));
+    Json(serde_json::json!({ "ok": true, "message": format!("now using {target} (open tabs were reset)") }))
+}
+
+// ---------------------------------------------------------------------------
 // Static UI
 // ---------------------------------------------------------------------------
 
@@ -2916,44 +3223,18 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     } else {
         tracing::info!("passcode protection enabled");
     }
-    let profile = args.profile.clone().unwrap_or_else(default_profile_dir);
-    std::fs::create_dir_all(&profile).ok();
+    let launch = LaunchConfig::from_args(&args);
+    std::fs::create_dir_all(&launch.profile).ok();
 
-    let mut cfg = BrowserConfig::builder()
-        .user_data_dir(std::path::PathBuf::from(&profile))
-        .window_size(1280, 900)
-        .launch_timeout(Duration::from_secs(60))
-        .request_timeout(Duration::from_secs(20));
-
-    if let Some(chrome) = &args.chrome {
-        cfg = cfg.chrome_executable(chrome.as_str());
-    } else if let Some(detected) = detect_chrome() {
-        cfg = cfg.chrome_executable(detected);
-    }
-
-    if args.headless_mode() {
-        // Headless is the default (no visible window); --headed opts out.
-    } else {
-        cfg = cfg.with_head();
-    }
-    if args.no_sandbox {
-        cfg = cfg.no_sandbox();
-    }
-    // Extra flags are *appended* to chromiumoxide's defaults (which already
-    // include --headless/--no-sandbox handling). Do NOT use
-    // disable_default_args() here — it would drop the --headless flag itself.
-    // NOTE: no --disable-blink-features=AutomationControlled — it breaks
-    // native mouse-drag behaviors (text selection, slider scrub).
-    cfg = cfg.args(vec![
-        "--no-first-run",
-        "--no-default-browser-check",
-    ]);
+    let cfg = build_browser_config(&launch)
+        .map_err(|e| anyhow::anyhow!("invalid browser config: {e}"))?;
 
     tracing::info!(
-        "launching chrome (profile: {profile}, {}) …",
-        if args.headless_mode() { "headless" } else { "headed" }
+        "launching chrome (profile: {}, {}) …",
+        launch.profile,
+        if launch.headed { "headed" } else { "headless" }
     );
-    let (browser, mut handler) = Browser::launch(cfg.build().map_err(|e| anyhow::anyhow!(e))?)
+    let (browser, handler) = Browser::launch(cfg)
         .await
         .context("failed to launch Chrome — try --chrome /path/to/chrome or --no-sandbox")?;
 
@@ -2961,15 +3242,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     // browser connection is dead — record it so CDP error mapping can tell
     // "browser died" (restart) apart from "one tab died" (close the tab).
     BROWSER_ALIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-    tokio::spawn(async move {
-        while let Some(h) = handler.next().await {
-            if h.is_err() {
-                break;
-            }
-        }
-        mark_browser_dead();
-        tracing::warn!("browser handler ended — the browser process is gone");
-    });
+    spawn_browser_watcher(handler);
 
     let start_url = args.url.clone().unwrap_or_else(|| "about:blank".into());
     let page = browser
@@ -3002,7 +3275,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     // the renderer and used to wedge the whole daemon — see spawn_dialog_guard).
     spawn_dialog_guard(page, log.clone(), 1);
     // Route browser downloads into a visible dir instead of the void.
-    let download_dir = std::path::PathBuf::from(&profile).join("downloads").to_string_lossy().to_string();
+    let download_dir = std::path::PathBuf::from(&launch.profile).join("downloads").to_string_lossy().to_string();
     std::fs::create_dir_all(&download_dir).ok();
     {
         use chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorParams;
@@ -3023,6 +3296,8 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         passcode: passcode.clone(),
         port: args.port,
         download_dir,
+        launch: Arc::new(Mutex::new(launch)),
+        cloak_dl: Arc::new(Mutex::new(crate::cloak::DownloadState::default())),
     };
     // Kept for shutdown: closing the browser releases the profile lock so
     // the next `lb web` starts clean (no orphaned Chrome).
@@ -3065,6 +3340,9 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .route("/api/tabs", get(api_tabs))
         .route("/api/close", post(api_close))
         .route("/api/activate", post(api_activate))
+        .route("/api/browsers", get(api_browsers))
+        .route("/api/browsers/download", post(api_browsers_download).get(api_browsers_download_progress))
+        .route("/api/browsers/use", post(api_browsers_use))
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_passcode))
         // Live tool: nothing is cacheable (stale tabs/snapshots caused real
         // confusion — the UI once needed a manual refresh to show new tabs).

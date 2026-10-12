@@ -26,3 +26,9 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 rmcp = { version = "3.5.1", features = ["transport-io", "schemars"] }
 schemars = "1.2.2"
+# Settings → browser manager (CloakBrowser download): streaming download is
+# via reqwest chunk(); these are only for checksum + archive extraction.
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }

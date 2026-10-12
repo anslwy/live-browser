@@ -735,6 +735,121 @@
     } catch {}
   }
 
+  // Settings popup (gear button): appearance + browser manager.
+  let settingsOpen = false;
+  type CloakDl = { phase: string; version: string; received: number; total: number | null; message: string };
+  type BrowsersInfo = {
+    ok: boolean;
+    current: { kind: string; path: string | null; version: string | null };
+    system: { path: string | null; version: string | null };
+    cloak: { version: string; path: string }[];
+    latest_free: string | null;
+    fallback_free: string;
+    download: CloakDl;
+  };
+  let browsers: BrowsersInfo | null = null;
+  let browsersLoading = false;
+  let browsersErr = '';
+  let settingsTimer: ReturnType<typeof setInterval> | null = null;
+
+  function fmtMB(n: number): string {
+    return `${(n / 1048576).toFixed(1)} MB`;
+  }
+  function dlPct(d: CloakDl): number | null {
+    if (d.total && d.total > 0) return Math.min(100, Math.round((Math.min(d.received, d.total) * 100) / d.total));
+    return null;
+  }
+  function cloakTargetVersion(): string {
+    return browsers?.latest_free || browsers?.fallback_free || '';
+  }
+
+  async function loadBrowsers() {
+    browsersLoading = true;
+    try {
+      const r = await apiFetch('/api/browsers');
+      const j = await r.json();
+      if (j.ok) {
+        browsers = j;
+        browsersErr = '';
+      } else browsersErr = j.error ?? 'failed to list browsers';
+    } catch {
+      browsersErr = 'daemon unreachable';
+    } finally {
+      browsersLoading = false;
+    }
+  }
+  async function pollDownload() {
+    try {
+      const r = await apiFetch('/api/browsers/download');
+      const j = await r.json();
+      if (!j.ok) return;
+      // Reload the list only when a download actually finishes — polling the
+      // steady-state `idle` phase must not flash the Refresh button.
+      const wasActive = ['downloading', 'verifying', 'extracting'].includes(browsers?.download.phase ?? '');
+      if (browsers) browsers = { ...browsers, download: j.download };
+      const now = j.download?.phase;
+      if ((now === 'done' || now === 'error') && wasActive) await loadBrowsers();
+    } catch {}
+  }
+  function stopSettingsTimer() {
+    if (settingsTimer) {
+      clearInterval(settingsTimer);
+      settingsTimer = null;
+    }
+  }
+  function toggleSettings() {
+    settingsOpen = !settingsOpen;
+    if (settingsOpen) {
+      void loadBrowsers();
+      if (!settingsTimer) settingsTimer = setInterval(() => { if (settingsOpen) void pollDownload(); }, 1500);
+    } else stopSettingsTimer();
+  }
+  function settingsOutside(e: MouseEvent) {
+    if (!settingsOpen) return;
+    const t = e.target as HTMLElement;
+    if (!t.closest('.settingspop') && !t.closest('.gearbtn')) {
+      settingsOpen = false;
+      stopSettingsTimer();
+    }
+  }
+  async function startCloakDownload() {
+    browsersErr = '';
+    busy = 'cloakdl';
+    try {
+      const r = await apiFetch('/api/browsers/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+      });
+      const j = await r.json();
+      if (!j.ok) browsersErr = j.error ?? 'download failed to start';
+    } catch {
+      browsersErr = 'daemon unreachable';
+    } finally {
+      busy = '';
+      await loadBrowsers();
+    }
+  }
+  async function switchBrowser(kind: string, version?: string) {
+    browsersErr = '';
+    busy = 'browserswitch';
+    try {
+      const r = await apiFetch('/api/browsers/use', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind, version: version ?? null })
+      });
+      const j = await r.json();
+      if (!j.ok) browsersErr = j.error ?? 'switch failed';
+      else await refreshAll();
+    } catch {
+      browsersErr = 'daemon unreachable';
+    } finally {
+      busy = '';
+      await loadBrowsers();
+    }
+  }
+
   // Navigation in flight (address bar / back-forward-reload): dim the live
   // view as a loading indication until the new page settles.
   $: pageLoading = busy === 'open' || busy === 'back' || busy === 'forward' || busy === 'reload';
@@ -823,6 +938,7 @@
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('resize', measureShot);
+    window.addEventListener('click', settingsOutside);
     attachShotWheel();
     // Liveness tick — always on. Interactions queue their own frames on top.
     timer = setInterval(async () => {
@@ -834,9 +950,11 @@
 
   onDestroy(() => {
     clearInterval(timer);
+    stopSettingsTimer();
     window.removeEventListener('keydown', onKeyDown);
     window.removeEventListener('keyup', onKeyUp);
     window.removeEventListener('resize', measureShot);
+    window.removeEventListener('click', settingsOutside);
   });
 </script>
 
@@ -930,9 +1048,89 @@
         </span>
       {/if}
       <input id="addr-bar" class="omnibox" type="text" placeholder="Type a URL or search…" bind:value={openUrl} disabled={busy === 'open'} on:focus={addrFocus} on:mouseup={addrMouseUp} on:blur={() => (addrJustFocused = false)} on:keydown={(e) => e.key === 'Enter' && doOpen()} />
-      <button class="iconplain" on:click={() => setTheme(theme === 'dark' ? 'light' : 'dark')} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light / dark mode">
-        <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
+      <button class="iconplain gearbtn" on:click={toggleSettings} title="Settings — appearance and browser" aria-label="Settings" aria-expanded={settingsOpen}>
+        <Icon name="gear" />
       </button>
+      {#if settingsOpen}
+        <div class="settingspop" role="dialog" aria-label="Settings">
+          <div class="setsect">
+            <div class="sethead">Appearance</div>
+            <div class="row">
+              <button class="ghost seg" aria-pressed={theme === 'dark'} on:click={() => setTheme('dark')}>Dark</button>
+              <button class="ghost seg" aria-pressed={theme === 'light'} on:click={() => setTheme('light')}>Light</button>
+            </div>
+          </div>
+          <div class="setsect">
+            <div class="sethead row" style="justify-content:space-between">
+              <span>Browser</span>
+              <button class="ghost mini" on:click={loadBrowsers} disabled={browsersLoading} title="Refresh browser list">{browsersLoading ? '…' : 'Refresh'}</button>
+            </div>
+            {#if browsers}
+              <p class="muted mono setcurrent">In use: {browsers.current.kind === 'cloak' ? 'CloakBrowser' : 'System Chrome'} — {browsers.current.version ?? browsers.current.path ?? 'unknown'}</p>
+              <div class="browrow">
+                <div>
+                  <strong>System Chrome</strong>
+                  <div class="muted mono">{browsers.system.version ?? browsers.system.path ?? 'not found'}</div>
+                </div>
+                <button
+                  class="mini"
+                  disabled={busy === 'browserswitch' || !browsers.system.path || browsers.current.path === browsers.system.path}
+                  on:click={() => switchBrowser('system')}>
+                  {browsers.current.path === browsers.system.path ? 'Active' : busy === 'browserswitch' ? 'Switching…' : 'Switch'}
+                </button>
+              </div>
+              {#each browsers.cloak as c}
+                <div class="browrow">
+                  <div>
+                    <strong>CloakBrowser {c.version}</strong>
+                    <div class="muted mono">stealth Chromium (free build)</div>
+                  </div>
+                  <button
+                    class="mini"
+                    disabled={busy === 'browserswitch' || browsers.current.path === c.path}
+                    on:click={() => switchBrowser('cloak', c.version)}>
+                    {browsers.current.path === c.path ? 'Active' : busy === 'browserswitch' ? 'Switching…' : 'Switch'}
+                  </button>
+                </div>
+              {/each}
+              {#if !browsers.cloak.some((c) => c.version === cloakTargetVersion()) && cloakTargetVersion()}
+                <div class="browrow">
+                  <div>
+                    <strong>CloakBrowser {cloakTargetVersion()}</strong>
+                    <div class="muted mono">stealth Chromium (free build) — not downloaded</div>
+                  </div>
+                  {#if ['downloading', 'verifying', 'extracting'].includes(browsers.download.phase)}
+                    <div class="dlwrap">
+                      <div class="dlbar">
+                        <div
+                          class="dlfill"
+                          style={dlPct(browsers.download) !== null ? `width:${dlPct(browsers.download)}%` : 'width:30%'}>
+                        </div>
+                      </div>
+                      <div class="muted mono">
+                        {#if dlPct(browsers.download) !== null}{dlPct(browsers.download)}% · {/if}{fmtMB(browsers.download.received)}{#if browsers.download.total} / {fmtMB(browsers.download.total)}{/if} · {browsers.download.phase}…
+                      </div>
+                    </div>
+                  {:else}
+                    <button class="mini" disabled={busy === 'cloakdl'} on:click={startCloakDownload}>
+                      <Icon name="download" /> {busy === 'cloakdl' ? 'Starting…' : 'Download'}
+                    </button>
+                  {/if}
+                </div>
+              {/if}
+              {#if browsers.download.phase === 'error'}
+                <p class="mono" style="color:var(--danger);margin:6px 0 0"><Icon name="warn" /> {browsers.download.message}</p>
+              {/if}
+              <p class="muted setnote">Switching relaunches the browser in place — open tabs reset, logins persist.</p>
+            {:else if browsersErr}
+              <p class="mono" style="color:var(--danger);margin:6px 0 0"><Icon name="warn" /> {browsersErr}</p>
+            {:else}
+              <p class="muted">Loading…</p>
+            {/if}
+            {#if browsersErr && browsers}<p class="mono" style="color:var(--danger);margin:6px 0 0"><Icon name="warn" /> {browsersErr}</p>{/if}
+          </div>
+        </div>
+      {/if}
     </div>
   </div>
 
