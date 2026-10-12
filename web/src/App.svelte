@@ -29,6 +29,8 @@
   let typeErr = '';
   let keysOn = true;
   let keyChain: Promise<void> = Promise.resolve();
+  let clipMsg = '';
+  let clipBusy = '';
 
   // Optional daemon passcode (set via `lb web --passcode` / LB_PASSCODE).
   // Persisted locally so a reload doesn't lock the UI out again.
@@ -393,6 +395,96 @@
 
   function onKeyDown(e: KeyboardEvent) { forwardKey(e, false); }
   function onKeyUp(e: KeyboardEvent) { forwardKey(e, true); }
+
+  const COPY_JS = `(() => {
+    try {
+      const ae = document.activeElement;
+      if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) {
+        const s = ae.selectionStart ?? 0;
+        const e = ae.selectionEnd ?? ae.value.length;
+        if (e > s) return ae.value.substring(s, e);
+        return ae.value || '';
+      }
+      if (ae && ae.isContentEditable) {
+        const sel = window.getSelection ? window.getSelection().toString() : '';
+        if (sel) return sel;
+        return ae.innerText || '';
+      }
+      const sel = window.getSelection ? window.getSelection().toString() : '';
+      return sel || '';
+    } catch { return ''; }
+  })()`;
+
+  async function doCopy() {
+    clipBusy = 'copy';
+    clipMsg = '';
+    try {
+      const r = await apiFetch('/api/eval', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ js: COPY_JS })
+      });
+      const j = await r.json();
+      const text = j.ok ? String(j.result ?? '') : '';
+      if (!text) {
+        clipMsg = 'nothing selected';
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        // Clipboard API needs a secure context / permission — fall back to
+        // a prompt the user can Ctrl+C from.
+        prompt('Copy this text (Ctrl+C):', text);
+      }
+      clipMsg = `copied ${text.length} chars`;
+    } catch {
+      clipMsg = 'copy failed — daemon unreachable?';
+    } finally {
+      clipBusy = '';
+      setTimeout(() => (clipMsg = ''), 4000);
+    }
+  }
+
+  async function doPaste() {
+    clipBusy = 'paste';
+    clipMsg = '';
+    try {
+      let text = '';
+      try {
+        text = await navigator.clipboard.readText();
+      } catch {
+        // Clipboard read blocked (permissions / non-secure context):
+        // let the user supply the text explicitly.
+        const viaPrompt = prompt('Paste text into the page:');
+        if (viaPrompt == null) return;
+        text = viaPrompt;
+      }
+      if (!text) {
+        clipMsg = 'clipboard empty';
+        return;
+      }
+      const r = await apiFetch('/api/insert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+      });
+      const j = await r.json();
+      if (!j.ok) {
+        clipMsg = j.error ?? 'paste failed';
+        return;
+      }
+      clipMsg = `pasted ${text.length} chars`;
+      requestShot();
+      await Promise.all([fetchStatus(), loadSnapshot()]);
+      requestShot();
+    } catch {
+      clipMsg = 'paste failed — daemon unreachable?';
+    } finally {
+      clipBusy = '';
+      setTimeout(() => (clipMsg = ''), 4000);
+    }
+  }
 
   function attachShotWheel() {
     // Non-passive so we can preventDefault: the wheel scrolls the page under
@@ -885,6 +977,13 @@
       <button class:ghost={!keysOn} on:click={() => (keysOn = !keysOn)} title={keysOn ? 'Keyboard capture is ON — your keystrokes go to the page. Click to turn off.' : 'Turn on keyboard capture to type into the page.'}>
         <Icon name="keyboard" /> {keysOn ? 'Keys: ON' : 'Keys: off'}
       </button>
+      <button class="ghost" on:click={doCopy} disabled={clipBusy === 'copy'} title="Copy selected text from the page to your clipboard">
+        <Icon name="copy" /> {clipBusy === 'copy' ? 'Copying…' : 'Copy'}
+      </button>
+      <button class="ghost" on:click={doPaste} disabled={clipBusy === 'paste'} title="Paste your clipboard into the page at the current focus">
+        <Icon name="paste" /> {clipBusy === 'paste' ? 'Pasting…' : 'Paste'}
+      </button>
+      {#if clipMsg}<span class="mono muted">{clipMsg}</span>{/if}
     </div>
   </div>
 
