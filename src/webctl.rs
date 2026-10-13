@@ -1,14 +1,22 @@
-//! `lb web stop` / `lb web restart`: find the running daemon via its pidfile
-//! and terminate it. No new dependencies — `kill(1)` on Unix, `taskkill` /
-//! `tasklist` on Windows.
+//! `lb web` lifecycle: `stop` / `restart` find the running daemon via its
+//! pidfile and terminate it; a plain start backgrounds by default (detach,
+//! survive terminal close) unless `--foreground` is given. No new
+//! dependencies — `kill(1)` on Unix, `taskkill` / `tasklist` on Windows,
+//! `setsid`/`nohup` for detaching on Unix.
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::cli::DaemonArgs;
+
 fn pid_file(port: u16) -> PathBuf {
     crate::daemon::pid_file(port)
+}
+
+fn log_file(port: u16) -> PathBuf {
+    crate::daemon::daemon_log_file(port)
 }
 
 fn read_pid(port: u16) -> Result<Option<u32>> {
@@ -383,6 +391,233 @@ pub fn ensure_not_running(port: u16) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Background start (`lb web`, the default): detach so the server survives
+// the terminal closing, reuse an already-running server instead of starting
+// a second one.
+// ---------------------------------------------------------------------------
+
+/// Argv tokens that select start mode. The detached child is the server
+/// itself and must run in the foreground (blocking) — otherwise it would
+/// re-detach forever. So the child gets these stripped and `--foreground`
+/// appended (see [`child_argv_foreground`]).
+fn is_start_mode_flag(arg: &str) -> bool {
+    matches!(arg, "--background" | "--detach" | "--foreground")
+        || arg.starts_with("--background=")
+        || arg.starts_with("--detach=")
+        || arg.starts_with("--foreground=")
+}
+
+/// Parent argv (minus the binary) rewritten for the detached child: start-mode
+/// flags stripped, `--foreground` forced so the child is the blocking server.
+fn child_argv_foreground() -> Vec<String> {
+    let mut out: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !is_start_mode_flag(a))
+        .collect();
+    out.push("--foreground".to_string());
+    out
+}
+
+/// Try to spawn `exe + args` detached (new session on Unix so terminal close
+/// delivers no SIGHUP; detached process group on Windows). Stdout/stderr go
+/// to `log_path`, stdin comes from null. Returns the child's pid.
+#[cfg(unix)]
+fn spawn_detached(exe: &std::path::Path, args: &[String], log_path: &std::path::Path) -> Result<u32> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let header = format!(
+        "\n=== lb web (background) starting {} — {} ===\n",
+        chrono_like_now(),
+        args.join(" ")
+    );
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(header.as_bytes()).map(|_| ())
+        })
+        .ok();
+    let open_log = |what: &str| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .context(format!("cannot open {what} log {}", log_path.display()))
+    };
+    // `setsid prog args…`: setsid creates the new session, then execs prog
+    // (child pid == server pid — good for status messages).
+    match Command::new("setsid")
+        .arg(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(open_log("stdout")?))
+        .stderr(Stdio::from(open_log("stderr")?))
+        .spawn()
+    {
+        Ok(child) => {
+            let pid = child.id();
+            std::mem::forget(child); // orphan: keep running after we exit
+            Ok(pid)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No setsid (e.g. macOS): try nohup, else plain spawn.
+            // (`nohup` also redirects stdout to nohup.out when it is a tty —
+            // we pass explicit files, so output always lands in our log.)
+            match Command::new("nohup")
+                .arg(exe)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(open_log("stdout")?))
+                .stderr(Stdio::from(open_log("stderr")?))
+                .spawn()
+            {
+                Ok(child) => {
+                    let pid = child.id();
+                    std::mem::forget(child);
+                    Ok(pid)
+                }
+                Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                    let child = Command::new(exe)
+                        .args(args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(open_log("stdout")?))
+                        .stderr(Stdio::from(open_log("stderr")?))
+                        .spawn()
+                        .context("failed to spawn detached daemon")?;
+                    let pid = child.id();
+                    std::mem::forget(child);
+                    Ok(pid)
+                }
+                Err(e2) => Err(e2).context("failed to spawn detached daemon via nohup"),
+            }
+        }
+        Err(e) => Err(e).context("failed to spawn detached daemon via setsid"),
+    }
+}
+
+/// Best-effort timestamp for the background log header (no chrono here —
+/// webctl stays dependency-light; the daemon itself logs proper timestamps).
+#[cfg(unix)]
+fn chrono_like_now() -> String {
+    // `date` is ubiquitous on Unix; fall back to a plain marker.
+    Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "now".to_string())
+}
+
+/// Try to spawn `exe + args` detached on Windows (no SIGHUP concept; a
+/// detached process group outlives the parent console). Logs to `log_path`.
+#[cfg(windows)]
+fn spawn_detached(
+    exe: &std::path::Path,
+    args: &[String],
+    log_path: &std::path::Path,
+) -> Result<u32> {
+    use std::fs::OpenOptions;
+    use std::os::windows::process::CommandExt;
+    // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: survive console close.
+    const DETACHED: u32 = 0x08000000 | 0x00000200;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let log_out = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .context(format!("cannot open log {}", log_path.display()))?;
+    let log_err = log_out.try_clone().context("cannot clone log handle")?;
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_out))
+        .stderr(Stdio::from(log_err))
+        .creation_flags(DETACHED)
+        .spawn()
+        .context("failed to spawn detached daemon")?;
+    let pid = child.id();
+    std::mem::forget(child);
+    Ok(pid)
+}
+
+/// Wait (up to `timeout`) for TCP on 127.0.0.1:`port` to accept connections.
+fn wait_for_port(port: u16, timeout: Duration) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+}
+
+/// Start the server in the background (default `lb web` behavior):
+/// - already running (pidfile alive, or something serving the port) → reuse
+///   it and just show the URL (never start a second daemon);
+/// - otherwise detach a child server (logs to `daemon-<port>.log`), wait for
+///   it to accept connections, and report the URL.
+pub fn start_background(args: &DaemonArgs) -> Result<String> {
+    let port = args.port;
+    let url = format!("http://127.0.0.1:{port}/");
+    // Reuse: our own daemon is already up — never start a second one.
+    match read_pid(port)? {
+        Some(pid) if process_alive(pid) => {
+            return Ok(format!(
+                "a daemon is already running (pid {pid}, port {port}) — reusing it\n  UI:  {url}\n  (stop it with: lb web --port {port} stop)"
+            ));
+        }
+        Some(_) => remove_pid_file(port), // stale crash file — we own the port now
+        None => {}
+    }
+    if port_serves(port) {
+        return Ok(format!(
+            "something is already serving port {port} (no pid record — started by an older lb?) — reusing it\n  UI:  {url}\n  (if that is a stale process, stop it, then run `lb web --port {port}` again)"
+        ));
+    }
+    let exe = std::env::current_exe().context("cannot determine own binary path")?;
+    let child_args = child_argv_foreground();
+    let log = log_file(port);
+    let _spawned_pid = spawn_detached(&exe, &child_args, &log)?;
+    if !wait_for_port(port, Duration::from_secs(60)) {
+        let tail = std::fs::read_to_string(&log)
+            .map(|s| {
+                let lines: Vec<&str> = s.lines().collect();
+                let n = lines.len().min(15);
+                lines[lines.len().saturating_sub(n)..].join("\n")
+            })
+            .unwrap_or_else(|_| "(could not read log)".to_string());
+        anyhow::bail!(
+            "background daemon on port {port} did not come up within 60s — log tail from {}:\n{tail}",
+            log.display()
+        );
+    }
+    // Prefer the pidfile pid (the server's own record) over the spawn pid
+    // (identical via setsid-exec, but the file is authoritative).
+    let pid_msg = match read_pid(port)? {
+        Some(pid) => format!("pid {pid}"),
+        None => format!("spawned pid {_spawned_pid}"),
+    };
+    Ok(format!(
+        "started daemon on port {port} ({pid_msg}, background — survives terminal close)\n  UI:  {url}\n  logs: {}\n  (stop it with: lb web --port {port} stop)",
+        log.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +650,45 @@ mod tests {
             user_data_dir(sibling),
             Some("/home/u/.cache/live-browser/profile-serve".to_string())
         );
+    }
+
+    /// Start-mode flags are stripped from the detached child's argv so it
+    /// runs as the blocking server (never re-detaches).
+    #[test]
+    fn start_mode_flags_detected() {
+        assert!(is_start_mode_flag("--background"));
+        assert!(is_start_mode_flag("--detach"));
+        assert!(is_start_mode_flag("--foreground"));
+        assert!(!is_start_mode_flag("--port"));
+        assert!(!is_start_mode_flag("--headed"));
+        assert!(!is_start_mode_flag("stop"));
+        assert!(!is_start_mode_flag("--no-open"));
+    }
+
+    /// Background is the default; `--foreground` opts out, `--background`
+    /// overrides `--foreground` (clap `overrides_with`, last flag wins —
+    /// same shape as the `--headless` / `--headed` pair).
+    #[test]
+    fn background_is_default() {
+        use clap::Parser;
+        use crate::cli::{Cli, Commands};
+        let parse = |argv: &[&str]| {
+            let mut full = vec!["lb"];
+            full.extend(argv);
+            Cli::try_parse_from(full).unwrap()
+        };
+        // Plain `lb web` → background.
+        let Commands::Web(w) = parse(&["web"]).command else { panic!("no web") };
+        assert!(w.daemon.background_mode());
+        // Explicit `--background` → background.
+        let Commands::Web(w) = parse(&["web", "--background"]).command else { panic!("no web") };
+        assert!(w.daemon.background_mode());
+        // `--foreground` → foreground.
+        let Commands::Web(w) = parse(&["web", "--foreground"]).command else { panic!("no web") };
+        assert!(!w.daemon.background_mode());
+        // Port + foreground compose.
+        let Commands::Web(w) = parse(&["web", "--port", "9000", "--foreground"]).command else { panic!("no web") };
+        assert_eq!(w.daemon.port, 9000);
+        assert!(!w.daemon.background_mode());
     }
 }

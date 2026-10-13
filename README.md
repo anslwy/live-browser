@@ -108,9 +108,16 @@ cd web && npm install && npm run build   # builds the monitor UI into web/dist
 ## Run
 
 ```sh
-# Headless (default): no visible browser window. The web UI auto-opens
-# in your default browser on start (unless --no-open).
+# Headless (default): no visible browser window. `lb web` backgrounds by
+# default (survives terminal close, logs to `daemon-<port>.log`); if a server
+# is already running on the port it just shows the URL instead of starting
+# a second one. The web UI auto-opens in your default browser on start
+# (unless --no-open; best-effort from a background daemon).
 lb web --port 8765
+
+# Keep the server in the terminal instead (logs to stdout; e.g. debugging,
+# or under supervisors like systemd Type=simple that background for you):
+lb web --port 8765 --foreground
 
 # Headed: visible browser window so a human can watch and take over.
 lb web --port 8765 --headed
@@ -118,9 +125,14 @@ lb web --port 8765 --headed
 # Containers / servers without a GUI:
 lb web --port 8765 --no-sandbox --no-open
 
-# Stop / restart the server (port flag goes before the subcommand):
+# Stop / restart the server (port flag goes before the subcommand;
+# restart backgrounds by default too — add --foreground to keep it terminal):
 lb web --port 8765 stop
 lb web --port 8765 restart
+
+# Useful server flags:
+#   --background / --detach (explicit background; the default — overrides --foreground)
+#   --foreground  (stay in the terminal; overrides --background)
 
 # Useful server flags:
 #   --chrome /path/to/chrome   (auto-detects /usr/bin/google-chrome-stable)
@@ -161,7 +173,7 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 
 | Command | What it does |
 |---|---|
-| `lb web [--port N] [flags]` | Start the browser + web UI server (old `lb daemon` still works) |
+| `lb web [--port N] [flags]` | Start the browser + web UI server (background by default; `--foreground` stays in the terminal; old `lb daemon` still works) |
 | `lb web --port N stop` | Stop the running server |
 | `lb web --port N restart` | Stop (if running) and start a new server |
 | `lb web --port N link [tab]` | Print a shareable UI link for a tab (`/?tabId=N`, default: active) |

@@ -55,9 +55,16 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Web(w) => match w.action {
             None => {
-                webctl::ensure_not_running(w.daemon.port)?;
-                update::spawn_update_reminder();
-                daemon::run_daemon(w.daemon, passcode).await
+                if w.daemon.background_mode() {
+                    // Default: detach, survive terminal close, reuse a live
+                    // server instead of starting a second one.
+                    println!("{}", webctl::start_background(&w.daemon)?);
+                    Ok(())
+                } else {
+                    webctl::ensure_not_running(w.daemon.port)?;
+                    update::spawn_update_reminder();
+                    daemon::run_daemon(w.daemon, passcode).await
+                }
             }
             Some(WebAction::Stop) => {
                 println!("{}", webctl::stop(w.daemon.port, w.daemon.profile.as_deref())?);
@@ -68,9 +75,14 @@ async fn main() -> Result<()> {
                     Ok(msg) => println!("{msg}"),
                     Err(e) => println!("stop skipped: {e:#}"),
                 }
-                webctl::ensure_not_running(w.daemon.port)?;
-                update::spawn_update_reminder();
-                daemon::run_daemon(w.daemon, passcode).await
+                if w.daemon.background_mode() {
+                    println!("{}", webctl::start_background(&w.daemon)?);
+                    Ok(())
+                } else {
+                    webctl::ensure_not_running(w.daemon.port)?;
+                    update::spawn_update_reminder();
+                    daemon::run_daemon(w.daemon, passcode).await
+                }
             }
             Some(WebAction::Link { tab: t, json }) => {
                 // Base URL precedence: explicit --server / LB_SERVER / SB_SERVER

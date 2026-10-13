@@ -23,8 +23,9 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Start the browser + web UI server (foreground, keep alive).
-    /// With no subcommand this starts the server; see `stop`/`restart`.
+    /// Start the browser + web UI server (background by default, survives
+    /// terminal close). With no subcommand this starts the server; see
+    /// `stop`/`restart`. Use `--foreground` to keep it in the terminal.
     /// (The old `lb daemon` spelling still works as an alias.)
     #[command(visible_alias = "daemon")]
     Web(WebArgs),
@@ -302,7 +303,9 @@ pub struct WebArgs {
 pub enum WebAction {
     /// Stop the running server (`--port` selects it: `lb web --port 9000 stop`)
     Stop,
-    /// Stop the running server (if any) and start a new one in the foreground
+    /// Stop the running server (if any) and start a new one
+    /// (background by default, like a plain start; `--foreground` keeps it
+    /// in the terminal instead).
     Restart,
     /// Print a shareable web UI link for a tab (`/?tabId=N`).
     /// Opening it focuses that tab in the UI.
@@ -340,6 +343,16 @@ pub struct DaemonArgs {
     /// URL to open on start
     #[arg(long)]
     pub url: Option<String>,
+    /// Run in the background (this is the default): detach, survive terminal
+    /// close, log to `daemon-<port>.log`. Explicit alias for the default
+    /// behavior — useful in scripts for clarity. Overrides `--foreground`.
+    #[arg(long, visible_alias = "detach", overrides_with = "foreground")]
+    pub background: bool,
+    /// Keep the server in the foreground (logs to the terminal) instead of
+    /// detaching. Needed under supervisors that already background for you
+    /// (e.g. systemd `Type=simple` services). Overrides `--background`.
+    #[arg(long, overrides_with = "background")]
+    pub foreground: bool,
     /// Don't auto-open the web UI in the default browser on start
     #[arg(long)]
     pub no_open: bool,
@@ -350,5 +363,12 @@ impl DaemonArgs {
     /// (`--headless` is the default and only exists to override `--headed`.)
     pub fn headless_mode(&self) -> bool {
         !self.headed || self.headless
+    }
+
+    /// Background unless the user asked for `--foreground`.
+    /// (`--background` is the default and only exists to override
+    /// `--foreground`, mirroring the `--headless` / `--headed` pair.)
+    pub fn background_mode(&self) -> bool {
+        !self.foreground || self.background
     }
 }
