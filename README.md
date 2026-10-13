@@ -108,11 +108,13 @@ cd web && npm install && npm run build   # builds the monitor UI into web/dist
 ## Run
 
 ```sh
-# Headless (default): no visible browser window. `lb web` backgrounds by
-# default (survives terminal close, logs to `daemon-<port>.log`); if a server
-# is already running on the port it just shows the URL instead of starting
-# a second one. The web UI auto-opens in your default browser on start
-# (unless --no-open; best-effort from a background daemon).
+# Headless (default): no visible browser window — the automation browser
+# never opens one. The web UI auto-opens in your default browser when run
+# interactively in a terminal (unless --no-open); the detached background
+# daemon itself never pops a window (an interactive `lb web` parent opens it
+# once the server is up). `lb web` backgrounds by default (survives terminal
+# close, logs to `daemon-<port>.log`); if a server is already running on the
+# port it just shows the URL instead of starting a second one.
 lb web --port 8765
 
 # Keep the server in the terminal instead (logs to stdout; e.g. debugging,

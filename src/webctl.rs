@@ -3,6 +3,7 @@
 //! survive terminal close) unless `--foreground` is given. No new
 //! dependencies — `kill(1)` on Unix, `taskkill` / `tasklist` on Windows,
 //! `setsid`/`nohup` for detaching on Unix.
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -10,6 +11,47 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::cli::DaemonArgs;
+
+/// Open `url` in the OS default browser. Best-effort: headless servers,
+/// containers and SSH sessions have no browser to open — that must never
+/// fail startup. Called only from interactive contexts (terminal stdout);
+/// the detached daemon itself never pops a window (see callers).
+pub(crate) fn open_in_default_browser(url: &str) {
+    let attempt = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).status()
+    } else if cfg!(windows) {
+        // `start` is a cmd builtin; the empty title arg keeps quoted URLs working.
+        // CREATE_NO_WINDOW: spawning cmd must not flash a console window.
+        #[cfg(windows)]
+        use std::os::windows::process::CommandExt;
+        // `mut` is only needed on Windows (creation_flags below); the allow
+        // keeps non-Windows clippy (`-D warnings`) quiet.
+        #[allow(unused_mut)]
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "start", "", url]);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
+        cmd.status()
+    } else if let Ok(browser) = std::env::var("BROWSER") {
+        // Respect $BROWSER when set (common on Linux).
+        let mut parts = browser.split_whitespace();
+        match parts.next() {
+            Some(bin) if !bin.is_empty() => {
+                let mut cmd = std::process::Command::new(bin);
+                cmd.args(parts).arg(url);
+                cmd.status()
+            }
+            _ => std::process::Command::new("xdg-open").arg(url).status(),
+        }
+    } else {
+        std::process::Command::new("xdg-open").arg(url).status()
+    };
+    match attempt {
+        Ok(s) if s.success() => tracing::info!("opened web UI in default browser"),
+        Ok(s) => tracing::warn!("default browser exited with {s} — open the UI manually"),
+        Err(e) => tracing::warn!("could not open a browser ({e:#}) — open the UI manually"),
+    }
+}
 
 fn pid_file(port: u16) -> PathBuf {
     crate::daemon::pid_file(port)
@@ -568,15 +610,27 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
 
 /// Start the server in the background (default `lb web` behavior):
 /// - already running (pidfile alive, or something serving the port) → reuse
-///   it and just show the URL (never start a second daemon);
+///   it, open the UI for an interactive human, and show the URL (never start
+///   a second daemon);
 /// - otherwise detach a child server (logs to `daemon-<port>.log`), wait for
-///   it to accept connections, and report the URL.
+///   it to accept connections, open the UI for an interactive human, and
+///   report the URL.
 pub fn start_background(args: &DaemonArgs) -> Result<String> {
     let port = args.port;
     let url = format!("http://127.0.0.1:{port}/");
+    // Reusing still opens the UI for an interactive human (unless
+    // --no-open) — the user asked for the UI to be shown, and the already
+    // running daemon never pops one itself. Non-terminal callers (scripts,
+    // CI) just get the URL printed.
+    let maybe_open = || {
+        if !args.no_open && std::io::stdout().is_terminal() {
+            open_in_default_browser(&url);
+        }
+    };
     // Reuse: our own daemon is already up — never start a second one.
     match read_pid(port)? {
         Some(pid) if process_alive(pid) => {
+            maybe_open();
             return Ok(format!(
                 "a daemon is already running (pid {pid}, port {port}) — reusing it\n  UI:  {url}\n  (stop it with: lb web --port {port} stop)"
             ));
@@ -585,6 +639,7 @@ pub fn start_background(args: &DaemonArgs) -> Result<String> {
         None => {}
     }
     if port_serves(port) {
+        maybe_open();
         return Ok(format!(
             "something is already serving port {port} (no pid record — started by an older lb?) — reusing it\n  UI:  {url}\n  (if that is a stale process, stop it, then run `lb web --port {port}` again)"
         ));
@@ -606,6 +661,11 @@ pub fn start_background(args: &DaemonArgs) -> Result<String> {
             log.display()
         );
     }
+    // The interactive parent opens the UI in the default browser: the
+    // detached child never pops a window itself — its stdout is a file, and
+    // a daemon opening browsers is never wanted. Non-terminal parents
+    // (scripts, CI) just print the URL.
+    maybe_open();
     // Prefer the pidfile pid (the server's own record) over the spawn pid
     // (identical via setsid-exec, but the file is authoritative).
     let pid_msg = match read_pid(port)? {
