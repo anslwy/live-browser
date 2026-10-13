@@ -1,6 +1,15 @@
-**Live browser for you and your agent to control and view the tab, at the same time.**
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="src-tauri/icons/Square71x71Logo.png">
+    <img src="web/public/globe.svg" alt="" width="71">
+  </picture>
+</p>
 
-Drive any page from the CLI (`lb click`, `lb type`, `lb snapshot`, …) while
+<h1 align="center">Live Browser</h1>
+
+<p align="center">A browser for you and your agent to control and view the tab, at the same time.</p>
+
+> Drive any page from the CLI (`lb click`, `lb type`, `lb snapshot`, …) while
 watching the live view — and grab control yourself for logins, captchas, and
 judgment calls, then hand back. You can see where agents get stuck and unstuck them by using the Web UI, just like the way how you use the browser.
 
