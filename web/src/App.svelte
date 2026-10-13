@@ -461,6 +461,32 @@
     } catch { return ''; }
   })()`;
 
+  // Direct clipboard access needs a secure context (localhost/https) plus
+  // permission. Remote origins (tailscale/LAN URLs) can never use it — and a
+  // prompt() fallback is unreliable there (browsers can suppress repeat
+  // prompts, which reads as "paste does not work"). So clipboard failures
+  // open an in-UI dialog instead: it always works, everywhere.
+  let pasteOpen = false;
+  let pasteText = '';
+  let copyOpen = false;
+  let copyText = '';
+
+  function clipboardReadable(): boolean {
+    try {
+      return window.isSecureContext && typeof navigator.clipboard?.readText === 'function';
+    } catch {
+      return false;
+    }
+  }
+
+  function clipboardWritable(): boolean {
+    try {
+      return window.isSecureContext && typeof navigator.clipboard?.writeText === 'function';
+    } catch {
+      return false;
+    }
+  }
+
   async function doCopy() {
     clipBusy = 'copy';
     clipMsg = '';
@@ -476,14 +502,22 @@
         clipMsg = 'nothing selected';
         return;
       }
-      try {
-        await navigator.clipboard.writeText(text);
-      } catch {
-        // Clipboard API needs a secure context / permission — fall back to
-        // a prompt the user can Ctrl+C from.
-        prompt('Copy this text (Ctrl+C):', text);
+      if (clipboardWritable()) {
+        try {
+          await navigator.clipboard.writeText(text);
+          clipMsg = `copied ${text.length} chars`;
+          return;
+        } catch {
+          // Denied — fall through to the manual dialog.
+        }
       }
-      clipMsg = `copied ${text.length} chars`;
+      copyText = text;
+      copyOpen = true;
+      requestAnimationFrame(() => {
+        const el = document.getElementById('copy-area') as HTMLTextAreaElement | null;
+        el?.focus();
+        el?.select();
+      });
     } catch {
       clipMsg = 'copy failed — daemon unreachable?';
     } finally {
@@ -492,24 +526,10 @@
     }
   }
 
-  async function doPaste() {
+  async function insertText(text: string) {
     clipBusy = 'paste';
     clipMsg = '';
     try {
-      let text = '';
-      try {
-        text = await navigator.clipboard.readText();
-      } catch {
-        // Clipboard read blocked (permissions / non-secure context):
-        // let the user supply the text explicitly.
-        const viaPrompt = prompt('Paste text into the page:');
-        if (viaPrompt == null) return;
-        text = viaPrompt;
-      }
-      if (!text) {
-        clipMsg = 'clipboard empty';
-        return;
-      }
       const r = await apiFetch('/api/insert', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -530,6 +550,39 @@
       clipBusy = '';
       setTimeout(() => (clipMsg = ''), 4000);
     }
+  }
+
+  async function doPaste() {
+    clipBusy = 'paste';
+    clipMsg = '';
+    try {
+      if (clipboardReadable()) {
+        try {
+          const text = await navigator.clipboard.readText();
+          if (text) {
+            await insertText(text);
+            return;
+          }
+          clipMsg = 'clipboard empty';
+          return;
+        } catch {
+          // Denied/unfocused — fall through to the manual dialog.
+        }
+      }
+      pasteText = '';
+      pasteOpen = true;
+      requestAnimationFrame(() => document.getElementById('paste-area')?.focus());
+    } finally {
+      clipBusy = '';
+    }
+  }
+
+  async function submitPasteDialog() {
+    const text = pasteText;
+    if (!text) return;
+    pasteOpen = false;
+    pasteText = '';
+    await insertText(text);
   }
 
   function attachShotWheel() {
@@ -1371,6 +1424,45 @@
       {#if clipMsg}<span class="mono muted">{clipMsg}</span>{/if}
     </div>
   </div>
+
+  {#if pasteOpen}
+    <div class="card constrain" role="dialog" aria-label="Paste into page">
+      <strong>Paste into the page</strong>
+      <p class="muted">Direct clipboard read isn't available on this URL (it needs localhost or https) — paste (Ctrl+V) your text below instead.</p>
+      <textarea
+        id="paste-area"
+        rows="4"
+        placeholder="Paste your text here…"
+        bind:value={pasteText}
+        on:keydown={(e) => {
+          if (e.key === 'Escape') pasteOpen = false;
+          else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) submitPasteDialog();
+        }}></textarea>
+      <div class="row" style="margin-top:8px">
+        <button on:click={submitPasteDialog} disabled={!pasteText || clipBusy === 'paste'}>
+          {clipBusy === 'paste' ? 'Pasting…' : 'Paste into page'}
+        </button>
+        <button class="ghost" on:click={() => (pasteOpen = false)}>Cancel</button>
+        <span class="muted mono">Ctrl+Enter also submits</span>
+      </div>
+    </div>
+  {/if}
+
+  {#if copyOpen}
+    <div class="card constrain" role="dialog" aria-label="Copy from page">
+      <strong>Copy this text</strong>
+      <p class="muted">Direct clipboard write isn't available on this URL — select all (Ctrl+A) and copy (Ctrl+C) below.</p>
+      <textarea
+        id="copy-area"
+        rows="4"
+        readonly
+        value={copyText}
+        on:focus={(e) => (e.currentTarget as HTMLTextAreaElement).select()}></textarea>
+      <div class="row" style="margin-top:8px">
+        <button class="ghost" on:click={() => (copyOpen = false)}>Done</button>
+      </div>
+    </div>
+  {/if}
 
   <details class="card collapsible constrain">
     <summary>

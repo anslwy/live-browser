@@ -10,6 +10,7 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::Page;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -217,7 +218,7 @@ fn resolve_chrome_path(raw: &str) -> String {
         return s;
     }
     if s == "~" || s.starts_with("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let home = home_dir().to_string_lossy().to_string();
         s = format!("{home}{}", &s[1..]);
     }
     if !s.contains('*') && !s.contains('?') && !s.contains('[') {
@@ -229,31 +230,49 @@ fn resolve_chrome_path(raw: &str) -> String {
     }
 }
 
+/// Split a `--chrome` pattern on both `/` and `\` so native Windows patterns
+/// (`C:\…\chromium-*\chrome.exe`) resolve as well as POSIX ones.
+fn split_pattern(pattern: &str) -> Vec<&str> {
+    pattern.split(['/', '\\']).collect()
+}
+
+/// Drive prefix (`C:`) of a pattern's first segment, if any.
+fn drive_prefix(seg: &str) -> Option<&str> {
+    let b = seg.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        Some(seg)
+    } else {
+        None
+    }
+}
+
 /// Resolve the first path segment containing a glob metacharacter by listing
 /// its parent dir and picking the newest (lexicographically last) match.
 /// Enough for versioned layouts like `chromium-*/chrome`; returns `None`
 /// when nothing matches (caller keeps the literal, launch reports it).
 fn expand_glob_segment(pattern: &str) -> Option<String> {
     use std::path::PathBuf;
-    let is_abs = pattern.starts_with('/');
-    let parts: Vec<&str> = pattern.split('/').collect();
+    let parts = split_pattern(pattern);
     let wild_idx = parts.iter().position(|p| p.contains('*') || p.contains('?') || p.contains('['))?;
     let parent_parts = &parts[..wild_idx];
-    let parent = if parent_parts.is_empty() || (parent_parts.len() == 1 && parent_parts[0].is_empty()) {
-        PathBuf::from("/")
-    } else {
-        let mut p = PathBuf::new();
-        if is_abs {
-            p.push("/");
+    // Root: `/`, `\`, `C:` (drive), or empty (relative — resolved against
+    // the working directory).
+    let drive = parts.first().copied().and_then(drive_prefix);
+    let rooted = pattern.starts_with('/') || pattern.starts_with('\\') || drive.is_some();
+    let mut parent = PathBuf::new();
+    if rooted {
+        if let Some(d) = drive {
+            parent.push(format!("{d}{}", std::path::MAIN_SEPARATOR));
+        } else {
+            parent.push(std::path::MAIN_SEPARATOR.to_string());
         }
-        for part in parent_parts {
-            if part.is_empty() {
-                continue;
-            }
-            p.push(part);
+    }
+    for part in parent_parts.iter().skip(if drive.is_some() { 1 } else { 0 }) {
+        if part.is_empty() {
+            continue;
         }
-        p
-    };
+        parent.push(part);
+    }
     let entries = std::fs::read_dir(&parent).ok()?;
     let mut hits: Vec<String> = vec![];
     for e in entries.filter_map(|x| x.ok()) {
@@ -310,9 +329,54 @@ fn segment_matches(pattern: &str, name: &str) -> bool {
 /// now reuses that initial tab instead (see [`startup_page`]).
 const DEFAULT_START_URL: &str = "chrome://new-tab-page/";
 
+/// Major Chrome version from a `--version` line (`Google Chrome 145.0…` →
+/// 145, `Chromium 146.0.7680.177` → 146). None when unparseable.
+fn chrome_major_version(line: &str) -> Option<u32> {
+    line.split_whitespace().find_map(|tok| {
+        let major = tok.split('.').next()?;
+        if !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()) {
+            major.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// True when the binary supports `--headless=new` (Chrome 112+). Probes
+/// `<binary> --version` (bounded, ~100ms); unprobed/unparseable assumes
+/// modern Chrome. Logs the detected version so headless mysteries ("a
+/// Chrome window popped up — is automation really headless?") are answered
+/// by the daemon log instead of guesswork.
+async fn chrome_supports_new_headless(path: Option<&str>) -> bool {
+    const MIN_NEW_HEADLESS: u32 = 112;
+    let Some(path) = path else {
+        return true;
+    };
+    match crate::cloak::binary_version(path).await {
+        Some(line) => match chrome_major_version(&line) {
+            Some(major) if major < MIN_NEW_HEADLESS => {
+                tracing::info!("{path} is Chrome {major} (predates --headless=new) — using old --headless");
+                false
+            }
+            Some(major) => {
+                tracing::info!("{path} is Chrome {major} — using --headless=new");
+                true
+            }
+            None => {
+                tracing::info!("{path} reports {line:?} (unparseable version — assuming --headless=new)");
+                true
+            }
+        },
+        None => {
+            tracing::info!("{path}: version probe failed — assuming --headless=new");
+            true
+        }
+    }
+}
+
 /// Build the chromiumoxide config for `launch` (shared by startup and
 /// in-process browser switches — keep them identical).
-fn build_browser_config(launch: &LaunchConfig) -> Result<BrowserConfig, String> {
+async fn build_browser_config(launch: &LaunchConfig) -> Result<BrowserConfig, String> {
     let mut cfg = BrowserConfig::builder()
         .user_data_dir(std::path::PathBuf::from(&launch.profile))
         .window_size(1280, 900)
@@ -325,11 +389,16 @@ fn build_browser_config(launch: &LaunchConfig) -> Result<BrowserConfig, String> 
     }
     if !launch.headed {
         // Headless is the default (no visible window); --headed opts out.
-        // Explicit `--headless=new`: the old `--headless` flag was removed in
-        // Chrome 132 — newer Chrome ignores it and opens a *visible* window
-        // (seen on Windows). The new headless mode is a full browser without
-        // a visible window and behaves like headed for automation.
-        cfg = cfg.new_headless_mode();
+        // `--headless=new` is required on modern Chrome: the old `--headless`
+        // flag was removed in Chrome 132 — newer Chrome ignores it and opens
+        // a *visible* window (seen on Windows). But `--headless=new` only
+        // exists since Chrome 112 (unknown flags are ignored → visible
+        // window on frozen/old installs), so probe the binary and use old
+        // `--headless` there. Unprobed (pure auto-detect) assumes modern.
+        if chrome_supports_new_headless(launch_chrome_path(launch).as_deref()).await {
+            cfg = cfg.new_headless_mode();
+        }
+        // else: the builder default is old `--headless` — leave it as is.
     } else {
         cfg = cfg.with_head();
     }
@@ -3301,7 +3370,7 @@ async fn startup_page(browser: &Browser, start_url: &str) -> Result<Page, String
 /// Reuses Chrome's initial tab (see [`startup_page`); a half-dead browser
 /// is dropped (child reaped) on failure.
 async fn launch_with_page(launch: &LaunchConfig) -> Result<(Browser, Page), String> {
-    let cfg = build_browser_config(launch).map_err(|e| format!("bad browser config: {e}"))?;
+    let cfg = build_browser_config(launch).await.map_err(|e| format!("bad browser config: {e}"))?;
     let (mut nb, handler) = tokio::time::timeout(Duration::from_secs(75), Browser::launch(cfg))
         .await
         .map_err(|_| "launch timed out after 75s (first launch can be slow — retry)".to_string())?
@@ -3469,6 +3538,34 @@ pub(crate) fn cache_base() -> std::path::PathBuf {
                 std::path::PathBuf::from(home).join(".cache")
             })
     }
+}
+
+// Home directory for per-user state. On Windows this is `%USERPROFILE%`
+// (`HOME` is usually unset in PowerShell/cmd, where falling back to `/tmp`
+// would scatter state by working directory). Elsewhere `$HOME`, temp dir as
+// a last resort. Matches Node's `os.homedir()`, which is what the
+// cloakbrowser wrapper uses.
+pub(crate) fn home_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            if !home.trim().is_empty() {
+                return std::path::PathBuf::from(home);
+            }
+        }
+        if let (Ok(drive), Ok(path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
+            let full = format!("{drive}{path}");
+            if !full.trim().is_empty() {
+                return std::path::PathBuf::from(full);
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            return std::path::PathBuf::from(home);
+        }
+    }
+    std::env::temp_dir()
 }
 
 /// Pidfile for the daemon serving `port` (one daemon per port).
@@ -3690,6 +3787,7 @@ fn tailscale_ipv4() -> Option<String> {
 /// chrome …" with the browser listening but the daemon silent).
 async fn startup_browser(launch: &LaunchConfig, start_url: &str) -> Result<(Browser, Page)> {
     let cfg = build_browser_config(launch)
+        .await
         .map_err(|e| anyhow::anyhow!("invalid browser config: {e}"))?;
     tracing::info!(
         "launching chrome (profile: {}, {}) …",
@@ -3949,8 +4047,16 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     println!("  lb --server http://{local_addr} snapshot");
     println!("  lb --server http://{local_addr} handover \"please log in, then click Done in the UI\"");
     println!("  (stop this server with: lb web --port {} stop)", args.port);
-    if !args.no_open {
-        open_in_default_browser(&format!("http://{local_addr}/"));
+    // Auto-open the UI only for an interactive human (stdout is a terminal).
+    // The detached background child always has a file/pipe here and never
+    // pops (the background *parent* in webctl does that job after the server
+    // is up). Pipes and redirects (systemd, logs) skip it too: a popping
+    // browser window from a daemon is never what a service wants — and on
+    // Windows, where Chrome is usually the default browser, the popped UI
+    // window looks exactly like the automation browser leaking out of
+    // headless mode. The URL is always printed, so nothing is lost.
+    if !args.no_open && std::io::stdout().is_terminal() {
+        crate::webctl::open_in_default_browser(&format!("http://{local_addr}/"));
     }
     // Ctrl-C / SIGTERM: shut down the HTTP server, then close the browser
     // (releasing the profile lock) and remove the pidfile, so `lb web stop`
@@ -3968,38 +4074,6 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     }
     std::fs::remove_file(pid_file(args.port)).ok();
     Ok(())
-}
-
-/// Open `url` in the OS default browser. Best-effort: headless servers,
-/// containers and SSH sessions have no browser to open — that must never
-/// fail the daemon startup.
-fn open_in_default_browser(url: &str) {
-    let attempt = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).status()
-    } else if cfg!(windows) {
-        // `start` is a cmd builtin; the empty title arg keeps quoted URLs working.
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
-            .status()
-    } else if let Ok(browser) = std::env::var("BROWSER") {
-        // Respect $BROWSER when set (common on Linux).
-        let mut parts = browser.split_whitespace();
-        match parts.next() {
-            Some(bin) if !bin.is_empty() => {
-                let mut cmd = std::process::Command::new(bin);
-                cmd.args(parts).arg(url);
-                cmd.status()
-            }
-            _ => std::process::Command::new("xdg-open").arg(url).status(),
-        }
-    } else {
-        std::process::Command::new("xdg-open").arg(url).status()
-    };
-    match attempt {
-        Ok(s) if s.success() => tracing::info!("opened web UI in default browser"),
-        Ok(s) => tracing::warn!("default browser exited with {s} — open the UI manually"),
-        Err(e) => tracing::warn!("could not open a browser ({e:#}) — open the UI manually"),
-    }
 }
 
 /// Fires on Ctrl-C everywhere, and on SIGTERM on Unix (that's what
@@ -4174,12 +4248,40 @@ mod tests {
     }
 
     #[test]
+    fn split_pattern_handles_both_separators() {
+        assert_eq!(split_pattern("C:\\Users\\u\\chromium-*\\chrome.exe"), vec!["C:", "Users", "u", "chromium-*", "chrome.exe"]);
+        assert_eq!(split_pattern("/a/b/chromium-*/chrome"), vec!["", "a", "b", "chromium-*", "chrome"]);
+        assert_eq!(split_pattern("relative/*/x"), vec!["relative", "*", "x"]);
+    }
+
+    #[test]
+    fn drive_prefix_detects_windows_drives() {
+        assert_eq!(drive_prefix("C:"), Some("C:"));
+        assert_eq!(drive_prefix("d:"), Some("d:"));
+        assert_eq!(drive_prefix(""), None);
+        assert_eq!(drive_prefix("C"), None);
+        assert_eq!(drive_prefix("C:x"), None);
+        assert_eq!(drive_prefix("1:"), None);
+        assert_eq!(drive_prefix("Users"), None);
+    }
+
+    #[test]
     fn segment_match_basics() {
         assert!(segment_matches("chromium-*", "chromium-146.0"));
         assert!(!segment_matches("chromium-*", "chrome-146.0"));
         assert!(segment_matches("?", "a"));
         assert!(!segment_matches("?", ""));
         assert!(segment_matches("a*b", "aXYZb"));
+    }
+
+    #[test]
+    fn chrome_major_version_parses() {
+        assert_eq!(chrome_major_version("Google Chrome 145.0.7632.109"), Some(145));
+        assert_eq!(chrome_major_version("Chromium 146.0.7680.177"), Some(146));
+        assert_eq!(chrome_major_version("Chromium 90.0.4430.0"), Some(90));
+        assert_eq!(chrome_major_version("  Chromium   111.0.5563.64  \n"), Some(111));
+        assert_eq!(chrome_major_version(""), None);
+        assert_eq!(chrome_major_version("not-a-version"), None);
     }
 
     #[test]

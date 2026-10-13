@@ -90,14 +90,17 @@ fn binary_rel_path() -> PathBuf {
 }
 
 /// `~/.cloakbrowser` (honors `CLOAKBROWSER_CACHE_DIR`, like the wrapper).
+/// Home resolution matches the wrapper's `os.homedir()` (`%USERPROFILE%` on
+/// Windows): `HOME` is usually unset in PowerShell/cmd, and falling back to
+/// `/tmp` there scattered installs by working directory and hid
+/// wrapper-installed (`npx cloakbrowser install`) binaries from us.
 pub fn cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CLOAKBROWSER_CACHE_DIR") {
         if !dir.trim().is_empty() {
             return PathBuf::from(dir);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".cloakbrowser")
+    crate::daemon::home_dir().join(".cloakbrowser")
 }
 
 pub fn binary_path(version: &str) -> PathBuf {
@@ -154,11 +157,26 @@ pub async fn binary_version(path: &str) -> Option<String> {
 /// CloakBrowser on macOS prints `<html>…</html>` then hangs instead of
 /// exiting when `--user-data-dir` is given (system Chrome exits cleanly), so
 /// waiting for exit via `output()` always times out and blocks switching.
+/// Monotonic suffix for throwaway smoke profiles (see [`smoke_profile_dir`]).
+static SMOKE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fresh throwaway profile per smoke run: killing a previous run can orphan
+/// grandchildren that keep its profile dir locked (mandatory file locking on
+/// Windows), which would make the next run fail on the same `lb-smoke-<pid>`
+/// path. Timestamp + sequence makes collisions impossible.
+fn smoke_profile_dir() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SMOKE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("lb-smoke-{}-{nanos}-{seq}", std::process::id()))
+}
+
 pub async fn smoke_test_headless(binary: &str, no_sandbox: bool) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
-    let dir = std::env::temp_dir().join(format!("lb-smoke-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = smoke_profile_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let mut args = vec![
         "--headless".to_string(),
@@ -678,6 +696,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn cache_dir_honors_override() {
+        let dir = scratch("override").join("custom-cache");
+        std::env::set_var("CLOAKBROWSER_CACHE_DIR", &dir);
+        assert_eq!(cache_dir(), dir);
+        std::env::remove_var("CLOAKBROWSER_CACHE_DIR");
+    }
+
+    #[test]
+    fn smoke_profile_dirs_are_unique() {
+        assert_ne!(smoke_profile_dir(), smoke_profile_dir());
     }
 
     /// Windows path: `.zip` archives (single top-level dir) must flatten and
