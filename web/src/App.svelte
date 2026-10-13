@@ -93,6 +93,7 @@
     // so identical frames cost a tiny header instead of ~47kB of JPEG.
     const params = new URLSearchParams();
     if (passcode) params.set('passcode', passcode);
+    if (viewId != null) params.set('tab', String(viewId));
     if (lastShotHash) params.set('have', lastShotHash);
     const qs = params.toString();
     return qs ? `/api/screenshot?${qs}` : '/api/screenshot';
@@ -146,7 +147,7 @@
 
   async function fetchMetrics() {
     try {
-      const r = await apiFetch('/api/metrics');
+      const r = await apiFetch(viewId != null ? `/api/metrics?tab=${viewId}` : '/api/metrics');
       const j = await r.json();
       if (j.ok && j.metrics) {
         viewW = j.metrics.w ?? 0;
@@ -181,7 +182,7 @@
       await apiFetch('/api/click-at', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ x: p.x, y: p.y, by: 'human' })
+        body: JSON.stringify({ x: p.x, y: p.y, by: 'human', tab: viewId ?? null })
       });
     } finally {
       busy = '';
@@ -221,7 +222,7 @@
     apiFetch('/api/hover', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ x: p.x, y: p.y })
+      body: JSON.stringify({ x: p.x, y: p.y, tab: viewId ?? null })
     }).catch(() => {});
     // Deliberately no requestShot() here: hover fires continuously while the
     // mouse moves, and each screenshot contends on the single CDP session —
@@ -273,7 +274,7 @@
         await apiFetch('/api/wheel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ x: start.x, y: start.y, dx: start.x - p.x, dy: start.y - p.y })
+          body: JSON.stringify({ x: start.x, y: start.y, dx: start.x - p.x, dy: start.y - p.y, tab: viewId ?? null })
         });
       } finally {
         busy = '';
@@ -288,7 +289,7 @@
       await apiFetch('/api/drag', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ x1: start.x, y1: start.y, x2: p.x, y2: p.y, by: 'human' })
+        body: JSON.stringify({ x1: start.x, y1: start.y, x2: p.x, y2: p.y, by: 'human', tab: viewId ?? null })
       });
     } finally {
       busy = '';
@@ -308,7 +309,7 @@
     apiFetch('/api/wheel', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ x: p.x, y: p.y, dx: e.deltaX * scale, dy: e.deltaY * scale })
+      body: JSON.stringify({ x: p.x, y: p.y, dx: e.deltaX * scale, dy: e.deltaY * scale, tab: viewId ?? null })
     }).catch(() => {});
     // Throttled: wheel fires per tick and screenshots serialize on one CDP
     // session, so an unthrottled frame per tick queues up behind scrolling.
@@ -325,7 +326,7 @@
       await apiFetch('/api/zoom', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action })
+        body: JSON.stringify({ action, tab: viewId ?? null })
       });
     } finally {
       busy = '';
@@ -341,7 +342,7 @@
       const r = await apiFetch('/api/select', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: String(ref), value })
+        body: JSON.stringify({ target: String(ref), value, tab: viewId ?? null })
       });
       const j = await r.json();
       if (!j.ok) typeErr = j.error ?? 'select failed';
@@ -360,7 +361,7 @@
     await apiFetch('/api/click', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target: String(ref), by: 'human' })
+      body: JSON.stringify({ target: String(ref), by: 'human', tab: viewId ?? null })
     });
     busy = '';
     requestShot();
@@ -376,7 +377,7 @@
       const r = await apiFetch('/api/type', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: String(ref), text: typeText, submit })
+        body: JSON.stringify({ target: String(ref), text: typeText, submit, tab: viewId ?? null })
       });
       const j = await r.json();
       if (!j.ok) {
@@ -416,7 +417,8 @@
       key_code: e.keyCode || 0,
       text: !up && e.key.length === 1 ? e.key : '',
       repeat: e.repeat,
-      modifiers: (e.shiftKey ? 8 : 0)
+      modifiers: (e.shiftKey ? 8 : 0),
+      tab: viewId ?? null
     };
     // Chain to preserve key order; fire-and-forget per keystroke.
     // Every completed keystroke queues a fresh frame so typing feels live.
@@ -466,7 +468,7 @@
       const r = await apiFetch('/api/eval', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ js: COPY_JS })
+        body: JSON.stringify({ js: COPY_JS, tab: viewId ?? null })
       });
       const j = await r.json();
       const text = j.ok ? String(j.result ?? '') : '';
@@ -511,7 +513,7 @@
       const r = await apiFetch('/api/insert', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text })
+        body: JSON.stringify({ text, tab: viewId ?? null })
       });
       const j = await r.json();
       if (!j.ok) {
@@ -537,10 +539,27 @@
     img?.addEventListener('wheel', onShotWheel as EventListener, { passive: false });
   }
 
-  type TabInfo = { id: number; active: boolean; title: string; url: string; handover: boolean };
+  type TabInfo = { id: number; active: boolean; title: string; url: string; handover: boolean; last_action?: string; last_action_at?: string | null };
   let tabs: TabInfo[] = [];
 
+  // What the human is looking at. Pinned locally — the daemon's `active`
+  // (the agent's working tab) may move on its own (new tabs, `lb open`,
+  // adopted popups) but the live view never follows it automatically.
+  // Only an explicit click in the tab strip (viewTab) or a ?tabId= deep
+  // link changes viewId. All status/screenshot/snapshot fetches and all
+  // UI-initiated actions target viewId explicitly.
+  let viewId: number | null = null;
+
+  function isRecent(t: TabInfo): boolean {
+    if (t.id === viewId || !t.last_action_at) return false;
+    const ts = Date.parse(t.last_action_at);
+    if (!isFinite(ts)) return false;
+    return Date.now() - ts < 12000;
+  }
+
   // Deep link: `/?tabId=N` (from `lb web link N`) focuses that tab on load.
+  // View-only: it pins the live view, it does NOT change the daemon's
+  // active (agent) tab.
   let tabLinkErr = '';
   let tabLinkDone = false;
 
@@ -561,23 +580,22 @@
       tabLinkDone = true;
       return;
     }
-    try {
-      const r = await apiFetch('/api/activate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tab: id })
-      });
-      const j = await r.json();
-      if (!j.ok) {
-        tabLinkErr = `tab ${id} does not exist — see the tab strip below`;
-      } else {
-        tabLinkErr = '';
+    // Tabs are already fetched on mount — pin the view if the tab exists.
+    if (!tabs.some((t) => t.id === id)) {
+      try {
+        await fetchTabs();
+      } catch {}
+      if (needAuth) return;
+    }
+    if (tabs.some((t) => t.id === id)) {
+      tabLinkErr = '';
+      if (viewId !== id) {
+        viewId = id;
+        lastShotHash = null;
         await refreshAll();
       }
-    } catch {
-      // Unauthorized flips needAuth — retry after unlock (leave tabLinkDone false).
-      if (needAuth) return;
-      tabLinkErr = `could not switch to tab ${id} — daemon unreachable`;
+    } else {
+      tabLinkErr = `tab ${id} does not exist — see the tab strip below`;
     }
     tabLinkDone = true;
   }
@@ -586,21 +604,38 @@
     try {
       const r = await apiFetch('/api/tabs');
       const j = await r.json();
-      if (j.ok) tabs = j.tabs ?? [];
+      if (j.ok) {
+        const list: TabInfo[] = j.tabs ?? [];
+        tabs = list;
+        if (list.length === 0) {
+          viewId = null;
+          return;
+        }
+        // Pin the view: never follow the daemon's active tab automatically.
+        // Only initialize (first load) or recover (viewed tab was closed).
+        if (viewId == null || !list.some((t) => t.id === viewId)) {
+          const active = list.find((t) => t.active);
+          const next = active?.id ?? list[list.length - 1].id;
+          if (viewId !== next) lastShotHash = null;
+          viewId = next;
+        }
+      }
     } catch {}
   }
 
-  async function activateTab(id: number) {
+  // Explicit user action: pin the live view to this tab. Deliberately does
+  // NOT POST /api/activate — viewing must not hijack the agent's default
+  // tab. Agent work on other tabs shows only as the blue activity pulse.
+  async function viewTab(id: number) {
+    if (viewId === id) return;
+    viewId = id;
+    lastShotHash = null;
     busy = `tab${id}`;
     try {
-      await apiFetch('/api/activate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tab: id })
-      });
+      await Promise.all([fetchStatus(), fetchMetrics(), loadSnapshot()]);
+      requestShot();
     } finally {
       busy = '';
-      await refreshAll();
     }
   }
 
@@ -614,6 +649,7 @@
       });
     } finally {
       busy = '';
+      // refreshAll → fetchTabs recovers viewId if we just closed the viewed tab.
       await refreshAll();
     }
   }
@@ -623,11 +659,20 @@
     try {
       // Always a New Tab page (Chrome behavior) — the address bar holds the
       // current URL now, so it can't double as the new-tab source.
-      await apiFetch('/api/open', {
+      // New tabs become the daemon's active tab; since this is an explicit
+      // human action, pin the view there too.
+      const r = await apiFetch('/api/open', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: 'chrome://new-tab-page/' })
       });
+      try {
+        const j = await r.json();
+        if (j.ok && typeof j.tab === 'number') {
+          viewId = j.tab;
+          lastShotHash = null;
+        }
+      } catch {}
     } finally {
       busy = '';
       await refreshAll();
@@ -635,19 +680,29 @@
   }
 
   async function refreshAll() {
-    // Screenshot preload starts first; metadata fetches run concurrently.
+    // Tabs first: it pins/recovers viewId, so the per-view fetches below
+    // target the right tab. Screenshot preload starts first either way.
     requestShot();
-    await Promise.all([fetchStatus(), fetchMetrics(), fetchTabs(), loadSnapshot(), fetchLog()]);
+    await fetchTabs();
+    await Promise.all([fetchStatus(), fetchMetrics(), loadSnapshot(), fetchLog()]);
     requestShot();
   }
 
   let timer: ReturnType<typeof setInterval>;
 
-  async function fetchStatus() {
+  async function fetchStatus(retry = true) {
     try {
-      const r = await apiFetch('/api/status');
+      const r = await apiFetch(viewId != null ? `/api/status?tab=${viewId}` : '/api/status');
       status = await r.json();
       if ((status as unknown as { ok?: boolean }).ok === false) {
+        // The viewed tab may have been closed between fetchTabs and this
+        // call — recover by re-pinning, don't mistake it for an auth error.
+        const msg = (status as unknown as { error?: string }).error ?? '';
+        if (retry && msg.includes('no such tab')) {
+          await fetchTabs();
+          await fetchStatus(false);
+          return;
+        }
         // Wrong passcode surfaced as JSON (should already be 401-caught).
         needAuth = true;
         connected = false;
@@ -962,13 +1017,12 @@
     histActive = -1;
     const submitted = openUrl.trim();
     busy = 'open';
-    // Navigate the CURRENT tab (Chrome behavior). `lb open` without --tab
+    // Navigate the VIEWED tab (Chrome behavior). `lb open` without --tab
     // still opens a new tab — that's the explicit CLI path.
-    const activeId = tabs.find((t) => t.active)?.id;
     await apiFetch('/api/open', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: submitted, tab: activeId ?? null })
+      body: JSON.stringify({ url: submitted, tab: viewId ?? null })
     });
     pushHistory(submitted);
     busy = '';
@@ -978,7 +1032,7 @@
   async function loadSnapshot() {
     snapLoading = true;
     try {
-      const r = await apiFetch('/api/snapshot');
+      const r = await apiFetch(viewId != null ? `/api/snapshot?tab=${viewId}` : '/api/snapshot');
       const j = await r.json();
       if (j.ok) {
         snapshot = j.elements ?? [];
@@ -994,7 +1048,7 @@
     await apiFetch('/api/nav', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action })
+      body: JSON.stringify({ action, tab: viewId ?? null })
     });
     busy = '';
     await refreshAll();
@@ -1002,27 +1056,30 @@
 
   async function handoverDone() {
     busy = 'done';
-    await apiFetch('/api/handover/done', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const qs = viewId != null ? `?tab=${viewId}` : '';
+    await apiFetch(`/api/handover/done${qs}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     busy = '';
     await refreshAll();
   }
 
   onMount(() => {
-    fetchStatus();
-    fetchLog();
-    fetchMetrics();
-    fetchTabs();
-    loadSnapshot();
-    handleTabLinkParam();
-    requestShot();
+    (async () => {
+      // Tabs first so viewId is pinned before any per-tab fetch runs.
+      await fetchTabs();
+      await handleTabLinkParam();
+      await Promise.all([fetchStatus(), fetchLog(), fetchMetrics(), loadSnapshot()]);
+      requestShot();
+    })().catch(() => {});
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('resize', measureShot);
     window.addEventListener('click', settingsOutside);
     attachShotWheel();
     // Liveness tick — always on. Interactions queue their own frames on top.
+    // Tabs first (it may recover viewId after a close), then per-view fetches.
     timer = setInterval(async () => {
-      await Promise.all([fetchStatus(), fetchLog(), fetchTabs()]);
+      await fetchTabs();
+      await Promise.all([fetchStatus(), fetchLog()]);
       measureShot();
       requestShot();
     }, 2000);
@@ -1068,18 +1125,20 @@
       {#each tabs as t}
         <button
           role="tab"
-          aria-selected={t.active}
+          aria-selected={t.id === viewId}
           class="tabpill"
-          class:active={t.active}
+          class:active={t.id === viewId}
           class:needs-human={t.handover}
-          title={t.title || t.url}
-          on:click={() => !t.active && activateTab(t.id)}
+          class:is-recent={isRecent(t) && busy !== 'newtab'}
+          title={`${t.title || t.url || `Tab ${t.id}`}${isRecent(t) ? ` — agent ${t.last_action || 'activity'} just now` : ''}`}
+          on:click={() => t.id !== viewId && viewTab(t.id)}
           on:mousedown={(e) => {
             if (e.button === 1) {
               e.preventDefault();
               closeTab(t.id);
             }
           }}>
+          {#if isRecent(t) && busy !== 'newtab'}<span class="activitydot" title={`Agent ${t.last_action || 'worked'} here just now`} aria-hidden="true"></span>{/if}
           <span class="tabtitle">{t.title || t.url || `Tab ${t.id}`}</span>
           {#if t.handover}<span class="tabflag" title="Needs human">!</span>{/if}
           <span
