@@ -178,22 +178,36 @@ fn unpack(archive: &Path, dest: &Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        // PowerShell's Expand-Archive ships with every supported Windows.
-        let status = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
-                    archive.display(),
-                    dest.display()
-                ),
-            ])
-            .status()
-            .context("failed to run Expand-Archive")?;
-        anyhow::ensure!(status.success(), "Expand-Archive failed");
-        Ok(())
+        unpack_zip(archive, dest)
     }
+}
+
+/// Extract a `.zip` with the in-crate `zip` dependency — never PowerShell's
+/// `Expand-Archive`, whose behavior differs between PS 5.1 (user machines)
+/// and PS 7 (our release runners) and fails on our archives with an opaque
+/// `Join-Path ... drive is null` error. Split out so every CI host,
+/// including Linux, exercises the Windows code path via tests.
+#[cfg(any(windows, test))]
+fn unpack_zip(archive: &Path, dest: &Path) -> Result<()> {
+    let f = std::fs::File::open(archive)?;
+    let mut zip = zip::ZipArchive::new(f)?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let rel = entry
+            .enclosed_name()
+            .with_context(|| format!("unsafe zip entry #{i}"))?;
+        let out = dest.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out)?;
+        } else {
+            if let Some(p) = out.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            let mut f = std::fs::File::create(&out)?;
+            std::io::copy(&mut entry, &mut f)?;
+        }
+    }
+    Ok(())
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
@@ -398,5 +412,45 @@ mod tests {
         } else {
             assert_eq!(asset_name("v0.2.5"), None);
         }
+    }
+
+    /// The release `.zip` layout must extract with the in-crate reader on
+    /// every host (regression test for PowerShell 5.1 `Expand-Archive`
+    /// failing on our archives with `Join-Path ... drive is null`).
+    /// Runs on all CI platforms — it calls `unpack_zip` directly, not the
+    /// cfg-gated `unpack`.
+    #[test]
+    fn unpack_zip_extracts_release_layout() {
+        let dir = std::env::temp_dir().join(format!("lb-ziptest-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("live-browser-v9.9.9-windows-x86_64.zip");
+        {
+            let f = std::fs::File::create(&archive).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for name in [
+                "live-browser-v9.9.9-windows-x86_64/lb.exe",
+                "live-browser-v9.9.9-windows-x86_64/web/dist/index.html",
+                "live-browser-v9.9.9-windows-x86_64/README.md",
+            ] {
+                zip.start_file(name, opts).unwrap();
+                use std::io::Write;
+                zip.write_all(b"fake").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let dest = dir.join("out");
+        unpack_zip(&archive, &dest).unwrap();
+        assert!(dest
+            .join("live-browser-v9.9.9-windows-x86_64/lb.exe")
+            .is_file());
+        assert!(dest
+            .join("live-browser-v9.9.9-windows-x86_64/web/dist/index.html")
+            .is_file());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

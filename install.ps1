@@ -58,11 +58,38 @@ function Install-Browser {
   }
 }
 
+function Stop-OldDaemon {
+  # Free the install dir + profile locks before replacing files: a running
+  # daemon (or its browser) holds them and every delete/write then fails.
+  $oldLb = Join-Path $Prefix "lb.exe"
+  if (Test-Path $oldLb) {
+    Write-Step "stopping previous daemon (if running)…"
+    try { & $oldLb web stop *>$null } catch { }
+  }
+  # Leftover browser processes from crashes / old versions hold the profile
+  # lock too. Match the daemon's default profile dir specifically.
+  $profile = Join-Path $env:LOCALAPPDATA "live-browser\profile"
+  try {
+    Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.CommandLine -and $_.CommandLine -like "*$profile*" } |
+      ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  } catch { }
+}
+
+function Clear-Prefix {
+  # Remove a previous install but KEEP the profile dir (logins/cookies live
+  # at %LOCALAPPDATA%\live-browser\profile, inside $Prefix by default).
+  if (-not (Test-Path $Prefix)) { return }
+  Get-ChildItem -Path $Prefix -Exclude profile -Force -ErrorAction SilentlyContinue |
+    Remove-Item -Recurse -Force -ErrorAction Stop
+}
+
 function Install-Release {
   $tag = Get-LatestTag
   $asset = "live-browser-$tag-windows-x86_64.zip"
   $url = "https://github.com/$Repo/releases/download/$tag/$asset"
   Write-Step "installing $asset…"
+  Stop-OldDaemon
   $tmp = Join-Path ([IO.Path]::GetTempPath()) ("lb-" + [Guid]::NewGuid().ToString("N"))
   New-Item -ItemType Directory -Path $tmp | Out-Null
   try {
@@ -76,7 +103,11 @@ function Install-Release {
     Expand-Archive -Path $zip -DestinationPath $extract -Force
     $inner = Get-ChildItem $extract -Directory | Where-Object { $_.Name -like "live-browser-*" } | Select-Object -First 1
     if (-not $inner) { throw "unexpected archive layout in $asset" }
-    if (Test-Path $Prefix) { Remove-Item -Recurse -Force $Prefix }
+    try {
+      Clear-Prefix
+    } catch {
+      throw "could not clear $Prefix (a browser may still hold files there — close Chrome, stop lb with 'lb web stop', then re-run): $_"
+    }
     New-Item -ItemType Directory -Path $Prefix -Force | Out-Null
     Copy-Item (Join-Path $inner.FullName "*") $Prefix -Recurse -Force
   } finally {
@@ -120,7 +151,12 @@ function Install-FromSource {
     Push-Location $work
     try { cargo build --release } finally { Pop-Location }
     Write-Step "installing to $Prefix…"
-    if (Test-Path $Prefix) { Remove-Item -Recurse -Force $Prefix }
+    Stop-OldDaemon
+    try {
+      Clear-Prefix
+    } catch {
+      throw "could not clear $Prefix (a browser may still hold files there — close Chrome, stop lb with 'lb web stop', then re-run): $_"
+    }
     New-Item -ItemType Directory -Path (Join-Path $Prefix "web") -Force | Out-Null
     Copy-Item (Join-Path $work "target\release\lb.exe") $Prefix -Force
     Copy-Item (Join-Path $work "web\dist") (Join-Path $Prefix "web\dist") -Recurse -Force
