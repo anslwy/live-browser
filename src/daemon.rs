@@ -3479,6 +3479,15 @@ pub(crate) fn pid_file(port: u16) -> std::path::PathBuf {
         .join(format!("daemon-{port}.pid"))
 }
 
+/// Log file for a background (`lb web`, detached) daemon serving `port`.
+/// Foreground daemons log to the terminal instead; background ones append
+/// here so crashes and startup errors survive the terminal closing.
+pub(crate) fn daemon_log_file(port: u16) -> std::path::PathBuf {
+    cache_base()
+        .join("live-browser")
+        .join(format!("daemon-{port}.log"))
+}
+
 pub(crate) fn default_profile_dir() -> String {
     let base = cache_base();
     #[cfg(windows)]

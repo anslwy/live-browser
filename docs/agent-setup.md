@@ -44,10 +44,12 @@ if the prebuilt binary is unsupported on this platform.
 lb web --port 8765
 ```
 
-- Run it in the background (it stays in the foreground by default — use your
-  background-process mechanism) and keep it alive.
-- If `lb status` already works, a server is already running — reuse it,
-  do not start a second one.
+- It backgrounds by default (survives terminal close, logs to
+  `daemon-<port>.log`) — no background-process mechanism needed.
+- If `lb status` already works, a server is already running — `lb web`
+  reuses it and just shows the URL, it does not start a second one.
+- Only use `--foreground` when you need the logs in the terminal
+  (debugging, or under a supervisor like systemd `Type=simple`).
 - Flags you may need:
   - Containers / servers without a GUI: add `--no-sandbox --no-open`
   - To show a visible browser window for the human: add `--headed`
