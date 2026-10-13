@@ -1007,13 +1007,6 @@
     await refreshAll();
   }
 
-  async function claimControl() {
-    busy = 'claim';
-    await apiFetch('/api/handover/claim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-    busy = '';
-    await refreshAll();
-  }
-
   onMount(() => {
     fetchStatus();
     fetchLog();
@@ -1319,17 +1312,6 @@
       {#if clipMsg}<span class="mono muted">{clipMsg}</span>{/if}
     </div>
   </div>
-
-  {#if status && !status.handover.active}
-    <div class="banner done slim constrain">
-      <div class="row banner-head" style="justify-content:space-between">
-        <span class="url-label"><Icon name="check-circle" /> Agent in control — <span class="mono">{status.url}</span></span>
-        <button class="ghost" on:click={claimControl} disabled={busy === 'claim'} title="Pause the agent and drive the page yourself — click or drag the screenshot, scroll with your wheel, use the snapshot buttons — then click Done to return control. The agent can also hand over explicitly when it needs you.">
-          <Icon name="hand" /> {busy === 'claim' ? 'Claiming…' : 'Take control'}
-        </button>
-      </div>
-    </div>
-  {/if}
 
   <details class="card collapsible constrain">
     <summary>
