@@ -476,6 +476,25 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
 }
 .tabpill .tabclose:hover { background: var(--input-border); }
 .tabpill.needs-human { box-shadow: inset 0 -2px 0 #f59e0b; }
+/* Background activity pulse: agent did something here just now.
+   Animation only — the live view stays pinned to the viewed tab. */
+.tabpill .activitydot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #22c55e;
+  flex: none;
+  animation: tabpulse 1.2s ease-in-out infinite;
+}
+.tabpill.is-recent { box-shadow: inset 0 -2px 0 #22c55e; }
+.tabpill.is-recent.needs-human { box-shadow: inset 0 -2px 0 #22c55e, inset 0 -4px 0 #f59e0b; }
+@keyframes tabpulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.8); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tabpill .activitydot { animation: none; }
+}
 .tabpill .tabflag {
   background: #f59e0b;
   color: #111;
