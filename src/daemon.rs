@@ -3229,6 +3229,26 @@ async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseRe
     // Lock ordering (browser → launch → tabs → log) is exclusive to this
     // endpoint, so holding across the relaunch is deadlock-free.
     let mut browser = s.browser.lock().await;
+    // Pre-flight the target profile BEFORE closing the running browser (and
+    // inside the exclusive section, so concurrent switches can't both pass):
+    // a live holder (orphaned browser from a crash, second daemon sharing
+    // the profile) makes the new launch abort with a SingletonLock error —
+    // and by then the old browser is already closed (open tabs lost). Refuse
+    // up front instead, leaving the current browser untouched. A short grace
+    // covers stragglers still releasing the lock; same-profile switches skip
+    // the check (the holder is our own browser, closed next).
+    let current_profile = s.launch.lock().await.profile.clone();
+    let target_profile = kind_profile(&current_profile, &kind);
+    if target_profile != current_profile {
+        let holders = wait_profile_free(&target_profile, Duration::from_secs(8)).await;
+        if !holders.is_empty() {
+            let pids = holders.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+            return err(format!(
+                "profile {target_profile} is locked by another live browser (pid {pids}) — switch refused, current browser untouched. \
+                 Stop the other `lb web` daemon using it, or `kill {pids}` if it is an orphan, then retry"
+            ));
+        }
+    }
     // Close the old browser first (releases the profile lock), then settle
     // briefly so slow platforms release it before the new launch.
     {
@@ -3258,6 +3278,21 @@ async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseRe
             }
         }
         Err(stage) => {
+            // A lock race (holder appeared after the pre-flight, or a
+            // same-profile switch) aborts the launch with Chrome's
+            // SingletonLock stderr — name the holders and the recovery
+            // instead of the raw dump.
+            let target_profile = launch.profile.clone();
+            let lock_holders = if is_profile_locked_msg(&stage) {
+                let holders = profile_lock_holders(&target_profile);
+                if holders.is_empty() {
+                    None
+                } else {
+                    Some(holders.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+                }
+            } else {
+                None
+            };
             // Roll back so the daemon is never left browserless.
             launch.chrome = previous;
             launch.profile = previous_profile;
@@ -3266,7 +3301,14 @@ async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseRe
                     let prev = launch.chrome.clone().unwrap_or_default();
                     install_fresh_browser(&s, &mut browser, launch.clone(), rb, page).await;
                     s.push_log("browser", &format!("switch failed ({stage}) — rolled back to {prev}"));
-                    err(format!("switch failed ({stage}) — still on the previous browser (tabs were reset)"))
+                    if let Some(pids) = lock_holders {
+                        err(format!(
+                            "switch failed: target profile {target_profile} is locked by another live browser (pid {pids}) — rolled back to the previous browser (tabs were reset). \
+                             Stop the other `lb web` daemon using it, or `kill {pids}` if it is an orphan, then retry"
+                        ))
+                    } else {
+                        err(format!("switch failed ({stage}) — still on the previous browser (tabs were reset)"))
+                    }
                 }
                 Err(e2) => {
                     mark_browser_dead();
@@ -3280,8 +3322,9 @@ async fn api_browsers_use(State(s): State<AppState>, Json(b): Json<BrowsersUseRe
 /// Profile dir for a browser kind, derived from the daemon's base profile:
 /// system uses the base dir itself, CloakBrowser a `-cloak` sibling. Stable
 /// across repeated switches (system <-> base, cloak <-> base-cloak) and
-/// respectful of an explicit `--profile *-cloak` dir.
-fn kind_profile(base: &str, kind: &str) -> String {
+/// respectful of an explicit `--profile *-cloak` dir. Shared with webctl
+/// (stop reaps both dirs one daemon may own).
+pub(crate) fn kind_profile(base: &str, kind: &str) -> String {
     if kind == "cloak" {
         if base.ends_with("-cloak") {
             base.to_string()
@@ -3292,6 +3335,33 @@ fn kind_profile(base: &str, kind: &str) -> String {
         base.trim_end_matches("-cloak").to_string()
     } else {
         base.to_string()
+    }
+}
+
+/// True when a launch failure is Chrome refusing a locked profile
+/// (`SingletonLock` / `ProcessSingleton` abort — another live browser holds
+/// the `--user-data-dir`) rather than a dead binary or bad flags.
+fn is_profile_locked_msg(s: &str) -> bool {
+    s.to_lowercase().contains("singleton")
+}
+
+/// Pids of live browsers holding `profile` right now (orphans from a crash,
+/// a second daemon sharing the profile, …). Empty = free to launch on.
+fn profile_lock_holders(profile: &str) -> Vec<u32> {
+    crate::webctl::profile_browser_pids(profile)
+}
+
+/// Wait (up to `timeout`) for every browser holding `profile` to exit —
+/// covers a just-closed browser releasing its lock slowly. Returns the pids
+/// still holding it afterwards (empty = free to launch on).
+async fn wait_profile_free(profile: &str, timeout: Duration) -> Vec<u32> {
+    let start = std::time::Instant::now();
+    loop {
+        let holders = profile_lock_holders(profile);
+        if holders.is_empty() || start.elapsed() >= timeout {
+            return holders;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -4272,6 +4342,21 @@ mod tests {
         assert!(segment_matches("?", "a"));
         assert!(!segment_matches("?", ""));
         assert!(segment_matches("a*b", "aXYZb"));
+    }
+
+    #[test]
+    fn profile_lock_detected_in_launch_stderr() {
+        // The exact abort seen when a second browser holds the profile.
+        let stderr = "launch failed: Input/Output error while resolving websocket URL from browser process, \
+            stderr: BrowserStderr(\"[35985:29650035:ERROR:chrome/browser/process_singleton_posix.cc] \
+            Failed to create /Users/u/Library/Caches/live-browser/profile-cloak/SingletonLock: File exists (17) \
+            Failed to create a ProcessSingleton for your profile directory. Aborting now to avoid profile corruption.\"): \
+            unexpected end of stream";
+        assert!(is_profile_locked_msg(stderr));
+        assert!(is_profile_locked_msg("SINGLETONLOCK: file exists"));
+        assert!(!is_profile_locked_msg("launch failed: connection refused"));
+        assert!(!is_profile_locked_msg("first tab failed after 3 tries (timeout)"));
+        assert!(!is_profile_locked_msg(""));
     }
 
     #[test]
