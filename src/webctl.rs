@@ -160,7 +160,12 @@ fn resolve_profile(profile: Option<&str>) -> String {
 /// not a substring: the default profile `…/live-browser/profile` is a string
 /// prefix of a sibling daemon's `…/live-browser/profile-serve`, and a
 /// substring match would SIGKILL the wrong daemon's browser on `lb web stop`.
-fn profile_browser_pids(profile: &str) -> Vec<u32> {
+///
+/// Shared with the daemon: the Settings → Browser switch pre-flights the
+/// target profile with it (a live holder aborts the new launch with a
+/// SingletonLock error — better refused up front with the current browser
+/// untouched than after it has been closed).
+pub(crate) fn profile_browser_pids(profile: &str) -> Vec<u32> {
     let me = std::process::id();
     process_list()
         .into_iter()
@@ -252,6 +257,26 @@ fn reap_profile_browsers(profile: &str) -> usize {
         }
     }
     killed
+}
+
+/// Both profile dirs one daemon may own: the base and its `-cloak` sibling
+/// (per-kind profiles — see [`crate::daemon::kind_profile`]). Cleanup must
+/// cover both: after a cloak switch, orphans on the sibling otherwise
+/// survive `stop` and wedge the next cloak launch/switch with a
+/// SingletonLock abort.
+fn owned_profiles(base: &str) -> Vec<String> {
+    let sibling = crate::daemon::kind_profile(base, "cloak");
+    if sibling == base {
+        vec![base.to_string()]
+    } else {
+        vec![base.to_string(), sibling]
+    }
+}
+
+/// SIGKILL leftover browsers holding any profile this daemon may own (base
+/// and `-cloak` sibling). Returns how many were killed.
+fn reap_owned_browsers(base: &str) -> usize {
+    owned_profiles(base).iter().map(|p| reap_profile_browsers(p)).sum()
 }
 
 /// Wait (up to `timeout`) for the process to disappear. Returns true when gone.
@@ -346,7 +371,7 @@ fn reap_if_safe(port: u16, profile: &str) -> String {
             " (another daemon is running: pid {other_pid} on port {other_port} — left its browser alone)"
         );
     }
-    let reaped = reap_profile_browsers(profile);
+    let reaped = reap_owned_browsers(profile);
     if reaped > 0 {
         format!("; freed profile by stopping {reaped} leftover browser process(es)")
     } else {
@@ -375,7 +400,7 @@ pub fn stop(port: u16, profile: Option<&str>) -> Result<String> {
                 note = " (had to force)".to_string();
             }
             remove_pid_file(port);
-            let reaped = reap_profile_browsers(&profile);
+            let reaped = reap_owned_browsers(&profile);
             let extra = if reaped > 0 {
                 format!(" (+{reaped} leftover browser process(es))")
             } else {
@@ -709,6 +734,24 @@ mod tests {
         assert_eq!(
             user_data_dir(sibling),
             Some("/home/u/.cache/live-browser/profile-serve".to_string())
+        );
+    }
+
+    /// Cleanup covers the base profile and its `-cloak` sibling: cloak
+    /// orphans must not survive `stop` to wedge the next cloak launch.
+    #[test]
+    fn owned_profiles_pairs_cloak_sibling() {
+        assert_eq!(
+            owned_profiles("/home/u/.cache/live-browser/profile"),
+            vec![
+                "/home/u/.cache/live-browser/profile".to_string(),
+                "/home/u/.cache/live-browser/profile-cloak".to_string(),
+            ]
+        );
+        // Already-suffixed base (explicit `--profile *-cloak`) dedups.
+        assert_eq!(
+            owned_profiles("/home/u/.cache/live-browser/profile-cloak"),
+            vec!["/home/u/.cache/live-browser/profile-cloak".to_string()]
         );
     }
 
