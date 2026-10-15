@@ -707,6 +707,27 @@ pub async fn list(server: &str, passcode: Option<&str>, json: bool) -> Result<()
     Ok(())
 }
 
+pub async fn recover(server: &str, passcode: Option<&str>, check: bool, json: bool) -> Result<()> {
+    if check {
+        let v = get(server, passcode, "/api/health").await?;
+        if json {
+            print_json(&v);
+            return Ok(());
+        }
+        let probe = v.get("probe").and_then(|x| x.as_str()).unwrap_or("?");
+        let alive = v.get("browser_alive").and_then(|x| x.as_bool()).unwrap_or(false);
+        if alive && probe == "ok" {
+            println!("browser is healthy");
+        } else {
+            eprintln!("browser is dead (probe: {probe}) — run `lb recover` to relaunch it in place (open tabs reset)");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let v = post(server, passcode, "/api/recover", serde_json::json!({})).await?;
+    check_ok(&v, json)
+}
+
 pub async fn close(server: &str, passcode: Option<&str>, tab: Option<u32>, json: bool) -> Result<()> {
     // Resolve the tab first so the warning names what is being closed.
     let tabs = get(server, passcode, "/api/tabs").await?;

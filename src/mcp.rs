@@ -781,6 +781,24 @@ impl LbMcp {
         }
     }
 
+    #[tool(description = "Browser health probe (dead after macOS sleep?). Returns probe ok/dead — call recover_browser when dead.")]
+    async fn browser_health(
+        &self,
+        Parameters(_): Parameters<NoArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let v = self.get_json("/api/health").await?;
+        Ok(Self::daemon_result(v))
+    }
+
+    #[tool(description = "Relaunch a dead/wedged browser in place (same engine, no daemon restart). Open tabs reset. Call after screenshot/CDP transport failures e.g. post-sleep 502s.")]
+    async fn recover_browser(
+        &self,
+        Parameters(_): Parameters<NoArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let v = self.post_json("/api/recover", serde_json::json!({})).await?;
+        Ok(Self::daemon_result(v))
+    }
+
     #[tool(description = "Recent daemon action log (last entries).")]
     async fn log(
         &self,

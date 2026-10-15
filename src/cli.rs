@@ -49,6 +49,16 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Check browser health (dead after macOS sleep?) / relaunch it in place.
+    /// `lb recover` relaunches the same engine without a daemon restart
+    /// (open tabs reset); `--check` only probes via /api/health.
+    Recover {
+        /// Only check health, don't relaunch
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Close a tab (default: active). Warns: agents lose control of it.
     Close {
         tab: Option<u32>,

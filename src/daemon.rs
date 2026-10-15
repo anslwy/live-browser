@@ -522,7 +522,7 @@ fn is_browser_gone_msg(msg: &str) -> bool {
 /// `send failed because receiver is gone`, which means nothing).
 fn gone_err(port: u16) -> serde_json::Value {
     serde_json::json!({ "ok": false,
-        "error": format!("browser process died — restart it with `lb web --port {port} restart` (open tabs will be lost)") })
+        "error": format!("browser process died (common after macOS sleep) — relaunch it in place with `lb recover` or POST /api/recover, or restart with `lb web --port {port} restart` (open tabs will be lost)") })
 }
 
 /// Map a CDP failure into a user-facing error string: dead-tab errors name
@@ -1399,12 +1399,18 @@ async fn api_screenshot(
             }
             (StatusCode::OK, hm, bytes).into_response()
         }
-        Ok(Err(e)) => (
-            StatusCode::BAD_GATEWAY,
-            [(header::CONTENT_TYPE, "text/plain"), (header::CACHE_CONTROL, "no-store")],
-            format!("screenshot failed: {e:#}").into_bytes(),
-        )
-            .into_response(),
+        Ok(Err(e)) => {
+            let raw = format!("{e:#}");
+            if is_transport_gone_msg(&raw) && !probe_browser(&s).await {
+                mark_browser_dead();
+            }
+            (
+                StatusCode::BAD_GATEWAY,
+                [(header::CONTENT_TYPE, "text/plain"), (header::CACHE_CONTROL, "no-store")],
+                format!("screenshot failed: {raw} (browser may be dead after sleep — POST /api/recover or run `lb recover` to relaunch)").into_bytes(),
+            )
+                .into_response()
+        }
         Err(_) => (
             StatusCode::GATEWAY_TIMEOUT,
             [(header::CONTENT_TYPE, "text/plain"), (header::CACHE_CONTROL, "no-store")],
@@ -3071,6 +3077,84 @@ async fn api_activate(State(s): State<AppState>, Json(b): Json<ActivateReq>) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Browser health + recovery (sleep/wake resilience).
+//
+// macOS lid-close → sleep suspends Chrome's renderers and can sever the CDP
+// websocket without killing the daemon. Afterwards every CDP call fails with
+// transport errors (screenshot → 502) and the only fix used to be manually
+// switching the browser engine back and forth (which relaunches Chrome).
+// These two endpoints make that recovery one click:
+// - GET  /api/health  — cheap liveness probe (flag + real CDP round-trip).
+// - POST /api/recover — relaunch the *same* binary/profile in-process,
+//   resetting to a single New-Tab page (same as a switch that didn't happen).
+// ---------------------------------------------------------------------------
+
+/// True when the browser answers a real CDP round-trip within the budget.
+/// `browser.pages()` is a handler-local query (no renderer involved), so a
+/// failure here means the connection itself is dead — not just one bad tab.
+async fn probe_browser(s: &AppState) -> bool {
+    let browser = s.browser.lock().await;
+    matches!(
+        tokio::time::timeout(TAB_PROBE_TIMEOUT, browser.pages()).await,
+        Ok(Ok(_))
+    )
+}
+
+async fn api_health(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let alive_flag = browser_alive();
+    let probe_ok = probe_browser(&s).await;
+    if !probe_ok && alive_flag {
+        // The handler hasn't exited (so the flag is stale-true) but no CDP
+        // round-trip answers — e.g. post-sleep half-dead connection. Flag it
+        // so error mapping tells tabs apart from a dead browser correctly.
+        mark_browser_dead();
+    }
+    let tabs = s.tabs.lock().await.map.len();
+    let status = if probe_ok { "ok" } else { "dead" };
+    Json(serde_json::json!({
+        "ok": true,
+        "browser_alive": alive_flag && probe_ok,
+        "probe": status,
+        "tabs": tabs,
+        "hint": if probe_ok { "browser is healthy" }
+                else { "browser is dead (common after macOS sleep) — POST /api/recover or run `lb recover` to relaunch it in place (open tabs reset)" },
+    }))
+}
+
+/// Relaunch the currently configured browser in-process (same binary +
+/// profile — no engine switch needed). Recovers from a sleep-wedged Chrome
+/// without restarting the daemon process.
+async fn api_recover(State(s): State<AppState>) -> Json<serde_json::Value> {
+    if probe_browser(&s).await {
+        return ok("browser is healthy — no recovery needed");
+    }
+    s.push_log("browser", "recover requested (probed dead) — relaunching same engine");
+    // Exclusive section (same lock ordering as the engine switch:
+    // browser → launch → tabs) so concurrent recovers/switches serialize.
+    let mut browser = s.browser.lock().await;
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(10), browser.close()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), browser.wait()).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    let launch = s.launch.lock().await.clone();
+    std::fs::create_dir_all(&launch.profile).ok();
+    match launch_with_page(&launch).await {
+        Ok((nb, page)) => {
+            let bin = launch.chrome.clone().unwrap_or_else(|| "auto-detect".into());
+            install_fresh_browser(&s, &mut browser, launch.clone(), nb, page).await;
+            s.push_log("browser", &format!("recovered on {bin} (tabs reset)"));
+            Json(serde_json::json!({ "ok": true,
+                "message": format!("browser relaunched on {bin} (open tabs were reset — re-open your pages)") }))
+        }
+        Err(stage) => {
+            mark_browser_dead();
+            err(format!("recover failed ({stage}) — try `lb web --port {} restart`", s.port))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Browser manager (Settings → Browser): list / download / switch the Chrome
 // binary without restarting the daemon process. Switching relaunches the
 // browser in-process — open tabs are lost (same as a restart). Profiles are
@@ -4039,6 +4123,8 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .route("/api/tabs", get(api_tabs))
         .route("/api/close", post(api_close))
         .route("/api/activate", post(api_activate))
+        .route("/api/health", get(api_health))
+        .route("/api/recover", post(api_recover))
         .route("/api/browsers", get(api_browsers))
         .route("/api/browsers/download", post(api_browsers_download).get(api_browsers_download_progress))
         .route("/api/browsers/use", post(api_browsers_use))
