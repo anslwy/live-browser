@@ -828,6 +828,51 @@
     void pumpShot();
   }
 
+  // Sleep/wake resilience: after macOS lid-close the browser's CDP
+  // connection can wedge (screenshot → 502/503 forever). Count consecutive
+  // screenshot failures and confirm via /api/health before showing the
+  // one-click recovery banner (transient blips must not flash it).
+  let browserDead = false;
+  let browserHint = '';
+  let shotFails = 0;
+  let recovering = false;
+
+  async function checkBrowserHealth() {
+    try {
+      const r = await apiFetch('/api/health');
+      const j = await r.json();
+      if (j.ok && (j.probe === 'dead' || j.browser_alive === false)) {
+        browserDead = true;
+        browserHint = j.hint ?? '';
+      } else if (j.ok) {
+        browserDead = false;
+        browserHint = '';
+        shotFails = 0;
+      }
+    } catch {}
+  }
+
+  async function recoverBrowser() {
+    recovering = true;
+    try {
+      const r = await apiFetch('/api/recover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+      });
+      const j = await r.json();
+      if (j.ok) {
+        browserDead = false;
+        browserHint = '';
+        shotFails = 0;
+        lastShotHash = null;
+        await refreshAll();
+      }
+    } catch {} finally {
+      recovering = false;
+    }
+  }
+
   async function pumpShot() {
     if (shotLoading || !shotPending) return;
     shotPending = false;
@@ -838,6 +883,7 @@
       const res = await fetch(screenshotFetchUrl(), { headers: authHeaders() });
       if (res.status === 304) {
         // Identical frame — keep current image, no decode cost.
+        shotFails = 0;
       } else if (res.ok) {
         const etag = res.headers.get('ETag') ?? res.headers.get('X-Image-Hash') ?? '';
         const hash = etag.replace(/^W\//, '').replace(/"/g, '').trim() || null;
@@ -860,8 +906,15 @@
           };
           pre.src = objUrl;
         });
+        shotFails = 0;
+        if (browserDead) browserDead = false;
       } else if (res.status === 401) {
         needAuth = true;
+      } else if (res.status === 502 || res.status === 503 || res.status === 504 || res.status === 500) {
+        // Possible dead browser (post-sleep) — confirm via health probe
+        // after 3 consecutive frame failures to avoid flashing on blips.
+        shotFails += 1;
+        if (shotFails >= 3) await checkBrowserHealth();
       }
       // Other errors: keep old frame, retry on next tick.
     } catch {
@@ -1204,6 +1257,20 @@
         </button>
       {/each}
       <button class="tabnew" on:click={newTab} disabled={busy === 'newtab'} title="New tab" aria-label="New tab"><Icon name="plus" /></button>
+    </div>
+  {/if}
+
+  {#if browserDead}
+    <div class="banner constrain" role="alert" style="border-color:var(--danger)">
+      <strong><Icon name="warn" /> Browser disconnected</strong>
+      <p>{browserHint || 'The browser stopped answering (common after macOS sleep / lid-close). Screenshots fail until it is relaunched.'}</p>
+      <p class="muted mono">One click relaunches the same engine in place — no need to switch System ↔ Cloak back and forth. Open tabs reset.</p>
+      <div class="row">
+        <button on:click={recoverBrowser} disabled={recovering}>
+          {recovering ? 'Relaunching…' : 'Restart browser'}
+        </button>
+        <button class="ghost" on:click={checkBrowserHealth}>Recheck</button>
+      </div>
     </div>
   {/if}
 
