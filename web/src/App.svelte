@@ -1168,6 +1168,22 @@
     await refreshAll();
   }
 
+  // Embedded use (e.g. Vicuna's iframe): desktop webviews don't implement
+  // new windows, so target=_blank links would die silently. When framed,
+  // http(s) links post out to the embedder instead (see README "Embedding
+  // the UI"); standalone use keeps the native behavior.
+  function externalLinkBridge(e: MouseEvent) {
+    if (window.parent === window) return;
+    const el = e.target as HTMLElement | null;
+    const a = el?.closest?.('a[target="_blank"]') as HTMLAnchorElement | null;
+    if (!a) return;
+    const href = a.getAttribute('href') ?? '';
+    if (!href.startsWith('http://') && !href.startsWith('https://')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    window.parent.postMessage({ type: 'live-browser:open-external', url: href }, '*');
+  }
+
   onMount(() => {
     (async () => {
       // Tabs first so viewId is pinned before any per-tab fetch runs.
@@ -1180,6 +1196,7 @@
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('resize', measureShot);
     window.addEventListener('click', settingsOutside);
+    window.addEventListener('click', externalLinkBridge, true);
     attachShotWheel();
     // Liveness tick — always on. Interactions queue their own frames on top.
     // Tabs first (it may recover viewId after a close), then per-view fetches.
@@ -1198,6 +1215,7 @@
     window.removeEventListener('keyup', onKeyUp);
     window.removeEventListener('resize', measureShot);
     window.removeEventListener('click', settingsOutside);
+    window.removeEventListener('click', externalLinkBridge, true);
   });
 </script>
 

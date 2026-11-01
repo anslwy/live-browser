@@ -245,6 +245,30 @@ Notes:
 
 Dev mode: `cd web && npm run dev` (proxies `/api` to the daemon on :8765).
 
+## Embedding the UI (e.g. Vicuna's Browser tab)
+
+The UI is framable (no `X-Frame-Options`) and takes embed params, applied
+before first paint:
+
+- `?theme=light|dark` — force the theme (default: saved `lb-theme`, then dark).
+- `?accent=rrggbb` (+ `?accentfg=rrggbb`) — re-tint `--accent`/`--accent-fg`
+  and the `--live` indicators (LIVE dot, recent-tab underline, click ripple).
+  Invalid hex is ignored. Combine with `?theme=` / `?tabId=`.
+
+```html
+<iframe src="http://127.0.0.1:8765/?theme=light&accent=ef6c00&accentfg=ffffff"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-modals"></iframe>
+```
+
+(`allow-same-origin` is required — without it the frame's opaque origin
+breaks `localStorage` at boot and the same-origin `/api` calls.)
+
+External links: desktop webviews don't implement new windows, so when framed
+(`window.parent !== window`) the UI intercepts `target="_blank"` clicks and
+posts `{type: "live-browser:open-external", url}` to the parent instead of
+navigating. The embedder should origin-check the message and open the URL
+natively. Standalone use keeps the native anchor behavior.
+
 ## API (for scripts)
 
 `GET /api/status`, `POST /api/open`, `GET /api/snapshot`, `GET /api/screenshot` (JPEG),

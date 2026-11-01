@@ -6,13 +6,25 @@
     <title>Live Browser</title>
     <link rel="icon" type="image/svg+xml" href="./globe.svg" />
     <script>
-      // Apply theme before first paint (no flash): explicit ?theme= embed
-      // param (e.g. Vicuna's iframe) wins, then the saved setting.
-      // Defaults to dark.
+      // Embed params (e.g. Vicuna's iframe), applied before first paint:
+      // ?theme=light|dark selects the theme; ?accent=rrggbb + ?accentfg=rrggbb
+      // re-tint --accent/--accent-fg and the --live indicators. Invalid
+      // values are ignored (saved theme, built-in accents). Defaults to dark.
       try {
-        var q = new URLSearchParams(window.location.search).get('theme');
+        var qs = new URLSearchParams(window.location.search);
+        var q = qs.get('theme');
         document.documentElement.dataset.theme =
           q === 'light' || q === 'dark' ? q : localStorage.getItem('lb-theme') || 'dark';
+        var hex = /^[0-9a-fA-F]{6}$/;
+        var acc = qs.get('accent');
+        if (acc !== null && hex.test(acc)) {
+          document.documentElement.style.setProperty('--accent', '#' + acc);
+          document.documentElement.style.setProperty('--live', '#' + acc);
+        }
+        var fg = qs.get('accentfg');
+        if (fg !== null && hex.test(fg)) {
+          document.documentElement.style.setProperty('--accent-fg', '#' + fg);
+        }
       } catch (e) {
         document.documentElement.dataset.theme = 'dark';
       }
