@@ -95,7 +95,8 @@ jobs:
 
   macos:
     needs: [notes]
-    runs-on: macos-14
+    # macos-14 retired 2026-11-02 (brownouts already cancel jobs) — track latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
