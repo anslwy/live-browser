@@ -249,7 +249,7 @@ fn process_list() -> Vec<(u32, String)> {
 
 /// SIGKILL leftover browser processes holding `profile` (e.g. after a crash
 /// or `kill -9` of the daemon). Returns how many were killed.
-fn reap_profile_browsers(profile: &str) -> usize {
+pub(crate) fn reap_profile_browsers(profile: &str) -> usize {
     let mut killed = 0;
     for pid in profile_browser_pids(profile) {
         if terminate(pid, true).is_ok() && wait_gone(pid, Duration::from_secs(3)) {

@@ -178,6 +178,8 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb web [--port N] [flags]` | Start the browser + web UI server (background by default; `--foreground` stays in the terminal; old `lb daemon` still works) |
 | `lb web --port N stop` | Stop the running server |
 | `lb web --port N restart` | Stop (if running) and start a new server |
+| `lb kill [--port N]` | Forcibly stop the server (TERM, then KILL) and reap its browsers — the escape hatch when the daemon itself is wedged |
+| `lb recover [--check]` | Relaunch a dead browser in place (reaps leftover lock-holders first); `--check` only probes |
 | `lb web --port N link [tab]` | Print a shareable UI link for a tab (`/?tabId=N`, default: active) |
 | `lb update [--force]` | Update to the latest release (reports when already current) |
 | `lb open <URL\|text> [--here]` | New tab with URL (plain text searches Google); `--here` reuses the active tab |

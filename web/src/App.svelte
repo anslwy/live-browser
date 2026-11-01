@@ -867,8 +867,16 @@
         shotFails = 0;
         lastShotHash = null;
         await refreshAll();
+      } else {
+        // surface the failure in the banner — a silent no-op here is
+        // indistinguishable from a broken button (hit live, twice)
+        browserDead = true;
+        browserHint = typeof j.error === 'string' && j.error ? j.error : 'Recover failed — see daemon log';
       }
-    } catch {} finally {
+    } catch {
+      browserDead = true;
+      browserHint = 'Recover request failed (daemon unreachable?)';
+    } finally {
       recovering = false;
     }
   }
