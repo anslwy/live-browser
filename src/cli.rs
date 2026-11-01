@@ -59,6 +59,15 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Forcibly stop the server (TERM, then KILL) and reap its browsers.
+    /// The escape hatch when the daemon itself is wedged; equivalent to
+    /// `lb web stop` without the subcommand dance. Stopped daemons stay
+    /// stopped — follow with `lb web` to start a fresh one.
+    Kill {
+        /// Daemon port to kill (default 8765)
+        #[arg(long, env = "LB_PORT", default_value_t = 8765)]
+        port: u16,
+    },
     /// Close a tab (default: active). Warns: agents lose control of it.
     Close {
         tab: Option<u32>,

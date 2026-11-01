@@ -108,6 +108,10 @@ async fn main() -> Result<()> {
         Commands::Status { json } => client::status(&server, pass, tab, json).await,
         Commands::List { json } => client::list(&server, pass, json).await,
         Commands::Recover { check, json } => client::recover(&server, pass, check, json).await,
+        Commands::Kill { port } => {
+            println!("{}", webctl::stop(port, None)?);
+            Ok(())
+        }
         Commands::Close { tab: t, json } => client::close(&server, pass, t.or(tab), json).await,
         Commands::Use { tab: t, json } => client::use_tab(&server, pass, t, json).await,
         Commands::Snapshot { json, full } => client::snapshot(&server, pass, tab, json, full).await,

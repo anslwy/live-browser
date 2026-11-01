@@ -3139,6 +3139,17 @@ async fn api_recover(State(s): State<AppState>) -> Json<serde_json::Value> {
     }
     let launch = s.launch.lock().await.clone();
     std::fs::create_dir_all(&launch.profile).ok();
+    // The wedge case (post-sleep): the old Chromium is gone from CDP's view
+    // but a process still holds the profile SingletonLock, which aborts the
+    // relaunch below. Reap leftovers first (SIGKILL — a wedged process won't
+    // answer TERM) so the fresh engine can take the profile.
+    let reaped = crate::webctl::reap_profile_browsers(launch.profile.as_str());
+    if reaped > 0 {
+        s.push_log(
+            "browser",
+            &format!("recover reaped {reaped} leftover browser process(es)"),
+        );
+    }
     match launch_with_page(&launch).await {
         Ok((nb, page)) => {
             let bin = launch.chrome.clone().unwrap_or_else(|| "auto-detect".into());
