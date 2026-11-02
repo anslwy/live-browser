@@ -68,6 +68,9 @@ pub enum Commands {
         #[arg(long, env = "LB_PORT", default_value_t = 8765)]
         port: u16,
     },
+    /// Manage browser engines without a daemon: list what's installed or
+    /// download the free CloakBrowser build. Bare `lb browsers` lists.
+    Browsers(BrowsersArgs),
     /// Close a tab (default: active). Warns: agents lose control of it.
     Close {
         tab: Option<u32>,
@@ -331,6 +334,30 @@ pub enum WebAction {
     Link {
         /// Tab id to link to (default: active tab; also honors global --tab / LB_TAB)
         tab: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct BrowsersArgs {
+    #[command(subcommand)]
+    pub action: Option<BrowsersAction>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BrowsersAction {
+    /// List installed engines (system Chrome + cached CloakBrowser builds)
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download + install the free CloakBrowser build (no daemon needed).
+    /// Prints the installed chrome binary path on success.
+    Download {
+        /// Pinned version (default: latest free release, offline fallback pin)
+        #[arg(long)]
+        version: Option<String>,
         #[arg(long)]
         json: bool,
     },

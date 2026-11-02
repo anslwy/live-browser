@@ -7,7 +7,7 @@ mod update;
 mod webctl;
 
 use anyhow::Result;
-use cli::{Cli, Commands, WebAction};
+use cli::{BrowsersAction, Cli, Commands, WebAction};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -112,6 +112,13 @@ async fn main() -> Result<()> {
             println!("{}", webctl::stop(port, None)?);
             Ok(())
         }
+        Commands::Browsers(b) => match b.action {
+            None => cloak::browsers_list(false).await,
+            Some(BrowsersAction::List { json }) => cloak::browsers_list(json).await,
+            Some(BrowsersAction::Download { version, json }) => {
+                cloak::browsers_download(version, json).await
+            }
+        },
         Commands::Close { tab: t, json } => client::close(&server, pass, t.or(tab), json).await,
         Commands::Use { tab: t, json } => client::use_tab(&server, pass, t, json).await,
         Commands::Snapshot { json, full } => client::snapshot(&server, pass, tab, json, full).await,

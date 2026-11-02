@@ -518,6 +518,16 @@ fn extract_staged(archive: &std::path::Path, staging: &std::path::Path, binary_r
     Ok(())
 }
 
+/// Per-process tmp name: two `browsers download` runs (terminal + an app
+/// first-run fetch) must not share one partial file.
+fn download_tmp_name(version: &str) -> String {
+    format!(
+        ".lb-download-{version}-{}{}",
+        std::process::id(),
+        archive_ext()
+    )
+}
+
 /// Download + verify + install the free build. Resolves `latest` via the
 /// releases API (pinned fallback offline). Updates `state` throughout; on
 /// success returns the chrome binary path.
@@ -555,7 +565,7 @@ pub async fn download_free(version: Option<String>, state: Arc<Mutex<DownloadSta
         fail(m.clone()).await;
         anyhow::bail!("{m}");
     }
-    let tmp = cache.join(format!(".lb-download-{version}{}", archive_ext()));
+    let tmp = cache.join(download_tmp_name(&version));
     // 1. Fetch (primary, then GitHub fallback — never the reverse: a
     // verification failure below is a tamper signal, not a retry trigger).
     let urls = vec![format!("{base_primary}/{archive}"), format!("{base_fallback}/{archive}")];
@@ -684,6 +694,94 @@ pub async fn download_free(version: Option<String>, state: Arc<Mutex<DownloadSta
     Ok(bin)
 }
 
+// ---------------------------------------------------------------------------
+// `lb browsers` (no daemon needed)
+// ---------------------------------------------------------------------------
+
+/// List engines: system Chrome (auto-detect) + installed CloakBrowser
+/// builds, marking the persisted choice (`lb web` prefers explicit
+/// --chrome over it, so this is the default, not a promise).
+pub async fn browsers_list(json: bool) -> Result<()> {
+    let system = crate::daemon::detect_chrome();
+    let installed = installed();
+    let active = crate::daemon::load_persisted_chrome().or_else(|| system.clone());
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "system": system,
+                "cloak": installed,
+                "active": active,
+            })
+        );
+        return Ok(());
+    }
+    match &system {
+        Some(p) => println!("System Chrome: {p}"),
+        None => println!("System Chrome: not found"),
+    }
+    if installed.is_empty() {
+        println!("CloakBrowser: none installed (`lb browsers download` to fetch the free build)");
+    }
+    for i in &installed {
+        let mark = if Some(&i.path) == active.as_ref() {
+            " (active)"
+        } else {
+            ""
+        };
+        println!("CloakBrowser {}: {}{mark}", i.version, i.path);
+    }
+    Ok(())
+}
+
+/// Fetch the free build (latest free release, offline fallback pin),
+/// verify + install it. Human progress on stderr, installed binary path
+/// on stdout (`{"ok":true,"path":…}` with `--json`).
+pub async fn browsers_download(version: Option<String>, json: bool) -> Result<()> {
+    let state = Arc::new(Mutex::new(DownloadState::default()));
+    if !json {
+        let s = state.clone();
+        tokio::spawn(async move {
+            let mut last = String::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let d = s.lock().await.clone();
+                let pct = d.pct().map(|p| format!(" {p}%")).unwrap_or_default();
+                let line = format!(
+                    "{} {}{} — {}",
+                    format!("{:?}", d.phase).to_lowercase(),
+                    d.version,
+                    pct,
+                    d.message
+                );
+                if line != last {
+                    eprintln!("{line}");
+                    last = line;
+                }
+                if matches!(d.phase, DlPhase::Done | DlPhase::Error) {
+                    break;
+                }
+            }
+        });
+    }
+    match download_free(version, state).await {
+        Ok(path) => {
+            if json {
+                println!("{}", serde_json::json!({"ok": true, "path": path}));
+            } else {
+                println!("{path}");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({"ok": false, "error": e.to_string()}));
+            }
+            anyhow::bail!("{e:#}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +794,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn download_tmp_is_per_process() {
+        let n = download_tmp_name("145.0.1.2");
+        assert!(n.starts_with(".lb-download-145.0.1.2-"), "{n}");
+        assert!(n.ends_with(archive_ext()), "{n}");
+        assert!(n.contains(&std::process::id().to_string()), "{n}");
     }
 
     #[test]
