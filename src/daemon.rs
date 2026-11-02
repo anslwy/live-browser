@@ -158,7 +158,7 @@ fn browser_prefs_path() -> std::path::PathBuf {
 /// Last persisted chrome path, if any. Best-effort: corrupt / missing files
 /// and vanished binaries (uninstalled CloakBrowser) fall back to auto-detect
 /// so startup never breaks because of a stale preference.
-fn load_persisted_chrome() -> Option<String> {
+pub(crate) fn load_persisted_chrome() -> Option<String> {
     load_persisted_chrome_from(&browser_prefs_path())
 }
 
@@ -3798,7 +3798,7 @@ pub(crate) fn default_profile_dir() -> String {
 /// Best-effort Chrome/Chromium auto-detect for `--chrome` default.
 /// `chromiumoxide` already searches PATH + standard locations, so this only
 /// pins well-known absolute paths that are *not* on PATH.
-fn detect_chrome() -> Option<String> {
+pub(crate) fn detect_chrome() -> Option<String> {
     let candidates: &[&str] = if cfg!(windows) {
         &[
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
