@@ -970,5 +970,7 @@ pub async fn run(
         closer.post_json("/api/session/close", serde_json::json!({})),
     )
     .await;
-    Ok(())
+    // Exit now: tokio's blocking stdin reader would otherwise keep the
+    // process alive after a signal until stdin closes.
+    std::process::exit(0)
 }
