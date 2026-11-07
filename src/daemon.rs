@@ -911,6 +911,7 @@ impl AppState {
         with_tab(self, id, move |ts| {
             ts.last_action = action;
             ts.last_action_at = Some(now);
+            ts.last_used = std::time::Instant::now();
         })
         .await;
     }
@@ -1487,11 +1488,16 @@ async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json
     // load event and used to burn 3×25s retries. Hash-navigate via JS.
     if url.contains('#') {
         let current = page_url(&page).await;
-        let base = |u: &str| u.split('#').next().unwrap_or("").to_string();
+        // `https://x.com` and `https://x.com/#a` are the same document.
+        let base = |u: &str| u.split('#').next().unwrap_or("").trim_end_matches('/').to_string();
         if !current.is_empty() && base(&current) == base(url) {
             let js = format!("location.href = {}", serde_json::Value::String(url.to_string()));
             let _ = tokio::time::timeout(TAB_PROBE_TIMEOUT, page.evaluate(js.as_str())).await;
-            with_tab(s, tab_id, |ts| ts.last_url = url.to_string()).await;
+            with_tab(s, tab_id, |ts| {
+                ts.last_url = url.to_string();
+                ts.last_used = std::time::Instant::now();
+            })
+            .await;
             return Json(serde_json::json!({ "ok": true, "tab": tab_id,
                 "message": format!("tab {tab_id}: opened {url} (same-document)") }));
         }
@@ -1523,6 +1529,8 @@ async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json
             if !landed.starts_with("chrome-error") && !landed.is_empty() {
                 with_tab(s, tab_id, |ts| ts.last_url = landed.clone()).await;
             }
+            // A slow load must not look idle to the reaper / cap.
+            with_tab(s, tab_id, |ts| ts.last_used = std::time::Instant::now()).await;
             // Navigations reset document zoom — re-apply the stored level.
             let zoom = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.zoom).unwrap_or(1.0);
             apply_zoom(&page, zoom).await;
