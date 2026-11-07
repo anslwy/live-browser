@@ -702,7 +702,11 @@ pub async fn list(server: &str, passcode: Option<&str>, json: bool) -> Result<()
         };
         let title = t.get("title").and_then(|x| x.as_str()).unwrap_or("(no title)");
         let url = t.get("url").and_then(|x| x.as_str()).unwrap_or("");
-        println!("{mark} tab {id}: {title} <{url}>{ho}");
+        let owner = match t.get("owner").and_then(|x| x.as_str()) {
+            Some(o) => format!(" [agent: {o}]"),
+            None => String::new(),
+        };
+        println!("{mark} tab {id}: {title} <{url}>{owner}{ho}");
     }
     Ok(())
 }

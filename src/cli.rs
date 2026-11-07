@@ -316,7 +316,7 @@ pub enum Commands {
         session: String,
         /// Private browser context for this session (separate cookies /
         /// storage; logins from the shared profile don't carry over)
-        #[arg(long, env = "LB_ISOLATED")]
+        #[arg(long, env = "LB_ISOLATED", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::SetTrue)]
         isolated: bool,
     },
     /// Update lb to the latest release (says so when already current)
