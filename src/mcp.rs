@@ -157,6 +157,7 @@ pub struct OpenArgs {
     pub tab: Option<u32>,
     /// Deprecated, ignored: navigating your current tab is the default.
     #[serde(default)]
+    #[allow(dead_code)]
     pub here: bool,
     /// Open an additional tab instead of navigating your current one
     /// (capped per session; the least recently used get closed).
