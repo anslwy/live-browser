@@ -109,12 +109,12 @@ fn check_ok(v: &Value, json: bool) -> Result<()> {
     }
 }
 
-pub async fn open(server: &str, passcode: Option<&str>, url: &str, tab: Option<u32>, here: bool, json: bool) -> Result<()> {
+pub async fn open(server: &str, passcode: Option<&str>, url: &str, tab: Option<u32>, new_tab: bool, json: bool) -> Result<()> {
     let v = post(
         server,
         passcode,
         "/api/open",
-        serde_json::json!({ "url": url, "tab": tab, "here": here }),
+        serde_json::json!({ "url": url, "tab": tab, "new_tab": new_tab }),
     )
     .await?;
     check_ok(&v, json)
