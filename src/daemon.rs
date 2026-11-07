@@ -1432,7 +1432,10 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
     let (tab_id, page) = match tab_sel {
         Some(id) => tab!(&s, Some(id)),
         None => {
-            let new_page = match new_session_page(&s, &me, &url).await {
+            // Blank first, then one goto in open_navigate: creating the tab at
+            // `url` and then goto-ing it again loaded every page twice, and a
+            // `#fragment` URL hung the second (same-document) goto 3×25s.
+            let new_page = match new_session_page(&s, &me, "about:blank").await {
                 Ok(p) => p,
                 Err(e) => return err(e),
             };
@@ -1479,6 +1482,19 @@ async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json
         with_tab(s, tab_id, |ts| ts.last_url = "about:blank".into()).await;
         return Json(serde_json::json!({ "ok": true, "tab": tab_id,
             "message": format!("tab {tab_id}: blank tab ready") }));
+    }
+    // Same-document (only the #fragment differs): CDP goto never sees a
+    // load event and used to burn 3×25s retries. Hash-navigate via JS.
+    if url.contains('#') {
+        let current = page_url(&page).await;
+        let base = |u: &str| u.split('#').next().unwrap_or("").to_string();
+        if !current.is_empty() && base(&current) == base(url) {
+            let js = format!("location.href = {}", serde_json::Value::String(url.to_string()));
+            let _ = tokio::time::timeout(TAB_PROBE_TIMEOUT, page.evaluate(js.as_str())).await;
+            with_tab(s, tab_id, |ts| ts.last_url = url.to_string()).await;
+            return Json(serde_json::json!({ "ok": true, "tab": tab_id,
+                "message": format!("tab {tab_id}: opened {url} (same-document)") }));
+        }
     }
     // The network here can flap (VPN/tailscale), so retry transient failures.
     let mut last_err = String::new();
