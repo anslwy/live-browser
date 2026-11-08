@@ -943,6 +943,7 @@
   function setTheme(t: 'dark' | 'light') {
     theme = t;
     document.documentElement.dataset.theme = t;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', t === 'light' ? '#fffaf6' : '#240c0e');
     try {
       localStorage.setItem('lb-theme', t);
     } catch {}
@@ -1228,6 +1229,24 @@
 </script>
 
 <div class="wrap">
+  <header class="topbar constrain">
+    <span class="brand">
+      <svg class="mark" viewBox="0 0 512 512" aria-hidden="true">
+        <rect width="512" height="512" rx="112" fill="#6b1116" />
+        <circle cx="186" cy="216" r="56" fill="#fff" />
+        <circle cx="326" cy="216" r="56" fill="#fff" opacity=".75" />
+        <circle cx="256" cy="330" r="56" fill="#f4ebe5" />
+        <path d="M186 216 L256 330 L326 216" stroke="#fff" stroke-width="18" fill="none" stroke-linecap="round" opacity=".6" />
+      </svg>
+      <h1>Kurisu</h1>
+    </span>
+    <span class="sub">Live Browser</span>
+    {#if passcode && !needAuth}
+      <button class="ghost mini" on:click={clearPasscode} title="Forget the saved passcode in this browser">Lock</button>
+    {/if}
+    <span class="livepill" title="Streaming screenshots"><span class="livedot"></span>LIVE</span>
+  </header>
+
   {#if needAuth}
     <div class="card constrain">
       <strong><Icon name="warn" /> This server needs its passcode</strong>
@@ -1469,13 +1488,7 @@
   </div>
 
   <div class="card constrain">
-    <div class="row" style="justify-content:flex-end">
-      {#if passcode && !needAuth}
-        <button class="ghost" style="padding:2px 8px;font-size:12px" on:click={clearPasscode} title="Forget the saved passcode in this browser">Lock</button>
-      {/if}
-      <span class="livepill" title="Streaming screenshots"><span class="livedot"></span>LIVE</span>
-    </div>
-        <!-- Single persistent <img>: src swaps only after the new frame decodes. -->
+    <!-- Single persistent <img>: src swaps only after the new frame decodes. -->
         <div class="shotwrap" class:dim={pageLoading}>
           <img
             id="live-shot"
