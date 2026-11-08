@@ -1,6 +1,6 @@
 [package]
 name = "live-browser"
-version = "0.4.18"
+version = "0.4.19"
 edition = "2021"
 description = "A remote browser that humans and agents control together, live"
 license = "MIT"
@@ -21,7 +21,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chromiumoxide = { version = "0.9" }
 futures = "0.3"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "charset"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 rmcp = { version = "3.5.1", features = ["transport-io", "schemars"] }
