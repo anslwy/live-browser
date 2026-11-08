@@ -1,60 +1,70 @@
+/* Kurisu theme. Values mirror `ku web` (crates/kurisu/web/src/app.css): burgundy
+   accent and ivory surfaces in light, warm burgundy-black in dark. lb's own
+   variable names are kept so every component picks the tokens up unchanged;
+   ?accent=/?accentfg= embeds still override --accent/--accent-fg/--live below. */
 :root, :root[data-theme='dark'] {
   color-scheme: dark;
-  font-family: ui-sans-serif, system-ui, sans-serif;
-  --bg: #3d3332;
-  --fg: #ece4e0;
-  --card: #4e4442;
-  --border: #665b58;
-  --input-bg: #4e4442;
-  --input-border: #756866;
-  --link: #7ed491;
-  --accent: #43a86a;
-  --accent-fg: #14201a;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --bg: #1c1516;
+  --fg: #f4ebe5;
+  --card: #261d1e;
+  --border: #493638;
+  --input-bg: #261d1e;
+  --input-border: #493638;
+  --link: #f1b9b3;
+  --accent: #edaaa9;
+  --accent-fg: #2d090d;
   /* live/on indicators (LIVE dot, recent-tab underline, click ripple):
-     green by default, overridable via ?accent= for embeds */
-  --live: #22c55e;
-  --ghost-bg: #5d4f4d;
+     Kurisu's ok-green, overridable via ?accent= for embeds */
+  --live: #77d29d;
+  --ghost-bg: #342426;
   --ghost-fg: inherit;
-  --danger: #f87171;
-  --banner-warn-bg: #543d1e;
-  --banner-warn-border: #b47a2f;
-  --banner-ok-bg: #1d4033;
-  --banner-ok-border: #2ea87a;
-  --marker: #b3a6a3;
+  --danger: #ff9b91;
+  --banner-warn-bg: #38272a;
+  --banner-warn-border: #965c25;
+  --banner-ok-bg: #1f2f27;
+  --banner-ok-border: #327b6a;
+  --marker: #bfa9a3;
+  /* Kurisu's --muted; .muted uses opacity, so this is for borders only. */
+  --muted: #bfa9a3;
   --shot-bg: #000;
 }
 :root[data-theme='light'] {
   color-scheme: light;
-  --bg: #f6f8fa;
-  --fg: #1f2328;
-  --card: #ffffff;
-  --border: #d0d7de;
-  --input-bg: #ffffff;
-  --input-border: #d0d7de;
-  --link: #0969da;
-  --accent: #15803d;
-  --accent-fg: white;
+  --bg: #fffaf6;
+  --fg: #21191a;
+  --card: #f6eeea;
+  --border: #dfd1cb;
+  --input-bg: #fffaf6;
+  --input-border: #dfd1cb;
+  --link: #831d25;
+  --accent: #6b1116;
+  --accent-fg: #fffaf6;
   /* live/on indicators (LIVE dot, recent-tab underline, click ripple):
-     green by default, overridable via ?accent= for embeds */
-  --live: #22c55e;
-  --ghost-bg: #eaeef2;
-  --ghost-fg: #1f2328;
-  --danger: #d1242c;
-  --banner-warn-bg: #fff8c5;
-  --banner-warn-border: #d4a017;
-  --banner-ok-bg: #dafbe1;
-  --banner-ok-border: #1a7f37;
-  --marker: #59636e;
+     Kurisu's ok-green, overridable via ?accent= for embeds */
+  --live: #207344;
+  --ghost-bg: #f1e5df;
+  --ghost-fg: #21191a;
+  --danger: #b3261e;
+  --banner-warn-bg: #fff0df;
+  --banner-warn-border: #8b5900;
+  --banner-ok-bg: #e4f3ea;
+  --banner-ok-border: #207344;
+  --marker: #756360;
+  --muted: #756360;
   --shot-bg: #000;
 }
 body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
+  font: 14.5px/1.46 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
 }
 a { color: var(--link); }
-button, input {
+button, input, select, textarea {
   font: inherit;
+  color: inherit;
 }
 .wrap {
   margin: 0 auto;
@@ -66,38 +76,65 @@ button, input {
   margin-left: auto;
   margin-right: auto;
 }
-header {
+/* Kurisu top bar: the mark + name, then a quiet "Live Browser" label.
+   Compact on purpose — on a phone it must not push the live view down. */
+.topbar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: 8px;
+  padding: 10px 0 8px;
 }
-/* Optical alignment: small mono label next to the large title. */
-header .status {
-  line-height: 1;
-  transform: translateY(3px);
+.topbar .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  text-decoration: none;
+  color: var(--fg);
+  flex: none;
 }
-/* Brand mark in the header. */
-.brand {
+.topbar .mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  flex: none;
+}
+.topbar h1 {
+  font-size: 17px;
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: 0.01em;
   color: var(--accent);
 }
-.brand .icon {
-  width: 1.15em;
-  height: 1.15em;
-  vertical-align: -0.2em;
+:root[data-theme='light'] .topbar h1 { color: #6b1116; }
+.topbar .sub {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fg);
+  opacity: 0.55;
+  border-left: 1px solid var(--border);
+  padding-left: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.topbar .livepill {
+  flex: none;
+  margin-left: auto;
 }
 .dot {
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: #34d399;
+  background: var(--live);
   display: inline-block;
 }
 .dot.off { background: var(--danger); }
 .card {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 10px;
   padding: 12px 14px;
   margin-bottom: 12px;
 }
@@ -105,17 +142,17 @@ header .status {
 .card.flush-bottom {
   margin-bottom: 0;
   border-bottom: 0;
-  border-radius: 12px 12px 0 0;
+  border-radius: 10px 10px 0 0;
 }
 .card.flush-top {
   margin-top: 0;
   border-top: 0;
-  border-radius: 0 0 12px 12px;
+  border-radius: 0 0 10px 10px;
 }
 .banner {
   background: var(--banner-warn-bg);
   border: 1px solid var(--banner-warn-border);
-  border-radius: 12px;
+  border-radius: 10px;
   padding: 14px;
   margin-bottom: 12px;
 }
@@ -140,21 +177,35 @@ input[type="password"] {
   background: var(--input-bg);
   border: 1px solid var(--input-border);
   color: inherit;
-  border-radius: 8px;
+  border-radius: 6px;
   padding: 8px 10px;
 }
+input[type="text"]:focus,
+input[type="password"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+/* Kurisu's .btn: solid burgundy (or soft rose in dark), 6px corners, semibold. */
 button {
   background: var(--accent);
   color: var(--accent-fg);
-  border: 0;
-  border-radius: 8px;
-  padding: 8px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 6px 13px;
+  font-weight: 600;
   cursor: pointer;
 }
-button.ghost { background: var(--ghost-bg); color: var(--ghost-fg); }
+/* Kurisu's .btn.ghost: line-coloured outline, page background, light weight. */
+button.ghost {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  font-weight: 500;
+}
+button.ghost:hover:not(:disabled) { background: var(--ghost-bg); }
 /* Square icon-only buttons (nav arrows): icon sized to match text buttons. */
 button.iconbtn {
-  padding: 8px 12px;
+  padding: 7px 12px;
   line-height: 1;
 }
 button.iconbtn .icon {
@@ -192,15 +243,16 @@ button.iconbtn .icon {
   min-width: 0;
   margin-left: 6px;
 }
+/* Kurisu input: 6px corners, line-coloured border, accent on focus. */
 .browserbar input.omnibox {
   flex: 1;
   min-width: 0;
   width: 100%;
-  background: var(--ghost-bg);
-  border: 1px solid transparent;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
   color: inherit;
-  border-radius: 999px;
-  padding: 9px 18px;
+  border-radius: 6px;
+  padding: 8px 12px;
 }
 /* Address-bar history autocomplete dropdown. */
 .histdrop {
@@ -269,10 +321,15 @@ button.iconbtn .icon {
 }
 .browserbar input.omnibox:focus {
   outline: none;
-  border-color: var(--input-border);
-  background: var(--input-bg);
+  border-color: var(--accent);
 }
-button.danger { background: #b91c1c; color: white; }
+/* Kurisu's .btn.danger: outline only, error colour. */
+button.danger {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  font-weight: 500;
+}
 button:disabled { opacity: 0.5; cursor: default; }
 /* Manual paste/copy dialog textareas (clipboard-API fallback). */
 .card textarea {
@@ -281,7 +338,7 @@ button:disabled { opacity: 0.5; cursor: default; }
   background: var(--input-bg);
   border: 1px solid var(--input-border);
   color: inherit;
-  border-radius: 8px;
+  border-radius: 6px;
   padding: 8px 10px;
   font: inherit;
   resize: vertical;
@@ -292,11 +349,11 @@ img.shot {
   /* Keep the whole live view + its toolbar inside the initial viewport so no
      vertical scrolling is needed to drive the page. JS mapping accounts for
      the resulting letterbox (see imgToPage). */
-  max-height: calc(100vh - 280px);
-  max-height: calc(100svh - 280px);
+  max-height: calc(100vh - 290px);
+  max-height: calc(100svh - 290px);
   object-fit: contain;
-  border-radius: 8px;
-  border: 1px solid var(--input-border);
+  border-radius: 6px;
+  border: 1px solid var(--border);
   background: var(--shot-bg);
   min-height: 280px;
 }
@@ -337,7 +394,7 @@ img.shot.actionable {
   border: 2px solid var(--live);
   animation: rippleout 0.9s ease-out forwards;
 }
-.ripple.drag { border-color: #f59e0b; }
+.ripple.drag { border-color: var(--banner-warn-border); }
 @keyframes rippleout {
   from { transform: scale(0.6); opacity: 0.95; }
   to { transform: scale(3.2); opacity: 0; }
@@ -346,14 +403,16 @@ img.shot.actionable {
   .ripple { animation: none; opacity: 0; }
 }
 button.mini {
-  background: var(--ghost-bg);
-  color: var(--ghost-fg);
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 2px 8px;
   font-size: 12px;
+  font-weight: 500;
   margin-right: 4px;
 }
-button.mini:not(.ghost) { background: var(--accent); color: var(--accent-fg); }
+button.mini:not(.ghost) { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 select.rowsel {
   background: var(--input-bg);
   border: 1px solid var(--input-border);
@@ -375,9 +434,10 @@ select.rowsel {
 .zoomgroup button {
   border: 0;
   border-radius: 0;
-  background: var(--ghost-bg);
-  color: var(--ghost-fg);
+  background: transparent;
+  color: var(--fg);
 }
+.zoomgroup button:hover:not(:disabled) { background: var(--ghost-bg); }
 .zoomgroup button + button { border-left: 1px solid var(--input-border); }
 .zoomgroup .zoompct {
   font-family: ui-monospace, monospace;
@@ -465,7 +525,7 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
   color: var(--fg);
   opacity: 0.72;
   border: 0;
-  border-radius: 10px 10px 0 0;
+  border-radius: 8px 8px 0 0;
   font-size: 13px;
   cursor: pointer;
   flex: none;
@@ -493,7 +553,7 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
   flex: none;
 }
 .tabpill .tabclose:hover { background: var(--input-border); }
-.tabpill.needs-human { box-shadow: inset 0 -2px 0 #f59e0b; }
+.tabpill.needs-human { box-shadow: inset 0 -2px 0 var(--banner-warn-border); }
 /* Background activity pulse: agent did something here just now.
    Animation only — the live view stays pinned to the viewed tab. */
 .tabpill .activitydot {
@@ -505,7 +565,7 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
   animation: tabpulse 1.2s ease-in-out infinite;
 }
 .tabpill.is-recent { box-shadow: inset 0 -2px 0 var(--live); }
-.tabpill.is-recent.needs-human { box-shadow: inset 0 -2px 0 var(--live), inset 0 -4px 0 #f59e0b; }
+.tabpill.is-recent.needs-human { box-shadow: inset 0 -2px 0 var(--live), inset 0 -4px 0 var(--banner-warn-border); }
 @keyframes tabpulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.35; transform: scale(0.8); }
@@ -514,8 +574,8 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
   .tabpill .activitydot { animation: none; }
 }
 .tabpill .tabflag {
-  background: #f59e0b;
-  color: #111;
+  background: var(--banner-warn-border);
+  color: var(--bg);
   font-size: 11px;
   font-weight: 700;
   border-radius: 50%;
@@ -555,8 +615,8 @@ table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 
   overflow-y: auto;
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
   padding: 12px 14px;
   z-index: 50;
   text-align: left;
@@ -625,6 +685,20 @@ button.seg[aria-pressed="true"] {
   font-weight: 600;
   padding: 0 5px;
   border-radius: 6px;
-  background: rgba(99, 102, 241, 0.18);
-  color: #6366f1;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--link);
+}
+
+/* Phones (where /browser is mostly opened): keep the top bar to one slim row. */
+@media (max-width: 430px) {
+  .wrap { padding: 10px 12px 16px; }
+  .topbar { padding: 6px 0 8px; gap: 6px; }
+  .topbar h1 { font-size: 16px; }
+  .topbar .sub {
+    border-left: 0;
+    padding-left: 0;
+    font-size: 12px;
+  }
+  .card { padding: 10px 11px; }
+  img.shot { max-height: calc(100vh - 286px); max-height: calc(100svh - 286px); }
 }
