@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
     let cli = <Cli as clap::Parser>::parse();
     // MCP speaks JSON-RPC on stdout — logs must go to stderr there,
     // otherwise the protocol stream gets corrupted.
-    let log_writer_is_stderr = matches!(cli.command, Commands::Mcp);
+    let log_writer_is_stderr = matches!(cli.command, Commands::Mcp { .. });
     if log_writer_is_stderr {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Update { force } => update::update(force).await,
-        Commands::Open { url, here, json } => client::open(&server, pass, &url, tab, here, json).await,
+        Commands::Open { url, here: _, new_tab, json } => client::open(&server, pass, &url, tab, new_tab, json).await,
         Commands::Status { json } => client::status(&server, pass, tab, json).await,
         Commands::List { json } => client::list(&server, pass, json).await,
         Commands::Recover { check, json } => client::recover(&server, pass, check, json).await,
@@ -175,6 +175,6 @@ async fn main() -> Result<()> {
             client::upload(&server, pass, &target, &file, tab, json).await
         }
         Commands::Downloads { json } => client::downloads(&server, pass, json).await,
-        Commands::Mcp => mcp::run(server, passcode, tab).await,
+        Commands::Mcp { session, isolated } => mcp::run(server, passcode, tab, session, isolated).await,
     }
 }

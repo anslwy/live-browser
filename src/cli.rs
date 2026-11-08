@@ -30,12 +30,15 @@ pub enum Commands {
     #[command(visible_alias = "daemon")]
     Web(WebArgs),
 
-    /// Open a URL in the running browser (new tab by default; --here reuses the active tab)
+    /// Open a URL in the running browser (navigates the active tab; --new-tab opens a new one)
     Open {
         url: String,
-        /// Navigate the active tab in place instead of opening a new tab
-        #[arg(long)]
+        /// Deprecated no-op: navigating the active tab in place is now the default
+        #[arg(long, hide = true)]
         here: bool,
+        /// Open a new tab instead of navigating the active one
+        #[arg(long)]
+        new_tab: bool,
         #[arg(long)]
         json: bool,
     },
@@ -304,7 +307,18 @@ pub enum Commands {
     },
     /// Start an MCP server on stdio (for opencode / Claude Code / etc.).
     /// Reads LB_SERVER / LB_PASSCODE like every other command.
-    Mcp,
+    /// Each `lb mcp` process is its own agent session: it gets its own
+    /// tab(s), never touches other sessions' tabs, and closes its tabs
+    /// when the client disconnects.
+    Mcp {
+        /// Session label shown in the live view (unique id = label-pid)
+        #[arg(long, env = "LB_SESSION", default_value = "mcp")]
+        session: String,
+        /// Private browser context for this session (separate cookies /
+        /// storage; logins from the shared profile don't carry over)
+        #[arg(long, env = "LB_ISOLATED", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::SetTrue)]
+        isolated: bool,
+    },
     /// Update lb to the latest release (says so when already current)
     Update {
         /// Reinstall the latest release even when already current
@@ -402,6 +416,13 @@ pub struct DaemonArgs {
     /// Don't auto-open the web UI in the default browser on start
     #[arg(long)]
     pub no_open: bool,
+    /// Max open tabs per agent session (and for shared/human tabs);
+    /// the least recently used beyond it are closed
+    #[arg(long, env = "LB_MAX_TABS", default_value_t = 5)]
+    pub max_tabs: usize,
+    /// Close tabs untouched for this many seconds (0 = never)
+    #[arg(long, env = "LB_TAB_IDLE_SECS", default_value_t = 1800)]
+    pub tab_idle_secs: u64,
 }
 
 impl DaemonArgs {

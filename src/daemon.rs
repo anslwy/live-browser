@@ -56,12 +56,46 @@ struct TabState {
     last_action: String,
     /// RFC3339 timestamp of `last_action` (None = never acted on).
     last_action_at: Option<String>,
+    /// Agent session (MCP client) that owns this tab; `None` = shared
+    /// (human / CLI / startup tab). Owned tabs are invisible to other
+    /// sessions' defaults and refuse their explicit access.
+    owner: Option<String>,
+    /// Last time anything resolved this tab (drives cap + idle reaping).
+    last_used: std::time::Instant,
 }
 
 struct Tabs {
     map: std::collections::HashMap<u32, TabState>,
+    /// The UI's / CLI's current tab (unscoped requests).
     active: u32,
     next_id: u32,
+    /// Each session's own current tab ("reuse the current tab" = this).
+    owner_active: std::collections::HashMap<String, u32>,
+    /// Isolated browser contexts (separate cookies) per session, when
+    /// the session asked for one (`lb mcp --isolated`).
+    contexts: std::collections::HashMap<String, chromiumoxide::cdp::browser_protocol::browser::BrowserContextId>,
+}
+
+impl Tabs {
+    fn new(map: std::collections::HashMap<u32, TabState>) -> Self {
+        Self { map, active: 1, next_id: 2, owner_active: Default::default(), contexts: Default::default() }
+    }
+}
+
+/// Requesting agent session, set per request from the `X-LB-Session`
+/// header (see [`session_scope`]). Task-local so every handler's tab
+/// resolution ([`tab_page`]) is session-aware without new parameters.
+#[derive(Clone, Default)]
+struct Session {
+    id: Option<String>,
+    /// `X-LB-Isolated: 1` — new tabs go into a private browser context.
+    isolated: bool,
+}
+tokio::task_local! {
+    static SESSION: Session;
+}
+fn current_session() -> Session {
+    SESSION.try_with(|s| s.clone()).unwrap_or_default()
 }
 
 impl TabState {
@@ -74,6 +108,8 @@ impl TabState {
             last_url,
             last_action: "open".to_string(),
             last_action_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            owner: None,
+            last_used: std::time::Instant::now(),
         }
     }
 }
@@ -94,6 +130,11 @@ struct AppState {
     launch: Arc<Mutex<LaunchConfig>>,
     /// Background CloakBrowser download progress (Settings → Browser).
     cloak_dl: Arc<Mutex<crate::cloak::DownloadState>>,
+    /// Max tabs per session (and for the shared bucket); oldest idle
+    /// tabs beyond it are closed.
+    max_tabs: usize,
+    /// Close tabs untouched for this long (0 = never).
+    tab_idle: Duration,
 }
 
 /// The knobs that define the running browser. Cloned out of [`DaemonArgs`]
@@ -669,13 +710,38 @@ async fn require_passcode(
 }
 
 /// Resolve a tab selector (None = active tab) to its id + a Page handle.
+///
+/// Session-scoped (agent) requests: "no tab" means *the session's own*
+/// current tab, and another session's tab is refused — so concurrent
+/// agents never act on each other's pages. Unscoped requests (UI, CLI)
+/// keep the global active tab and may address any tab.
 async fn tab_page(s: &AppState, tab: Option<u32>) -> anyhow::Result<(u32, Page)> {
-    let t = s.tabs.lock().await;
-    let id = tab.unwrap_or(t.active);
-    t.map
-        .get(&id)
-        .map(|ts| (id, ts.page.clone()))
-        .ok_or_else(|| anyhow::anyhow!("no such tab: {id} — see `lb list`"))
+    let me = current_session().id;
+    let mut t = s.tabs.lock().await;
+    let id = match (tab, &me) {
+        (Some(id), _) => id,
+        (None, Some(o)) => match t.owner_active.get(o) {
+            Some(id) if t.map.contains_key(id) => *id,
+            _ => anyhow::bail!("this session ({o}) has no tab yet — call open(url) first (each agent session gets its own tab)"),
+        },
+        (None, None) => t.active,
+    };
+    let ts = t
+        .map
+        .get_mut(&id)
+        .ok_or_else(|| anyhow::anyhow!("no such tab: {id} — see `lb list`"))?;
+    if let (Some(o), Some(owner)) = (&me, &ts.owner) {
+        if o != owner {
+            anyhow::bail!("tab {id} belongs to another agent session ({owner}) — sessions can't touch each other's tabs; use your own (open/list_tabs)");
+        }
+    }
+    ts.last_used = std::time::Instant::now();
+    let page = ts.page.clone();
+    let owned = me.is_some() && ts.owner == me;
+    if owned {
+        t.owner_active.insert(me.unwrap(), id);
+    }
+    Ok((id, page))
 }
 
 macro_rules! tab {
@@ -739,7 +805,7 @@ async fn reconcile_tabs(s: &AppState) {
             .unwrap_or_default();
         fresh.push((p, url));
     }
-    let mut adopted: Vec<(Page, u32)> = vec![];
+    let mut adopted: Vec<(Page, u32, Option<String>)> = vec![];
     {
         let mut t = s.tabs.lock().await;
         for (page, url) in fresh {
@@ -748,19 +814,30 @@ async fn reconcile_tabs(s: &AppState) {
             if t.map.values().any(|ts| ts.page.target_id() == page.target_id()) {
                 continue;
             }
+            // A popup belongs to the session whose tab opened it, and
+            // becomes that session's current tab (foreground-open).
+            let owner = page.opener_id().as_ref().and_then(|op| {
+                t.map.values().find(|ts| ts.page.target_id() == op).and_then(|ts| ts.owner.clone())
+            });
             let id = t.next_id;
             t.next_id += 1;
-            t.map.insert(
-                id,
-                TabState::new(page.clone(), url),
-            );
-            t.active = id;
-            adopted.push((page, id));
+            let mut ts = TabState::new(page.clone(), url);
+            ts.owner = owner.clone();
+            t.map.insert(id, ts);
+            match &owner {
+                Some(o) => {
+                    t.owner_active.insert(o.clone(), id);
+                }
+                None => t.active = id,
+            }
+            adopted.push((page, id, owner));
         }
     }
-    for (page, id) in adopted {
+    for (page, id, owner) in adopted {
         spawn_dialog_guard(page, s.log.clone(), id);
-        s.push_log("open/tab", &format!("tab {id} opened by the page (adopted)"));
+        let who = owner.as_deref().unwrap_or("shared");
+        s.push_log("open/tab", &format!("tab {id} [{who}] opened by the page (adopted)"));
+        enforce_tab_cap(s, owner.as_deref(), id).await;
     }
 }
 
@@ -834,6 +911,7 @@ impl AppState {
         with_tab(self, id, move |ts| {
             ts.last_action = action;
             ts.last_action_at = Some(now);
+            ts.last_used = std::time::Instant::now();
         })
         .await;
     }
@@ -1116,10 +1194,13 @@ struct OpenReq {
     #[serde(default)]
     tab: Option<u32>,
     url: String,
-    /// Navigate the active tab in place instead of opening a new tab
-    /// (same as passing the active tab id explicitly).
+    /// Deprecated no-op: reusing the current tab is now the default.
     #[serde(default)]
+    #[allow(dead_code)]
     here: bool,
+    /// Open a new tab instead of navigating the current one.
+    #[serde(default)]
+    new_tab: bool,
 }
 /// Omnibox-style normalization: full URLs pass through, bare domains get
 /// https://, and anything else becomes a Google search.
@@ -1179,6 +1260,151 @@ fn urlencode_query(s: &str) -> String {
     out
 }
 
+/// Create a page for `me`: in the session's private browser context when
+/// it asked for isolation, else in the shared (default) context.
+async fn new_session_page(s: &AppState, me: &Session, url: &str) -> Result<Page, String> {
+    use chromiumoxide::cdp::browser_protocol::target::{CreateBrowserContextParams, CreateTargetParams};
+    let browser = s.browser.lock().await;
+    let ctx = match (&me.id, me.isolated) {
+        (Some(o), true) => {
+            let existing = s.tabs.lock().await.contexts.get(o).cloned();
+            match existing {
+                Some(c) => Some(c),
+                None => {
+                    let c = tokio::time::timeout(CDP_TIMEOUT, browser.create_browser_context(CreateBrowserContextParams::default()))
+                        .await
+                        .map_err(|_| "creating an isolated browser context timed out".to_string())?
+                        .map_err(|e| format!("creating an isolated browser context failed: {e:#}"))?;
+                    s.tabs.lock().await.contexts.insert(o.clone(), c.clone());
+                    Some(c)
+                }
+            }
+        }
+        _ => None,
+    };
+    let mut params = CreateTargetParams::new(url.to_string());
+    params.browser_context_id = ctx;
+    match tokio::time::timeout(CDP_TIMEOUT, browser.new_page(params)).await {
+        Ok(Ok(p)) => Ok(p),
+        Ok(Err(e)) => Err(friendly_cdp_error(s.port, "new tab failed", e)),
+        Err(_) => Err(format!(
+            "new tab timed out after {}s — the browser may be wedged (a JS dialog blocks it?); check `lb log`",
+            CDP_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Keep each session (and the shared bucket) at most `max_tabs` tabs:
+/// close the least recently used ones, never `keep`, a tab in handover, or
+/// the UI's active shared tab.
+async fn enforce_tab_cap(s: &AppState, owner: Option<&str>, keep: u32) {
+    let victims: Vec<u32> = {
+        let t = s.tabs.lock().await;
+        let mut mine: Vec<(&u32, &TabState)> =
+            t.map.iter().filter(|(_, ts)| ts.owner.as_deref() == owner).collect();
+        if mine.len() <= s.max_tabs {
+            return;
+        }
+        let excess = mine.len() - s.max_tabs;
+        mine.sort_by_key(|(_, ts)| ts.last_used);
+        mine.into_iter()
+            .filter(|(id, ts)| **id != keep && !ts.handover.active && !(owner.is_none() && **id == t.active))
+            .take(excess)
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for id in victims {
+        let who = owner.unwrap_or("shared");
+        if let Ok(m) = close_tab_id(s, id).await {
+            s.push_log("close/cap", &format!("{m} — over {} tabs for [{who}]", s.max_tabs));
+        }
+    }
+}
+
+/// Background reaper: close tabs nobody touched for `tab_idle` (agents
+/// that crashed without disconnecting, forgotten popups). The UI's active
+/// shared tab and tabs in handover are kept.
+fn spawn_idle_reaper(s: AppState) {
+    if s.tab_idle.is_zero() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let victims: Vec<u32> = {
+                let t = s.tabs.lock().await;
+                t.map
+                    .iter()
+                    .filter(|(id, ts)| {
+                        ts.last_used.elapsed() > s.tab_idle
+                            && !ts.handover.active
+                            && !(ts.owner.is_none() && **id == t.active)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
+            };
+            for id in victims {
+                if let Ok(m) = close_tab_id(&s, id).await {
+                    s.push_log("close/idle", &format!("{m} — idle > {}s", s.tab_idle.as_secs()));
+                }
+            }
+        }
+    });
+}
+
+#[derive(Deserialize, Default)]
+struct SessionCloseReq {
+    /// Session to end (default: the requesting session's header).
+    #[serde(default)]
+    session: Option<String>,
+}
+/// End an agent session: close every tab it owns and drop its private
+/// context. `lb mcp` calls this when its client disconnects.
+async fn api_session_close(State(s): State<AppState>, body: Option<Json<SessionCloseReq>>) -> Json<serde_json::Value> {
+    let me = current_session().id;
+    let Some(session) = body.and_then(|b| b.0.session).or(me.clone()) else {
+        return err("no session given (X-LB-Session header or {\"session\": ...})".into());
+    };
+    if me.is_some() && me.as_deref() != Some(session.as_str()) {
+        return err(format!("can't end another agent session ({session})"));
+    }
+    let ids: Vec<u32> = {
+        let t = s.tabs.lock().await;
+        t.map.iter().filter(|(_, ts)| ts.owner.as_deref() == Some(session.as_str())).map(|(id, _)| *id).collect()
+    };
+    let n = ids.len();
+    for id in ids {
+        let _ = close_tab_id(&s, id).await;
+    }
+    let ctx = {
+        let mut t = s.tabs.lock().await;
+        t.owner_active.remove(&session);
+        t.contexts.remove(&session)
+    };
+    if let Some(c) = ctx {
+        let browser = s.browser.lock().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), browser.dispose_browser_context(c)).await;
+    }
+    s.push_log("session/close", &format!("[{session}] closed {n} tab(s)"));
+    Json(serde_json::json!({ "ok": true, "session": session, "closed": n }))
+}
+
+/// Read `X-LB-Session` / `X-LB-Isolated` and run the request inside that
+/// session scope (see [`SESSION`]).
+async fn session_scope(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let h = req.headers();
+    let id = h
+        .get("x-lb-session")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().chars().filter(|c| !c.is_control()).take(80).collect::<String>())
+        .filter(|v| !v.is_empty());
+    let isolated = h.get("x-lb-isolated").and_then(|v| v.to_str().ok()).is_some_and(|v| v == "1" || v == "true");
+    SESSION.scope(Session { id, isolated }, next.run(req)).await
+}
+
 async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<serde_json::Value> {
     let input = b.url.trim().to_string();
     if input.is_empty() {
@@ -1188,31 +1414,31 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
         Ok(u) => u,
         Err(e) => return err(e),
     };
-    // With an explicit tab (or --here): navigate it in place.
-    // Without: open a new tab (pass --here to reuse the active one —
-    // otherwise repeated `lb open` calls pile up tabs).
-    let tab_sel = b.tab.or(if b.here {
-        Some(s.tabs.lock().await.active)
-    } else {
-        None
-    });
+    // Default: navigate the current tab in place (the session's own tab
+    // for agents, the active tab otherwise). A new tab only when asked
+    // (`new_tab`) or when an agent session has no tab yet — opening a tab
+    // per call is what used to leak dozens of renderers per agent session.
+    let me = current_session();
+    let tab_sel = match (b.tab, b.new_tab) {
+        (Some(id), _) => Some(id),
+        (None, true) => None,
+        (None, false) => match &me.id {
+            Some(o) => {
+                let t = s.tabs.lock().await;
+                t.owner_active.get(o).copied().filter(|id| t.map.contains_key(id))
+            }
+            None => Some(s.tabs.lock().await.active),
+        },
+    };
     let (tab_id, page) = match tab_sel {
         Some(id) => tab!(&s, Some(id)),
         None => {
-            let new_page = {
-                let browser = s.browser.lock().await;
-                match tokio::time::timeout(CDP_TIMEOUT, browser.new_page(&url)).await {
-                    Ok(Ok(p)) => p,
-                    Ok(Err(e)) => {
-                        return err(friendly_cdp_error(s.port, "new tab failed", e));
-                    }
-                    Err(_) => {
-                        return err(format!(
-                            "new tab timed out after {}s — the browser may be wedged (a JS dialog blocks it?); check `lb log`",
-                            CDP_TIMEOUT.as_secs()
-                        ));
-                    }
-                }
+            // Blank first, then one goto in open_navigate: creating the tab at
+            // `url` and then goto-ing it again loaded every page twice, and a
+            // `#fragment` URL hung the second (same-document) goto 3×25s.
+            let new_page = match new_session_page(&s, &me, "about:blank").await {
+                Ok(p) => p,
+                Err(e) => return err(e),
             };
             // Scope the lock: it must be released before open_navigate,
             // which locks again (holding it across the call deadlocks).
@@ -1220,15 +1446,27 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
                 let mut t = s.tabs.lock().await;
                 let id = t.next_id;
                 t.next_id += 1;
-                t.map.insert(
-                    id,
-                    TabState::new(new_page.clone(), url.clone()),
-                );
-                t.active = id;
+                let mut ts = TabState::new(new_page.clone(), url.clone());
+                ts.owner = me.id.clone();
+                t.map.insert(id, ts);
+                match &me.id {
+                    Some(o) => {
+                        t.owner_active.insert(o.clone(), id);
+                        // Follow in the live view unless the human is
+                        // watching another agent's tab.
+                        let watching_agent = t.map.get(&t.active).is_some_and(|x| x.owner.is_some());
+                        if !watching_agent {
+                            t.active = id;
+                        }
+                    }
+                    None => t.active = id,
+                }
                 id
             };
-            s.push_log("open/tab", &format!("tab {id} <- {url}"));
+            let who = me.id.as_deref().unwrap_or("shared");
+            s.push_log("open/tab", &format!("tab {id} [{who}] <- {url}"));
             spawn_dialog_guard(new_page.clone(), s.log.clone(), id);
+            enforce_tab_cap(&s, me.id.as_deref(), id).await;
             return open_navigate(&s, id, new_page, &url).await;
         }
     };
@@ -1245,6 +1483,24 @@ async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json
         with_tab(s, tab_id, |ts| ts.last_url = "about:blank".into()).await;
         return Json(serde_json::json!({ "ok": true, "tab": tab_id,
             "message": format!("tab {tab_id}: blank tab ready") }));
+    }
+    // Same-document (only the #fragment differs): CDP goto never sees a
+    // load event and used to burn 3×25s retries. Hash-navigate via JS.
+    if url.contains('#') {
+        let current = page_url(&page).await;
+        // `https://x.com` and `https://x.com/#a` are the same document.
+        let base = |u: &str| u.split('#').next().unwrap_or("").trim_end_matches('/').to_string();
+        if !current.is_empty() && base(&current) == base(url) {
+            let js = format!("location.href = {}", serde_json::Value::String(url.to_string()));
+            let _ = tokio::time::timeout(TAB_PROBE_TIMEOUT, page.evaluate(js.as_str())).await;
+            with_tab(s, tab_id, |ts| {
+                ts.last_url = url.to_string();
+                ts.last_used = std::time::Instant::now();
+            })
+            .await;
+            return Json(serde_json::json!({ "ok": true, "tab": tab_id,
+                "message": format!("tab {tab_id}: opened {url} (same-document)") }));
+        }
     }
     // The network here can flap (VPN/tailscale), so retry transient failures.
     let mut last_err = String::new();
@@ -1273,6 +1529,8 @@ async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json
             if !landed.starts_with("chrome-error") && !landed.is_empty() {
                 with_tab(s, tab_id, |ts| ts.last_url = landed.clone()).await;
             }
+            // A slow load must not look idle to the reaper / cap.
+            with_tab(s, tab_id, |ts| ts.last_used = std::time::Instant::now()).await;
             // Navigations reset document zoom — re-apply the stored level.
             let zoom = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.zoom).unwrap_or(1.0);
             apply_zoom(&page, zoom).await;
@@ -2975,16 +3233,19 @@ async fn api_tabs(State(s): State<AppState>) -> Json<serde_json::Value> {
     // Adopt page-opened tabs first so the tab strip shows target=_blank links.
     reconcile_tabs(&s).await;
     // Snapshot ids first so we don't hold the lock across CDP calls.
+    let me = current_session().id;
     let (ids, active) = {
         let t = s.tabs.lock().await;
-        (t.map.keys().copied().collect::<Vec<_>>(), t.active)
+        // Agents see their own current tab as "active".
+        let active = me.as_ref().and_then(|o| t.owner_active.get(o).copied()).unwrap_or(t.active);
+        (t.map.keys().copied().collect::<Vec<_>>(), active)
     };
     let mut tabs = vec![];
     for id in ids {
-        let (page, last_url, handover_active, last_action, last_action_at) = {
+        let (page, last_url, handover_active, last_action, last_action_at, owner, idle) = {
             let t = s.tabs.lock().await;
             match t.map.get(&id) {
-                Some(ts) => (ts.page.clone(), ts.last_url.clone(), ts.handover.active, ts.last_action.clone(), ts.last_action_at.clone()),
+                Some(ts) => (ts.page.clone(), ts.last_url.clone(), ts.handover.active, ts.last_action.clone(), ts.last_action_at.clone(), ts.owner.clone(), ts.last_used.elapsed().as_secs()),
                 None => continue,
             }
         };
@@ -3006,10 +3267,14 @@ async fn api_tabs(State(s): State<AppState>) -> Json<serde_json::Value> {
             "stale": stale,
             "last_action": last_action,
             "last_action_at": last_action_at,
+            // Agent session owning the tab (null = shared/human).
+            "owner": owner,
+            "mine": me.is_some() && owner == me,
+            "idle_secs": idle,
         }));
     }
     tabs.sort_by_key(|t| t["id"].as_u64().unwrap_or(0));
-    Json(serde_json::json!({ "ok": true, "tabs": tabs }))
+    Json(serde_json::json!({ "ok": true, "tabs": tabs, "session": me, "max_tabs": s.max_tabs }))
 }
 
 #[derive(Deserialize)]
@@ -3020,46 +3285,74 @@ struct CloseReq {
 }
 async fn api_close(State(s): State<AppState>, Json(b): Json<CloseReq>) -> Json<serde_json::Value> {
     let (tab_id, _page) = tab!(&s, b.tab);
-    // Drop the tab from our map first, then close the target in the
-    // background with a timeout: a wedged renderer must not hang the close
-    // (this used to make a poisoned tab unkillable).
-    let removed = s.tabs.lock().await.map.remove(&tab_id);
-    match removed {
-        Some(ts) => {
-            let url = if ts.last_url.is_empty() { "(unknown url)".to_string() } else { ts.last_url.clone() };
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(10), ts.page.close()).await;
-            });
-            s.push_log("close", &format!("tab {tab_id} ({url})"));
-            // Never leave the daemon tabless: open a fresh New-Tab page.
-            let mut t = s.tabs.lock().await;
-            if t.map.is_empty() {
-                drop(t);
-                let fresh = {
-                    let browser = s.browser.lock().await;
-                    tokio::time::timeout(CDP_TIMEOUT, browser.new_page(DEFAULT_START_URL)).await
-                };
-                match fresh {
-                    Ok(Ok(fresh_page)) => {
-                        let mut t = s.tabs.lock().await;
-                        let id = t.next_id;
-                        t.next_id += 1;
-                        spawn_dialog_guard(fresh_page.clone(), s.log.clone(), id);
-                        t.map.insert(id, TabState::new(fresh_page, DEFAULT_START_URL.into()));
-                        t.active = id;
-                        return ok(&format!("closed tab {tab_id}; opened fresh tab {id}"));
-                    }
-                    Ok(Err(e)) => return err(friendly_cdp_error(s.port, &format!("closed tab {tab_id} but fresh tab failed"), e)),
-                    Err(_) => return err(format!("closed tab {tab_id} but the fresh tab timed out — browser may be dead; restart with `lb web --port {} restart`", s.port)),
-                }
-            }
-            if t.active == tab_id {
-                t.active = *t.map.keys().max().unwrap();
-            }
-            ok(&format!("closed tab {tab_id} ({url})"))
-        }
-        None => err(format!("no such tab: {tab_id}")),
+    match close_tab_id(&s, tab_id).await {
+        Ok(m) => ok(&m),
+        Err(e) => err(e),
     }
+}
+
+/// Close one tab by id (no ownership check — callers resolve that).
+/// Drops it from the map first, then closes the target in the background
+/// with a timeout: a wedged renderer must not hang the close (this used
+/// to make a poisoned tab unkillable). Never leaves the daemon tabless.
+async fn close_tab_id(s: &AppState, tab_id: u32) -> Result<String, String> {
+    let removed = s.tabs.lock().await.map.remove(&tab_id);
+    let Some(ts) = removed else {
+        return Err(format!("no such tab: {tab_id}"));
+    };
+    let url = if ts.last_url.is_empty() { "(unknown url)".to_string() } else { ts.last_url.clone() };
+    let owner = ts.owner.clone();
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(10), ts.page.close()).await;
+    });
+    s.push_log("close", &format!("tab {tab_id} ({url})"));
+    let mut t = s.tabs.lock().await;
+    // The owner's current tab falls back to its most recently used other tab.
+    if let Some(o) = owner {
+        if t.owner_active.get(&o) == Some(&tab_id) {
+            let next = t
+                .map
+                .iter()
+                .filter(|(_, x)| x.owner.as_deref() == Some(o.as_str()))
+                .max_by_key(|(_, x)| x.last_used)
+                .map(|(id, _)| *id);
+            match next {
+                Some(n) => t.owner_active.insert(o, n),
+                None => t.owner_active.remove(&o),
+            };
+        }
+    }
+    if t.map.is_empty() {
+        drop(t);
+        let fresh = {
+            let browser = s.browser.lock().await;
+            tokio::time::timeout(CDP_TIMEOUT, browser.new_page(DEFAULT_START_URL)).await
+        };
+        return match fresh {
+            Ok(Ok(fresh_page)) => {
+                let mut t = s.tabs.lock().await;
+                let id = t.next_id;
+                t.next_id += 1;
+                spawn_dialog_guard(fresh_page.clone(), s.log.clone(), id);
+                t.map.insert(id, TabState::new(fresh_page, DEFAULT_START_URL.into()));
+                t.active = id;
+                Ok(format!("closed tab {tab_id}; opened fresh tab {id}"))
+            }
+            Ok(Err(e)) => Err(friendly_cdp_error(s.port, &format!("closed tab {tab_id} but fresh tab failed"), e)),
+            Err(_) => Err(format!("closed tab {tab_id} but the fresh tab timed out — browser may be dead; restart with `lb web --port {} restart`", s.port)),
+        };
+    }
+    if t.active == tab_id {
+        // Prefer a shared tab for the UI, else the newest.
+        t.active = t
+            .map
+            .iter()
+            .filter(|(_, x)| x.owner.is_none())
+            .map(|(id, _)| *id)
+            .max()
+            .unwrap_or_else(|| *t.map.keys().max().unwrap());
+    }
+    Ok(format!("closed tab {tab_id} ({url})"))
 }
 
 #[derive(Deserialize)]
@@ -3585,6 +3878,9 @@ async fn install_fresh_browser(
         );
         t.active = 1;
         t.next_id = 2;
+        // Old pages (and contexts) died with the old browser.
+        t.owner_active.clear();
+        t.contexts.clear();
     }
     spawn_dialog_guard(page, s.log.clone(), 1);
 }
@@ -4084,7 +4380,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         let _ = browser.execute(params).await;
     }
     let state = AppState {
-        tabs: Arc::new(Mutex::new(Tabs { map: tabs_map, active: 1, next_id: 2 })),
+        tabs: Arc::new(Mutex::new(Tabs::new(tabs_map))),
         browser: Arc::new(Mutex::new(browser)),
         log,
         passcode: passcode.clone(),
@@ -4092,10 +4388,13 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         download_dir,
         launch: Arc::new(Mutex::new(launch)),
         cloak_dl: Arc::new(Mutex::new(crate::cloak::DownloadState::default())),
+        max_tabs: args.max_tabs.max(1),
+        tab_idle: Duration::from_secs(args.tab_idle_secs),
     };
     // Kept for shutdown: closing the browser releases the profile lock so
     // the next `lb web` starts clean (no orphaned Chrome).
     let browser_handle = state.browser.clone();
+    spawn_idle_reaper(state.clone());
 
     // `/api/*` goes behind the passcode gate (when configured); the static
     // UI itself stays public so it can render its own login form.
@@ -4133,12 +4432,14 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .route("/api/log", get(api_log))
         .route("/api/tabs", get(api_tabs))
         .route("/api/close", post(api_close))
+        .route("/api/session/close", post(api_session_close))
         .route("/api/activate", post(api_activate))
         .route("/api/health", get(api_health))
         .route("/api/recover", post(api_recover))
         .route("/api/browsers", get(api_browsers))
         .route("/api/browsers/download", post(api_browsers_download).get(api_browsers_download_progress))
         .route("/api/browsers/use", post(api_browsers_use))
+        .layer(axum::middleware::from_fn(session_scope))
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_passcode))
         // Live tool: nothing is cacheable (stale tabs/snapshots caused real
         // confusion — the UI once needed a manual refresh to show new tabs).

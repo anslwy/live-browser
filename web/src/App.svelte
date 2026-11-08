@@ -592,7 +592,7 @@
     img?.addEventListener('wheel', onShotWheel as EventListener, { passive: false });
   }
 
-  type TabInfo = { id: number; active: boolean; title: string; url: string; handover: boolean; last_action?: string; last_action_at?: string | null };
+  type TabInfo = { id: number; active: boolean; title: string; url: string; handover: boolean; last_action?: string; last_action_at?: string | null; owner?: string | null };
   let tabs: TabInfo[] = [];
 
   // What the human is looking at. Pinned locally — the daemon's `active`
@@ -717,7 +717,7 @@
       const r = await apiFetch('/api/open', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: 'chrome://new-tab-page/' })
+        body: JSON.stringify({ url: 'chrome://new-tab-page/', new_tab: true })
       });
       try {
         const j = await r.json();
@@ -1262,7 +1262,7 @@
           class:active={t.id === viewId}
           class:needs-human={t.handover}
           class:is-recent={isRecent(t) && busy !== 'newtab'}
-          title={`${t.title || t.url || `Tab ${t.id}`}${isRecent(t) ? ` — agent ${t.last_action || 'activity'} just now` : ''}`}
+          title={`${t.title || t.url || `Tab ${t.id}`}${t.owner ? ` — owned by agent session ${t.owner}` : ''}${isRecent(t) ? ` — agent ${t.last_action || 'activity'} just now` : ''}`}
           on:click={() => t.id !== viewId && viewTab(t.id)}
           on:mousedown={(e) => {
             if (e.button === 1) {
@@ -1271,6 +1271,7 @@
             }
           }}>
           {#if isRecent(t) && busy !== 'newtab'}<span class="activitydot" title={`Agent ${t.last_action || 'worked'} here just now`} aria-hidden="true"></span>{/if}
+          {#if t.owner}<span class="tabowner" title={`Agent session ${t.owner}`}>{t.owner}</span>{/if}
           <span class="tabtitle">{t.title || t.url || `Tab ${t.id}`}</span>
           {#if t.handover}<span class="tabflag" title="Needs human">!</span>{/if}
           <span

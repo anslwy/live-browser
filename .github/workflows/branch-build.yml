@@ -1,0 +1,28 @@
+name: branch-build
+
+# Feature branches: lint + test + a downloadable Linux binary, so changes can
+# be exercised on machines without a Rust/C toolchain (e.g. a Steam Deck).
+on:
+  push:
+    branches-ignore: ["master", "main"]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: tests
+        run: cargo test
+      - name: release build
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lb-linux-x86_64
+          path: target/release/lb
+          retention-days: 7

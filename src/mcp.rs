@@ -20,16 +20,22 @@ pub struct LbMcp {
     server: String,
     passcode: Option<String>,
     default_tab: Option<u32>,
+    /// This process's agent-session id (sent as `X-LB-Session`): the
+    /// daemon scopes every call to tabs this session owns.
+    session: String,
+    isolated: bool,
     http: reqwest::Client,
     tool_router: ToolRouter<Self>,
 }
 
 impl LbMcp {
-    pub fn new(server: String, passcode: Option<String>, default_tab: Option<u32>) -> Self {
+    pub fn new(server: String, passcode: Option<String>, default_tab: Option<u32>, session: String, isolated: bool) -> Self {
         Self {
             server,
             passcode,
             default_tab,
+            session,
+            isolated,
             http: reqwest::Client::new(),
             tool_router: Self::tool_router(),
         }
@@ -52,6 +58,8 @@ impl LbMcp {
     }
 
     fn auth(&self, b: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let b = b.header("x-lb-session", &self.session);
+        let b = if self.isolated { b.header("x-lb-isolated", "1") } else { b };
         match &self.passcode {
             Some(p) if !p.is_empty() => b.header("x-lb-passcode", p),
             _ => b,
@@ -147,9 +155,14 @@ pub struct OpenArgs {
     pub url: String,
     #[serde(default)]
     pub tab: Option<u32>,
-    /// Navigate the active tab in place instead of opening a new tab.
+    /// Deprecated, ignored: navigating your current tab is the default.
     #[serde(default)]
+    #[allow(dead_code)]
     pub here: bool,
+    /// Open an additional tab instead of navigating your current one
+    /// (capped per session; the least recently used get closed).
+    #[serde(default)]
+    pub new_tab: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -365,7 +378,7 @@ pub struct UploadArgs {
 
 #[tool_router]
 impl LbMcp {
-    #[tool(description = "Navigate to a URL: opens a new tab by default (plain text searches Google). Pass here=true to reuse the active tab.")]
+    #[tool(description = "Navigate to a URL (plain text searches Google). Reuses this session's own tab (created on first call); pass new_tab=true for an extra tab.")]
     async fn open(
         &self,
         Parameters(a): Parameters<OpenArgs>,
@@ -373,7 +386,7 @@ impl LbMcp {
         let v = self
             .post_json(
                 "/api/open",
-                serde_json::json!({ "url": a.url, "tab": self.tab(a.tab), "here": a.here }),
+                serde_json::json!({ "url": a.url, "tab": self.tab(a.tab), "new_tab": a.new_tab }),
             )
             .await?;
         Ok(Self::daemon_result(v))
@@ -390,7 +403,7 @@ impl LbMcp {
         Ok(Self::daemon_result(v))
     }
 
-    #[tool(description = "List all tabs (id, title, url, active).")]
+    #[tool(description = "List all tabs (id, title, url, owner session, mine). You can only act on tabs where mine=true (or shared ones by explicit id).")]
     async fn list_tabs(
         &self,
         Parameters(_): Parameters<NoArgs>,
@@ -726,7 +739,15 @@ impl LbMcp {
         Ok(Self::daemon_result(v))
     }
 
-    #[tool(description = "Switch the active tab (see list_tabs for ids).")]
+    #[tool(description = "Close one of your tabs (default: your current tab). Same as close.")]
+    async fn close_tab(
+        &self,
+        Parameters(a): Parameters<TabArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.close(Parameters(a)).await
+    }
+
+    #[tool(description = "Switch your current tab (see list_tabs for ids).")]
     async fn activate_tab(
         &self,
         Parameters(a): Parameters<ActivateArgs>,
@@ -899,7 +920,9 @@ impl ServerHandler for LbMcp {
                  Use wait after navigation instead of guessing load timing; \
                  use text/html to read page content; use screenshot when layout/coordinates matter. \
                  For logins/captchas use handover_request, poll handover_status, then snapshot again. \
-                 Use tab_link to get a shareable UI link (/?tabId=N) that opens the UI on a specific tab.",
+                 Use tab_link to get a shareable UI link (/?tabId=N) that opens the UI on a specific tab. \
+                 This session has its own tab(s): open navigates it in place, other agents' tabs are off limits, \
+                 and your tabs are closed when you disconnect.",
             )
     }
 }
@@ -909,9 +932,45 @@ pub async fn run(
     server: String,
     passcode: Option<String>,
     default_tab: Option<u32>,
+    session: String,
+    isolated: bool,
 ) -> anyhow::Result<()> {
-    let svc = LbMcp::new(server, passcode, default_tab);
+    // Unique per process so two clients with the same label never share
+    // (or close) each other's tabs.
+    let label: String = session
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || "-_.:".contains(*c))
+        .take(40)
+        .collect();
+    let label = if label.is_empty() { "mcp".to_string() } else { label };
+    let session_id = format!("{label}-{}", std::process::id());
+    let svc = LbMcp::new(server, passcode, default_tab, session_id, isolated);
+    let closer = svc.clone();
     let running = svc.serve(rmcp::transport::stdio()).await?;
-    running.waiting().await?;
-    Ok(())
+    // End the session however we stop: client disconnect (stdin EOF),
+    // Ctrl-C or SIGTERM — so an agent's tabs never outlive it.
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        r = running.waiting() => { r?; }
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term => {}
+    }
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        closer.post_json("/api/session/close", serde_json::json!({})),
+    )
+    .await;
+    // Exit now: tokio's blocking stdin reader would otherwise keep the
+    // process alive after a signal until stdin closes.
+    std::process::exit(0)
 }

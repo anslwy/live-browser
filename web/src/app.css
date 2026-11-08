@@ -613,3 +613,18 @@ button.seg[aria-pressed="true"] {
   border-radius: 999px;
   transition: width 0.3s;
 }
+
+/* Agent session that owns a tab (multi-agent: each `lb mcp` has its own). */
+.tabpill .tabowner {
+  flex-shrink: 0;
+  max-width: 9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: 6px;
+  background: rgba(99, 102, 241, 0.18);
+  color: #6366f1;
+}

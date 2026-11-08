@@ -109,12 +109,12 @@ fn check_ok(v: &Value, json: bool) -> Result<()> {
     }
 }
 
-pub async fn open(server: &str, passcode: Option<&str>, url: &str, tab: Option<u32>, here: bool, json: bool) -> Result<()> {
+pub async fn open(server: &str, passcode: Option<&str>, url: &str, tab: Option<u32>, new_tab: bool, json: bool) -> Result<()> {
     let v = post(
         server,
         passcode,
         "/api/open",
-        serde_json::json!({ "url": url, "tab": tab, "here": here }),
+        serde_json::json!({ "url": url, "tab": tab, "new_tab": new_tab }),
     )
     .await?;
     check_ok(&v, json)
@@ -702,7 +702,11 @@ pub async fn list(server: &str, passcode: Option<&str>, json: bool) -> Result<()
         };
         let title = t.get("title").and_then(|x| x.as_str()).unwrap_or("(no title)");
         let url = t.get("url").and_then(|x| x.as_str()).unwrap_or("");
-        println!("{mark} tab {id}: {title} <{url}>{ho}");
+        let owner = match t.get("owner").and_then(|x| x.as_str()) {
+            Some(o) => format!(" [agent: {o}]"),
+            None => String::new(),
+        };
+        println!("{mark} tab {id}: {title} <{url}>{owner}{ho}");
     }
     Ok(())
 }
