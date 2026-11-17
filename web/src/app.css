@@ -702,3 +702,29 @@ button.seg[aria-pressed="true"] {
   .card { padding: 10px 11px; }
   img.shot { max-height: calc(100vh - 286px); max-height: calc(100svh - 286px); }
 }
+
+/* User lock: agents blocked while the user drives by hand. */
+.lockbtn.locked {
+  background: #b3261e;
+  border-color: #b3261e;
+  color: #fff;
+}
+.lockpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  background: #b3261e;
+  color: #fff;
+}
+.topbar .lockpill + .livepill {
+  margin-left: 8px;
+}
+.livepill.locked {
+  outline: 2px solid #b3261e;
+}

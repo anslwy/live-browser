@@ -1095,6 +1095,7 @@ dependencies = [
  "sha2",
  "tar",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

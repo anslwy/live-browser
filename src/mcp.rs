@@ -392,7 +392,7 @@ impl LbMcp {
         Ok(Self::daemon_result(v))
     }
 
-    #[tool(description = "Current URL, title and handover state of a tab.")]
+    #[tool(description = "Current URL, title, handover state of a tab, and `locked` (true = the user locked the browser from the web UI; actions fail until they unlock).")]
     async fn status(
         &self,
         Parameters(a): Parameters<TabArgs>,
@@ -922,7 +922,12 @@ impl ServerHandler for LbMcp {
                  For logins/captchas use handover_request, poll handover_status, then snapshot again. \
                  Use tab_link to get a shareable UI link (/?tabId=N) that opens the UI on a specific tab. \
                  This session has its own tab(s): open navigates it in place, other agents' tabs are off limits, \
-                 and your tabs are closed when you disconnect.",
+                 and your tabs are closed when you disconnect. \
+                 USER LOCK: the user can Lock the browser from the web UI while driving it by hand. \
+                 While locked, every action that changes the browser (open, click, type, press, scroll, eval, close, …) \
+                 fails with \"Browser is locked by the user\"; read-only tools (status, snapshot, screenshot, text, html, \
+                 wait, list_tabs, log) still work and status reports locked: true. Do not retry in a loop: \
+                 wait and check status occasionally, or ask the user to unlock. Agents cannot unlock it.",
             )
     }
 }
