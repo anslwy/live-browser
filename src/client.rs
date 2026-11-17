@@ -150,6 +150,9 @@ pub async fn status(server: &str, passcode: Option<&str>, tab: Option<u32>, json
         } else {
             println!("handover: none");
         }
+        if v.get("locked").and_then(|x| x.as_bool()) == Some(true) {
+            println!("locked: YES — the user locked the browser in the web UI; actions fail until they unlock it");
+        }
     }
     Ok(())
 }

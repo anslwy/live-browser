@@ -77,6 +77,38 @@ export PATH="$HOME/.local/bin:$PATH"  # if not already set
 lb web --port 8765
 ```
 
+## User lock (Lock / Unlock button)
+
+The web UI's bottom control row has a **Lock** button (next to Keys / Copy /
+Paste). Default: unlocked. Click it when you want to drive the browser by hand
+without agents interfering:
+
+- **Agents are blocked server-side.** One gate in front of every `/api/*`
+  route refuses every call that could change the browser (open, click, type,
+  press, scroll, eval, close/activate tabs, zoom, upload, recover, claim, …)
+  from MCP, the CLI or raw HTTP with:
+  `Browser is locked by the user, who is controlling it manually. Do not retry in a loop; …`.
+  It is default-deny: every non-GET route is blocked unless it's on a short
+  read-only allowlist, so new routes can't slip past it.
+- **Reads still work**: `status` (reports `locked: true`), `snapshot`,
+  `screenshot`, `text`, `html`, `wait`, `list_tabs`, `log`, `downloads`,
+  plus `handover_request` (which only posts a banner message, so an agent can
+  ask you to unlock). Agents can watch what you do but can't act.
+- **Your own input keeps working**: the UI marks its requests with
+  `X-LB-Client: ui`, so your clicks, keys, paste, tabs and address bar all
+  go through.
+- **Only the UI can unlock** (`POST /api/lock {"locked": false}`). Agent
+  requests, meaning anything sending `X-LB-Session` or lacking the UI header,
+  are refused. There's no MCP tool or CLI command for it.
+- **Every open UI window stays in sync** (the state comes back in `/api/status`,
+  which each window polls every 2s). The button turns red and a
+  `LOCKED · agents blocked` badge shows next to LIVE.
+- **The lock is in memory only**: restarting the daemon starts unlocked.
+
+The lock keeps cooperating agents (and their MCP/CLI tools) from interfering.
+It is not a security boundary: anything that can reach the API can send the
+UI header. Use `LB_PASSCODE` to keep untrusted clients out.
+
 ## MCP (`lb mcp`)
 
 The same actions as JSON-RPC tools on stdio — for opencode, Claude Code, etc.
@@ -185,7 +217,7 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb web --port N link [tab]` | Print a shareable UI link for a tab (`/?tabId=N`, default: active) |
 | `lb update [--force]` | Update to the latest release (reports when already current) |
 | `lb open <URL\|text> [--here]` | New tab with URL (plain text searches Google); `--here` reuses the active tab |
-| `lb status` | URL, title, handover state |
+| `lb status` | URL, title, handover state, user lock |
 | `lb list` | All tabs (stale tabs flagged when a renderer is wedged) |
 | `lb close [tab]` | Close a tab (never hangs, even on wedged pages) |
 | `lb use <tab>` | Switch the active tab |
@@ -278,7 +310,8 @@ natively. Standalone use keeps the native anchor behavior.
 `GET /api/status`, `POST /api/open`, `GET /api/snapshot`, `GET /api/screenshot` (JPEG),
 `GET /api/metrics`, `POST /api/click|click-at|hover|type|type-raw|insert|press|key|eval|nav|scroll|wheel|drag|zoom|select|wait|text|html|upload`,
 `GET /api/downloads`, `GET /api/handover`, `POST /api/handover/request|claim|done`,
-`GET /api/log`. All POSTs take/return JSON with `{ok: …}`.
+`GET /api/log`, `GET|POST /api/lock` (POST only from the web UI; see User lock). All POSTs take/return JSON with `{ok: …}`.
+While the user lock is on, agent POSTs other than `wait|text|html|handover/request` return `{ok:false, locked:true, error:"Browser is locked by the user…"}`.
 
 ## Layout
 

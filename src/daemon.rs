@@ -135,6 +135,14 @@ struct AppState {
     max_tabs: usize,
     /// Close tabs untouched for this long (0 = never).
     tab_idle: Duration,
+    /// User lock (UI "Lock" button): while set, agents can't drive the browser.
+    user_lock: UserLock,
+}
+
+impl axum::extract::FromRef<AppState> for UserLock {
+    fn from_ref(s: &AppState) -> UserLock {
+        s.user_lock.clone()
+    }
 }
 
 /// The knobs that define the running browser. Cloned out of [`DaemonArgs`]
@@ -1163,7 +1171,15 @@ async fn api_status(
 ) -> Json<serde_json::Value> {
     // Adopt page-opened tabs first so the live view follows target=_blank links.
     reconcile_tabs(&s).await;
-    let (tab_id, page) = tab!(&s, q.tab);
+    // Even a session with no tab yet must learn about the user lock.
+    let (tab_id, page) = match tab_page(&s, q.tab).await {
+        Ok(x) => x,
+        Err(e) => {
+            let locked = s.user_lock.is_locked();
+            let error = if locked { format!("locked: true — {LOCKED_MSG} ({e:#})") } else { format!("{e:#}") };
+            return Json(serde_json::json!({ "ok": false, "error": error, "locked": locked }));
+        }
+    };
     // Bounded reads: a wedged renderer must not hang even the status call.
     // Falls back to the last known URL so status stays useful.
     let url = match tokio::time::timeout(TAB_PROBE_TIMEOUT, page.url()).await {
@@ -1185,6 +1201,7 @@ async fn api_status(
         "handover": ts.handover,
         "zoom": ts.zoom,
         "cursor": ts.cursor,
+        "locked": s.user_lock.is_locked(),
     }))
 }
 
@@ -1331,6 +1348,10 @@ fn spawn_idle_reaper(s: AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
+            // The user is driving by hand: never yank a tab away mid-use.
+            if s.user_lock.is_locked() {
+                continue;
+            }
             let victims: Vec<u32> = {
                 let t = s.tabs.lock().await;
                 t.map
@@ -1387,6 +1408,102 @@ async fn api_session_close(State(s): State<AppState>, body: Option<Json<SessionC
     }
     s.push_log("session/close", &format!("[{session}] closed {n} tab(s)"));
     Json(serde_json::json!({ "ok": true, "session": session, "closed": n }))
+}
+
+// ---------------------------------------------------------------------------
+// User lock
+// ---------------------------------------------------------------------------
+
+/// Error every agent-control call gets while the user holds the lock.
+const LOCKED_MSG: &str = "Browser is locked by the user, who is controlling it manually. \
+Do not retry in a loop; wait until the user unlocks it (check `status`, which reports locked: true/false), \
+or ask the user to unlock it (Unlock button in the live-browser web UI).";
+
+/// Header the bundled web UI sends on every API call. Its absence (or an
+/// `X-LB-Session` header, which only agents send) marks an agent request.
+const UI_CLIENT_HEADER: &str = "x-lb-client";
+
+/// The UI's Lock/Unlock state. In memory only: a daemon restart starts
+/// unlocked (the user who locked it is no longer mid-gesture by then, and a
+/// stale persisted lock would silently wedge every agent).
+#[derive(Clone, Default)]
+struct UserLock(Arc<std::sync::atomic::AtomicBool>);
+
+impl UserLock {
+    fn is_locked(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn set(&self, locked: bool) {
+        self.0.store(locked, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// POST routes that never change the page or browser, so agents keep them
+/// while locked. Everything else that isn't a GET is blocked by default —
+/// a newly added route is gated unless someone deliberately lists it here.
+/// - wait/text/html: pure reads (agents can watch the user's progress).
+/// - handover/request: only posts a message to the UI banner, letting an
+///   agent ask the user for something (e.g. to unlock) without retrying.
+const LOCK_EXEMPT_POSTS: &[&str] = &["/api/wait", "/api/text", "/api/html", "/api/handover/request"];
+
+/// Is this request from the user's web UI (as opposed to an agent: MCP,
+/// CLI, raw HTTP)? Agent sessions always carry `X-LB-Session`, which wins.
+fn is_ui_request(h: &axum::http::HeaderMap) -> bool {
+    h.get("x-lb-session").is_none()
+        && h.get(UI_CLIENT_HEADER).and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("ui"))
+}
+
+/// Would this request be refused under the lock? Pure, for the middleware
+/// and tests. `/api/lock` itself is UI-only regardless of lock state.
+fn lock_blocks(method: &axum::http::Method, path: &str, ui: bool, locked: bool) -> bool {
+    if ui {
+        return false;
+    }
+    if path == "/api/lock" {
+        return method != axum::http::Method::GET;
+    }
+    if !locked || !path.starts_with("/api/") {
+        return false;
+    }
+    let read = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
+    !read && !LOCK_EXEMPT_POSTS.contains(&path)
+}
+
+/// The one central gate: every `/api/*` route passes through here, so no
+/// agent path (MCP tool, CLI command, raw HTTP) can drive the browser — or
+/// unlock it — while the user holds the lock.
+async fn user_lock_gate(
+    State(lock): State<UserLock>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let ui = is_ui_request(req.headers());
+    let locked = lock.is_locked();
+    if !lock_blocks(req.method(), req.uri().path(), ui, locked) {
+        return next.run(req).await;
+    }
+    let msg = if req.uri().path() == "/api/lock" {
+        "Only the user can lock or unlock the browser, from the live-browser web UI. Agents cannot change the lock."
+    } else {
+        LOCKED_MSG
+    };
+    // 200 + `ok:false`, the API's usual error shape: MCP and CLI clients
+    // surface `error` verbatim as a tool error.
+    Json(serde_json::json!({ "ok": false, "locked": locked, "error": msg })).into_response()
+}
+
+#[derive(Deserialize)]
+struct LockReq {
+    locked: bool,
+}
+/// `GET /api/lock` → state; `POST /api/lock {"locked": bool}` → set it
+/// (the gate admits only the web UI here).
+async fn api_lock(State(lock): State<UserLock>, body: Option<Json<LockReq>>) -> Json<serde_json::Value> {
+    if let Some(Json(b)) = body {
+        lock.set(b.locked);
+        tracing::info!("user lock {}", if b.locked { "ON" } else { "off" });
+    }
+    Json(serde_json::json!({ "ok": true, "locked": lock.is_locked() }))
 }
 
 /// Read `X-LB-Session` / `X-LB-Isolated` and run the request inside that
@@ -4390,6 +4507,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         cloak_dl: Arc::new(Mutex::new(crate::cloak::DownloadState::default())),
         max_tabs: args.max_tabs.max(1),
         tab_idle: Duration::from_secs(args.tab_idle_secs),
+        user_lock: UserLock::default(),
     };
     // Kept for shutdown: closing the browser releases the profile lock so
     // the next `lb web` starts clean (no orphaned Chrome).
@@ -4439,6 +4557,9 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .route("/api/browsers", get(api_browsers))
         .route("/api/browsers/download", post(api_browsers_download).get(api_browsers_download_progress))
         .route("/api/browsers/use", post(api_browsers_use))
+        .route("/api/lock", get(api_lock).post(api_lock))
+        // The one lock gate for every /api route (see `user_lock_gate`).
+        .layer(axum::middleware::from_fn_with_state(state.user_lock.clone(), user_lock_gate))
         .layer(axum::middleware::from_fn(session_scope))
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_passcode))
         // Live tool: nothing is cacheable (stale tabs/snapshots caused real
@@ -4793,5 +4914,117 @@ mod tests {
         let ipcfg = "   IPv4 Address. . . . . . . . . . . : 100.120.7.9(Preferred)";
         assert_eq!(scrape_tailscale_ips(ipcfg), vec!["100.120.7.9".to_string()]);
         assert!(scrape_tailscale_ips("inet 192.168.1.5/24").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod user_lock_tests {
+    use super::*;
+    use axum::http::{Method, Request};
+
+    /// The real gate + real `/api/lock` handler, with stub handlers standing
+    /// in for browser-driving routes (those need a live Chrome).
+    fn app(lock: UserLock) -> Router {
+        let stub = || async { Json(serde_json::json!({ "ok": true })) };
+        Router::new()
+            .route("/api/click", post(stub))
+            .route("/api/open", post(stub))
+            .route("/api/brand-new-tool", post(stub))
+            .route("/api/snapshot", get(stub))
+            .route("/api/screenshot", get(stub))
+            .route("/api/text", post(stub))
+            .route("/api/lock", get(api_lock).post(api_lock))
+            .layer(axum::middleware::from_fn_with_state(lock.clone(), user_lock_gate))
+            .with_state(lock)
+    }
+
+    async fn call(app: &Router, method: Method, path: &str, who: &str, body: &str) -> serde_json::Value {
+        use tower::ServiceExt;
+        let mut b = Request::builder().method(method).uri(path);
+        if !body.is_empty() {
+            b = b.header("content-type", "application/json");
+        }
+        match who {
+            "ui" => b = b.header("x-lb-client", "ui"),
+            "mcp" => b = b.header("x-lb-session", "agent-1"),
+            "forged" => b = b.header("x-lb-client", "ui").header("x-lb-session", "agent-1"),
+            _ => {} // CLI / raw HTTP
+        }
+        let res = app.clone().oneshot(b.body(axum::body::Body::from(body.to_string())).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn is_locked_err(v: &serde_json::Value) -> bool {
+        v["ok"] == false && v["error"].as_str().unwrap_or("").starts_with("Browser is locked by the user")
+    }
+
+    #[tokio::test]
+    async fn locked_browser_rejects_agent_control() {
+        let lock = UserLock::default();
+        let app = app(lock.clone());
+        assert_eq!(call(&app, Method::POST, "/api/lock", "ui", r#"{"locked":true}"#).await["locked"], true);
+        for who in ["mcp", "cli", "forged"] {
+            for path in ["/api/click", "/api/open", "/api/brand-new-tool"] {
+                let v = call(&app, Method::POST, path, who, "{}").await;
+                assert!(is_locked_err(&v), "{who} {path}: {v}");
+                assert_eq!(v["locked"], true);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_allowed_while_locked() {
+        let lock = UserLock::default();
+        lock.set(true);
+        let app = app(lock);
+        for (m, p) in [(Method::GET, "/api/snapshot"), (Method::GET, "/api/screenshot"), (Method::POST, "/api/text")] {
+            assert_eq!(call(&app, m, p, "mcp", "{}").await["ok"], true, "{p}");
+        }
+        assert_eq!(call(&app, Method::GET, "/api/lock", "mcp", "").await["locked"], true);
+    }
+
+    #[tokio::test]
+    async fn ui_keeps_control_while_locked() {
+        let lock = UserLock::default();
+        lock.set(true);
+        let app = app(lock);
+        assert_eq!(call(&app, Method::POST, "/api/click", "ui", "{}").await["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn unlock_restores_agent_control() {
+        let lock = UserLock::default();
+        lock.set(true);
+        let app = app(lock.clone());
+        assert!(is_locked_err(&call(&app, Method::POST, "/api/click", "mcp", "{}").await));
+        assert_eq!(call(&app, Method::POST, "/api/lock", "ui", r#"{"locked":false}"#).await["locked"], false);
+        assert_eq!(call(&app, Method::POST, "/api/click", "mcp", "{}").await["ok"], true);
+        assert_eq!(call(&app, Method::POST, "/api/click", "cli", "{}").await["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn agents_cannot_unlock_or_lock() {
+        let lock = UserLock::default();
+        lock.set(true);
+        let app = app(lock.clone());
+        for who in ["mcp", "cli", "forged"] {
+            let v = call(&app, Method::POST, "/api/lock", who, r#"{"locked":false}"#).await;
+            assert_eq!(v["ok"], false, "{who}");
+            assert!(lock.is_locked());
+        }
+        lock.set(false);
+        let v = call(&app, Method::POST, "/api/lock", "mcp", r#"{"locked":true}"#).await;
+        assert_eq!(v["ok"], false);
+        assert!(!lock.is_locked());
+    }
+
+    #[test]
+    fn default_unlocked_and_gate_is_default_deny() {
+        assert!(!UserLock::default().is_locked());
+        assert!(lock_blocks(&Method::POST, "/api/anything-new", false, true));
+        assert!(lock_blocks(&Method::DELETE, "/api/tabs", false, true));
+        assert!(!lock_blocks(&Method::POST, "/api/anything-new", false, false));
+        assert!(!lock_blocks(&Method::GET, "/api/status", false, true));
     }
 }

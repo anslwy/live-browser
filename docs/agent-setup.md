@@ -117,3 +117,7 @@ Reply with:
 Tell the user to open the web UI URL in their browser to watch the live
 page, take over for logins/captchas (`lb handover` / handover banner), and
 drive the browser either from the UI or via the `live-browser` MCP tools.
+Also mention the **Lock** button in the UI: while it's on, the user is
+driving by hand and every agent action fails with "Browser is locked by the
+user…". Agents should stop, check `status` (`locked: true`) only now and then,
+and ask the user to unlock. They can't unlock it themselves.

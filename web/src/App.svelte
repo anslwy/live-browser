@@ -4,7 +4,7 @@
 
   type Handover = { active: boolean; message: string; claimed?: boolean; requested_at?: string };
   type Cursor = { x: number; y: number; kind: string; by?: string; at: number };
-  type Status = { ok: boolean; url: string; title: string; handover: Handover; zoom?: number; cursor?: Cursor };
+  type Status = { ok: boolean; url: string; title: string; handover: Handover; zoom?: number; cursor?: Cursor; locked?: boolean };
   type SnapOpt = { value: string; text: string; selected: boolean };
   type SnapEl = { ref: number; tag: string; type: string; name: string; href: string; placeholder: string; value: string; options?: SnapOpt[] };
   type LogEntry = { at: string; action: string; detail: string };
@@ -85,7 +85,11 @@
   let authErr = '';
 
   function authHeaders(): Record<string, string> {
-    return passcode ? { 'x-lb-passcode': passcode } : {};
+    // `x-lb-client: ui` marks the user's own clicks/keys: the server's user
+    // lock blocks agents but never this UI.
+    const h: Record<string, string> = { 'x-lb-client': 'ui' };
+    if (passcode) h['x-lb-passcode'] = passcode;
+    return h;
   }
 
   function screenshotFetchUrl(): string {
@@ -743,6 +747,28 @@
 
   let timer: ReturnType<typeof setInterval>;
 
+  // User lock: blocks agents server-side while you drive by hand. State
+  // lives on the server (status.locked), so every open UI window follows it
+  // on its next 2s status poll.
+  $: locked = status?.locked === true;
+  let lockBusy = false;
+  async function toggleLock() {
+    lockBusy = true;
+    try {
+      const r = await apiFetch('/api/lock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ locked: !locked }),
+      });
+      const j = await r.json();
+      if (j.ok && status) status = { ...status, locked: j.locked };
+      else if (!j.ok) error = j.error ?? 'lock failed';
+    } catch {
+    } finally {
+      lockBusy = false;
+    }
+  }
+
   async function fetchStatus(retry = true) {
     try {
       const r = await apiFetch(viewId != null ? `/api/status?tab=${viewId}` : '/api/status');
@@ -1242,9 +1268,12 @@
     </span>
     <span class="sub">Live Browser</span>
     {#if passcode && !needAuth}
-      <button class="ghost mini" on:click={clearPasscode} title="Forget the saved passcode in this browser">Lock</button>
+      <button class="ghost mini" on:click={clearPasscode} title="Forget the saved passcode in this browser">Sign out</button>
     {/if}
-    <span class="livepill" title="Streaming screenshots"><span class="livedot"></span>LIVE</span>
+    {#if locked}
+      <span class="lockpill" title="You locked the browser: agents are blocked until you click Unlock"><Icon name="lock" /> LOCKED · agents blocked</span>
+    {/if}
+    <span class="livepill" class:locked title="Streaming screenshots"><span class="livedot"></span>LIVE</span>
   </header>
 
   {#if needAuth}
@@ -1521,6 +1550,16 @@
           </span>
       <button class:ghost={!keysOn} on:click={() => (keysOn = !keysOn)} title={keysOn ? 'Keyboard capture is ON — your keystrokes go to the page. Click to turn off.' : 'Turn on keyboard capture to type into the page.'}>
         <Icon name="keyboard" /> {keysOn ? 'Keys: ON' : 'Keys: off'}
+      </button>
+      <button
+        class="lockbtn"
+        class:ghost={!locked}
+        class:locked
+        on:click={toggleLock}
+        disabled={lockBusy || !connected}
+        aria-pressed={locked}
+        title={locked ? 'Locked: agents cannot control the browser. Click to unlock and let agents act again.' : 'Lock the browser so agents cannot control it while you drive it by hand.'}>
+        <Icon name={locked ? 'lock' : 'unlock'} /> {locked ? 'Locked — Unlock' : 'Lock'}
       </button>
       <button class="ghost" on:click={doCopy} disabled={clipBusy === 'copy'} title="Copy selected text from the page to your clipboard">
         <Icon name="copy" /> {clipBusy === 'copy' ? 'Copying…' : 'Copy'}
