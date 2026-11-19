@@ -922,7 +922,8 @@ impl ServerHandler for LbMcp {
                  For logins/captchas use handover_request, poll handover_status, then snapshot again. \
                  Use tab_link to get a shareable UI link (/?tabId=N) that opens the UI on a specific tab. \
                  This session has its own tab(s): open navigates it in place, other agents' tabs are off limits, \
-                 and your tabs are closed when you disconnect. \
+                 and when you disconnect your tabs stay open as shared tabs (e.g. for a login the user finishes later), \
+                 so a later session can find them with list_tabs and keep using them. \
                  USER LOCK: the user can Lock the browser from the web UI while driving it by hand. \
                  While locked, every action that changes the browser (open, click, type, press, scroll, eval, close, …) \
                  fails with \"Browser is locked by the user\"; read-only tools (status, snapshot, screenshot, text, html, \

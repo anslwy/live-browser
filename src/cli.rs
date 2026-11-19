@@ -308,8 +308,9 @@ pub enum Commands {
     /// Start an MCP server on stdio (for opencode / Claude Code / etc.).
     /// Reads LB_SERVER / LB_PASSCODE like every other command.
     /// Each `lb mcp` process is its own agent session: it gets its own
-    /// tab(s), never touches other sessions' tabs, and closes its tabs
-    /// when the client disconnects.
+    /// tab(s) and never touches other sessions' tabs. When the client
+    /// disconnects its tabs become shared (kept open) unless the daemon
+    /// runs with --close-on-disconnect or the session is --isolated.
     Mcp {
         /// Session label shown in the live view (unique id = label-pid)
         #[arg(long, env = "LB_SESSION", default_value = "mcp")]
@@ -423,6 +424,12 @@ pub struct DaemonArgs {
     /// Close tabs untouched for this many seconds (0 = never)
     #[arg(long, env = "LB_TAB_IDLE_SECS", default_value_t = 1800)]
     pub tab_idle_secs: u64,
+    /// Close an agent's tabs when its MCP client disconnects. Off by
+    /// default: the tabs are handed to the shared bucket instead (still
+    /// reaped by --tab-idle-secs), so a login the user finishes after the
+    /// agent stopped survives into the next session.
+    #[arg(long, env = "LB_CLOSE_ON_DISCONNECT", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::SetTrue)]
+    pub close_on_disconnect: bool,
 }
 
 impl DaemonArgs {

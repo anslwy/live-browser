@@ -135,6 +135,8 @@ struct AppState {
     max_tabs: usize,
     /// Close tabs untouched for this long (0 = never).
     tab_idle: Duration,
+    /// Close a session's tabs when it ends instead of sharing them.
+    close_on_disconnect: bool,
     /// User lock (UI "Lock" button): while set, agents can't drive the browser.
     user_lock: UserLock,
 }
@@ -745,7 +747,9 @@ async fn tab_page(s: &AppState, tab: Option<u32>) -> anyhow::Result<(u32, Page)>
     }
     ts.last_used = std::time::Instant::now();
     let page = ts.page.clone();
-    let owned = me.is_some() && ts.owner == me;
+    // Picking a shared tab by id (e.g. one a previous session left open for
+    // a login) makes it this session's current tab too.
+    let owned = me.is_some() && (ts.owner == me || (tab.is_some() && ts.owner.is_none()));
     if owned {
         t.owner_active.insert(me.unwrap(), id);
     }
@@ -1379,8 +1383,12 @@ struct SessionCloseReq {
     #[serde(default)]
     session: Option<String>,
 }
-/// End an agent session: close every tab it owns and drop its private
-/// context. `lb mcp` calls this when its client disconnects.
+/// End an agent session (`lb mcp` calls this when its client disconnects).
+/// Its tabs are handed to the shared bucket, kept open: an agent often
+/// stops to let the user sign in, and closing the tab would throw the login
+/// away. The idle reaper still reclaims them. Tabs in an isolated context
+/// (the context dies with the session) or with `--close-on-disconnect`
+/// are closed instead.
 async fn api_session_close(State(s): State<AppState>, body: Option<Json<SessionCloseReq>>) -> Json<serde_json::Value> {
     let me = current_session().id;
     let Some(session) = body.and_then(|b| b.0.session).or(me.clone()) else {
@@ -1389,12 +1397,17 @@ async fn api_session_close(State(s): State<AppState>, body: Option<Json<SessionC
     if me.is_some() && me.as_deref() != Some(session.as_str()) {
         return err(format!("can't end another agent session ({session})"));
     }
-    let ids: Vec<u32> = {
+    let isolated = s.tabs.lock().await.contexts.contains_key(&session);
+    let (closing, kept) = if isolated || s.close_on_disconnect {
         let t = s.tabs.lock().await;
-        t.map.iter().filter(|(_, ts)| ts.owner.as_deref() == Some(session.as_str())).map(|(id, _)| *id).collect()
+        let ids: Vec<u32> = t.map.iter().filter(|(_, ts)| ts.owner.as_deref() == Some(session.as_str())).map(|(id, _)| *id).collect();
+        (ids, 0)
+    } else {
+        let mut t = s.tabs.lock().await;
+        (Vec::new(), release_session_tabs(&mut t, &session))
     };
-    let n = ids.len();
-    for id in ids {
+    let n = closing.len();
+    for id in closing {
         let _ = close_tab_id(&s, id).await;
     }
     let ctx = {
@@ -1406,8 +1419,22 @@ async fn api_session_close(State(s): State<AppState>, body: Option<Json<SessionC
         let browser = s.browser.lock().await;
         let _ = tokio::time::timeout(Duration::from_secs(5), browser.dispose_browser_context(c)).await;
     }
-    s.push_log("session/close", &format!("[{session}] closed {n} tab(s)"));
-    Json(serde_json::json!({ "ok": true, "session": session, "closed": n }))
+    s.push_log("session/close", &format!("[{session}] closed {n} tab(s), kept {kept} as shared"));
+    Json(serde_json::json!({ "ok": true, "session": session, "closed": n, "kept": kept }))
+}
+
+/// Hand every tab `session` owns to the shared bucket, restarting their
+/// idle clocks so the reaper gives the user the full idle window.
+fn release_session_tabs(t: &mut Tabs, session: &str) -> usize {
+    let mut n = 0;
+    for ts in t.map.values_mut() {
+        if ts.owner.as_deref() == Some(session) {
+            ts.owner = None;
+            ts.last_used = std::time::Instant::now();
+            n += 1;
+        }
+    }
+    n
 }
 
 // ---------------------------------------------------------------------------
@@ -4507,6 +4534,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         cloak_dl: Arc::new(Mutex::new(crate::cloak::DownloadState::default())),
         max_tabs: args.max_tabs.max(1),
         tab_idle: Duration::from_secs(args.tab_idle_secs),
+        close_on_disconnect: args.close_on_disconnect,
         user_lock: UserLock::default(),
     };
     // Kept for shutdown: closing the browser releases the profile lock so
