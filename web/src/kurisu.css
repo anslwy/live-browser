@@ -1,0 +1,730 @@
+/* Kurisu theme. Values mirror `ku web` (crates/kurisu/web/src/app.css): burgundy
+   accent and ivory surfaces in light, warm burgundy-black in dark. lb's own
+   variable names are kept so every component picks the tokens up unchanged;
+   ?accent=/?accentfg= embeds still override --accent/--accent-fg/--live below. */
+:root, :root[data-theme='dark'] {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --bg: #1c1516;
+  --fg: #f4ebe5;
+  --card: #261d1e;
+  --border: #493638;
+  --input-bg: #261d1e;
+  --input-border: #493638;
+  --link: #f1b9b3;
+  --accent: #edaaa9;
+  --accent-fg: #2d090d;
+  /* live/on indicators (LIVE dot, recent-tab underline, click ripple):
+     Kurisu's ok-green, overridable via ?accent= for embeds */
+  --live: #77d29d;
+  --ghost-bg: #342426;
+  --ghost-fg: inherit;
+  --danger: #ff9b91;
+  --banner-warn-bg: #38272a;
+  --banner-warn-border: #965c25;
+  --banner-ok-bg: #1f2f27;
+  --banner-ok-border: #327b6a;
+  --marker: #bfa9a3;
+  /* Kurisu's --muted; .muted uses opacity, so this is for borders only. */
+  --muted: #bfa9a3;
+  --shot-bg: #000;
+}
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #fffaf6;
+  --fg: #21191a;
+  --card: #f6eeea;
+  --border: #dfd1cb;
+  --input-bg: #fffaf6;
+  --input-border: #dfd1cb;
+  --link: #831d25;
+  --accent: #6b1116;
+  --accent-fg: #fffaf6;
+  /* live/on indicators (LIVE dot, recent-tab underline, click ripple):
+     Kurisu's ok-green, overridable via ?accent= for embeds */
+  --live: #207344;
+  --ghost-bg: #f1e5df;
+  --ghost-fg: #21191a;
+  --danger: #b3261e;
+  --banner-warn-bg: #fff0df;
+  --banner-warn-border: #8b5900;
+  --banner-ok-bg: #e4f3ea;
+  --banner-ok-border: #207344;
+  --marker: #756360;
+  --muted: #756360;
+  --shot-bg: #000;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14.5px/1.46 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+a { color: var(--link); }
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+}
+.wrap {
+  margin: 0 auto;
+  padding: 16px;
+}
+/* Narrow column shared by every section, live view included. */
+.constrain {
+  max-width: 1100px;
+  margin-left: auto;
+  margin-right: auto;
+}
+/* Kurisu top bar: the mark + name, then a quiet "Live Browser" label.
+   Compact on purpose — on a phone it must not push the live view down. */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 8px;
+}
+.topbar .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  text-decoration: none;
+  color: var(--fg);
+  flex: none;
+}
+.topbar .mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  flex: none;
+}
+.topbar h1 {
+  font-size: 17px;
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--accent);
+}
+:root[data-theme='light'] .topbar h1 { color: #6b1116; }
+.topbar .sub {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fg);
+  opacity: 0.55;
+  border-left: 1px solid var(--border);
+  padding-left: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.topbar .livepill {
+  flex: none;
+  margin-left: auto;
+}
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--live);
+  display: inline-block;
+}
+.dot.off { background: var(--danger); }
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+/* Fused address-bar + live-view surface: no gap, no double border. */
+.card.flush-bottom {
+  margin-bottom: 0;
+  border-bottom: 0;
+  border-radius: 10px 10px 0 0;
+}
+.card.flush-top {
+  margin-top: 0;
+  border-top: 0;
+  border-radius: 0 0 10px 10px;
+}
+.banner {
+  background: var(--banner-warn-bg);
+  border: 1px solid var(--banner-warn-border);
+  border-radius: 10px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+.banner.done { background: var(--banner-ok-bg); border-color: var(--banner-ok-border); }
+/* Slim one-line variant: no paragraph, tighter padding. */
+.banner.slim { padding: 8px 14px; }
+/* Banner head row: label truncates instead of pushing the button out. */
+.banner-head { flex-wrap: nowrap; }
+.banner-head .url-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.banner-head button { flex: none; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+input[type="text"],
+input[type="password"] {
+  flex: 1;
+  min-width: 260px;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: inherit;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+input[type="text"]:focus,
+input[type="password"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+/* Kurisu's .btn: solid burgundy (or soft rose in dark), 6px corners, semibold. */
+button {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 6px 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+/* Kurisu's .btn.ghost: line-coloured outline, page background, light weight. */
+button.ghost {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  font-weight: 500;
+}
+button.ghost:hover:not(:disabled) { background: var(--ghost-bg); }
+/* Square icon-only buttons (nav arrows): icon sized to match text buttons. */
+button.iconbtn {
+  padding: 7px 12px;
+  line-height: 1;
+}
+button.iconbtn .icon {
+  width: 1.1em;
+  height: 1.1em;
+  vertical-align: -0.2em;
+}
+/* Chrome-style browser bar: borderless icon buttons + pill omnibox. */
+.browserbar { gap: 2px; }
+.browserbar .iconplain {
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  padding: 8px;
+  line-height: 1;
+  color: inherit;
+  opacity: 0.85;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+.browserbar .iconplain:hover:not(:disabled) { background: var(--ghost-bg); opacity: 1; }
+.browserbar .iconplain:disabled { opacity: 0.4; }
+.browserbar .iconplain.is-disabled { opacity: 0.35; cursor: default; }
+.browserbar .iconplain .icon {
+  width: 1.25em;
+  height: 1.25em;
+  vertical-align: -0.25em;
+}
+.browserbar .omniboxwrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  min-width: 0;
+  margin-left: 6px;
+}
+/* Kurisu input: 6px corners, line-coloured border, accent on focus. */
+.browserbar input.omnibox {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  color: inherit;
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+/* Address-bar history autocomplete dropdown. */
+.histdrop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+  max-height: 280px;
+  overflow-y: auto;
+  z-index: 60;
+  text-align: left;
+}
+.histdrop li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+}
+.histdrop li:hover,
+.histdrop li.active {
+  background: var(--ghost-bg);
+}
+.histdrop .histitem {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  padding: 7px 8px;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.histdrop .histurl {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13px;
+}
+/* Delete button pinned to the far right of each history row. */
+.histdrop .histdel {
+  flex: none;
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  width: 26px;
+  height: 26px;
+  line-height: 1;
+  padding: 0;
+  color: inherit;
+  opacity: 0.55;
+  font-size: 16px;
+  cursor: pointer;
+}
+.histdrop .histdel:hover {
+  background: var(--input-border);
+  opacity: 1;
+}
+.browserbar input.omnibox:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+/* Kurisu's .btn.danger: outline only, error colour. */
+button.danger {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  font-weight: 500;
+}
+button:disabled { opacity: 0.5; cursor: default; }
+/* Manual paste/copy dialog textareas (clipboard-API fallback). */
+.card textarea {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: inherit;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: inherit;
+  resize: vertical;
+}
+img.shot {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  /* Keep the whole live view + its toolbar inside the initial viewport so no
+     vertical scrolling is needed to drive the page. JS mapping accounts for
+     the resulting letterbox (see imgToPage). */
+  max-height: calc(100vh - 290px);
+  max-height: calc(100svh - 290px);
+  object-fit: contain;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--shot-bg);
+  min-height: 280px;
+}
+img.shot.clickable { cursor: crosshair; }
+img.shot.actionable {
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+  display: block;
+}
+/* Fake cursor overlay: positioned like imgToPage in reverse. */
+.shotwrap { position: relative; }
+.shotwrap img.shot { transition: opacity 0.25s ease; }
+.shotwrap.dim img.shot { opacity: 0.5; }
+.cursorlayer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  border-radius: 8px;
+}
+.fakecursor {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  transform: translate(-3px, -3px);
+}
+.fakecursor svg { display: block; filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6)); }
+.ripple {
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--live);
+  animation: rippleout 0.9s ease-out forwards;
+}
+.ripple.drag { border-color: var(--banner-warn-border); }
+@keyframes rippleout {
+  from { transform: scale(0.6); opacity: 0.95; }
+  to { transform: scale(3.2); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ripple { animation: none; opacity: 0; }
+}
+button.mini {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 500;
+  margin-right: 4px;
+}
+button.mini:not(.ghost) { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+select.rowsel {
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: inherit;
+  border-radius: 6px;
+  padding: 2px 4px;
+  font-size: 12px;
+  max-width: 130px;
+}
+.mono { font-family: ui-monospace, monospace; font-size: 13px; }
+/* Segmented zoom control: equal-height buttons, shared border. */
+.zoomgroup {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--input-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.zoomgroup button {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--fg);
+}
+.zoomgroup button:hover:not(:disabled) { background: var(--ghost-bg); }
+.zoomgroup button + button { border-left: 1px solid var(--input-border); }
+.zoomgroup .zoompct {
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  min-width: 4em;
+  text-align: center;
+}
+/* LIVE indicator. */
+.livepill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--fg);
+  opacity: 0.75;
+}
+.livedot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--live);
+  animation: livepulse 2s ease-in-out infinite;
+}
+@keyframes livepulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .livedot { animation: none; }
+}
+/* Current-page line under the URL bar: never grows — long titles/URLs clip. */
+.page-meta { margin: 8px 0 0; }
+.page-meta .title,
+.page-meta a.url {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.muted { opacity: 0.7; }
+ul.log { list-style: none; padding: 0; margin: 0; }
+ul.log li { padding: 4px 0; border-bottom: 1px solid var(--border); }
+details.collapsible summary {
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  list-style: none;
+}
+details.collapsible summary::-webkit-details-marker { display: none; }
+details.collapsible summary::before {
+  content: '▸';
+  color: var(--marker);
+  font-size: 12px;
+}
+details.collapsible[open] summary::before { content: '▾'; }
+details.collapsible summary:hover strong { text-decoration: underline; }
+table.snap { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.snap td, table.snap th { border-bottom: 1px solid var(--border); padding: 4px 6px; text-align: left; }
+
+/* Chrome-style tab strip. */
+.tabstrip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 6px 0 0;
+  margin-bottom: 10px;
+  scrollbar-width: thin;
+}
+.tabstrip.constrain {
+  margin-left: auto;
+  margin-right: auto;
+}
+.tabpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 190px;
+  min-width: 0;
+  padding: 7px 8px 7px 12px;
+  background: transparent;
+  color: var(--fg);
+  opacity: 0.72;
+  border: 0;
+  border-radius: 8px 8px 0 0;
+  font-size: 13px;
+  cursor: pointer;
+  flex: none;
+}
+.tabpill:hover { background: var(--ghost-bg); opacity: 1; }
+.tabpill.active {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-bottom-color: transparent;
+  opacity: 1;
+}
+.tabpill .tabtitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tabpill .tabclose {
+  display: inline-block;
+  border-radius: 50%;
+  width: 20px;
+  height: 20px;
+  line-height: 18px;
+  text-align: center;
+  font-size: 14px;
+  flex: none;
+}
+.tabpill .tabclose:hover { background: var(--input-border); }
+.tabpill.needs-human { box-shadow: inset 0 -2px 0 var(--banner-warn-border); }
+/* Background activity pulse: agent did something here just now.
+   Animation only — the live view stays pinned to the viewed tab. */
+.tabpill .activitydot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--live);
+  flex: none;
+  animation: tabpulse 1.2s ease-in-out infinite;
+}
+.tabpill.is-recent { box-shadow: inset 0 -2px 0 var(--live); }
+.tabpill.is-recent.needs-human { box-shadow: inset 0 -2px 0 var(--live), inset 0 -4px 0 var(--banner-warn-border); }
+@keyframes tabpulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.8); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tabpill .activitydot { animation: none; }
+}
+.tabpill .tabflag {
+  background: var(--banner-warn-border);
+  color: var(--bg);
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 50%;
+  width: 16px;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  flex: none;
+}
+.tabnew {
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  padding: 8px;
+  line-height: 1;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
+  flex: none;
+  align-self: center;
+}
+.tabnew:hover:not(:disabled) { background: var(--ghost-bg); opacity: 1; }
+.tabnew:disabled { opacity: 0.4; }
+.tabnew .icon {
+  width: 1.25em;
+  height: 1.25em;
+  vertical-align: -0.25em;
+}
+/* Settings popup (gear button in the browser bar). */
+.browserbar { position: relative; }
+.settingspop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(420px, calc(100vw - 64px));
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+  padding: 12px 14px;
+  z-index: 50;
+  text-align: left;
+}
+.setsect + .setsect {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.sethead {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.setcurrent {
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}
+.browrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 0;
+}
+.browrow + .browrow {
+  border-top: 1px solid var(--border);
+}
+.browrow .muted {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+button.seg[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+.setnote {
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+.dlwrap {
+  flex: 1;
+  min-width: 140px;
+}
+.dlbar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--ghost-bg);
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+.dlfill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.3s;
+}
+
+/* Agent session that owns a tab (multi-agent: each `lb mcp` has its own). */
+.tabpill .tabowner {
+  flex-shrink: 0;
+  max-width: 9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--link);
+}
+
+/* Phones (where /browser is mostly opened): keep the top bar to one slim row. */
+@media (max-width: 430px) {
+  .wrap { padding: 10px 12px 16px; }
+  .topbar { padding: 6px 0 8px; gap: 6px; }
+  .topbar h1 { font-size: 16px; }
+  .topbar .sub {
+    border-left: 0;
+    padding-left: 0;
+    font-size: 12px;
+  }
+  .card { padding: 10px 11px; }
+  img.shot { max-height: calc(100vh - 286px); max-height: calc(100svh - 286px); }
+}
+
+/* User lock: agents blocked while the user drives by hand. */
+.lockbtn.locked {
+  background: #b3261e;
+  border-color: #b3261e;
+  color: #fff;
+}
+.lockpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  background: #b3261e;
+  color: #fff;
+}
+.topbar .lockpill + .livepill {
+  margin-left: 8px;
+}
+.livepill.locked {
+  outline: 2px solid #b3261e;
+}

@@ -966,10 +966,12 @@
       ? 'light'
       : 'dark';
 
+  const kurisu = document.documentElement.dataset.skin === 'kurisu';
+
   function setTheme(t: 'dark' | 'light') {
     theme = t;
     document.documentElement.dataset.theme = t;
-    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', t === 'light' ? '#fffaf6' : '#240c0e');
+    if (kurisu) document.querySelector('meta[name="theme-color"]')?.setAttribute('content', t === 'light' ? '#fffaf6' : '#240c0e');
     try {
       localStorage.setItem('lb-theme', t);
     } catch {}
@@ -1255,6 +1257,7 @@
 </script>
 
 <div class="wrap">
+  {#if kurisu}
   <header class="topbar constrain">
     <span class="brand">
       <svg class="mark" viewBox="0 0 512 512" aria-hidden="true">
@@ -1275,6 +1278,7 @@
     {/if}
     <span class="livepill" class:locked title="Streaming screenshots"><span class="livedot"></span>LIVE</span>
   </header>
+  {/if}
 
   {#if needAuth}
     <div class="card constrain">
@@ -1517,6 +1521,17 @@
   </div>
 
   <div class="card constrain">
+    {#if !kurisu}
+      <div class="row" style="justify-content:flex-end">
+        {#if passcode && !needAuth}
+          <button class="ghost" style="padding:2px 8px;font-size:12px" on:click={clearPasscode} title="Forget the saved passcode in this browser">Sign out</button>
+        {/if}
+        {#if locked}
+          <span class="lockpill" title="You locked the browser: agents are blocked until you click Unlock"><Icon name="lock" /> LOCKED · agents blocked</span>
+        {/if}
+        <span class="livepill" class:locked title="Streaming screenshots"><span class="livedot"></span>LIVE</span>
+      </div>
+    {/if}
     <!-- Single persistent <img>: src swaps only after the new frame decodes. -->
         <div class="shotwrap" class:dim={pageLoading}>
           <img

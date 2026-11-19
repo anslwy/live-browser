@@ -4,24 +4,32 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
-    <title>Kurisu · Live Browser</title>
-    <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+    <title>Live Browser</title>
+    <link rel="icon" type="image/svg+xml" href="./globe.svg" />
     <script>
       // Embed params (e.g. Vicuna's iframe), applied before first paint:
-      // ?theme=light|dark selects the theme; ?accent=rrggbb + ?accentfg=rrggbb
+      // ?theme=light|dark selects the theme; ?theme=kurisu opts into the
+      // Kurisu skin (its own palette, brand top bar, follows system light/dark
+      // unless a saved choice exists); ?accent=rrggbb + ?accentfg=rrggbb
       // re-tint --accent/--accent-fg and the --live indicators. Invalid
-      // values are ignored (saved theme, built-in accents). With no choice
-      // made, follow the system preference like the Kurisu web app does.
+      // values are ignored (saved theme, built-in accents). Default is dark.
       try {
         var qs = new URLSearchParams(window.location.search);
         var q = qs.get('theme');
+        var kurisu = q === 'kurisu';
         var saved = localStorage.getItem('lb-theme');
+        saved = saved === 'light' || saved === 'dark' ? saved : null;
         var system = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-        var theme = q === 'light' || q === 'dark' ? q : saved === 'light' || saved === 'dark' ? saved : system;
+        var theme = q === 'light' || q === 'dark' ? q : saved || (kurisu ? system : 'dark');
         document.documentElement.dataset.theme = theme;
-        var meta = document.querySelector('meta[name="theme-color"]') || document.head.appendChild(document.createElement('meta'));
+        if (kurisu) {
+          document.documentElement.dataset.skin = 'kurisu';
+          document.title = 'Kurisu · Live Browser';
+          document.querySelector('link[rel="icon"]').setAttribute('href', './icon.svg');
+          var meta = document.querySelector('meta[name="theme-color"]') || document.head.appendChild(document.createElement('meta'));
         meta.setAttribute('name', 'theme-color');
         meta.setAttribute('content', theme === 'light' ? '#fffaf6' : '#240c0e');
+        }
         var hex = /^[0-9a-fA-F]{6}$/;
         var acc = qs.get('accent');
         if (acc !== null && hex.test(acc)) {
