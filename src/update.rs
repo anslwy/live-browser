@@ -47,6 +47,7 @@ fn is_newer(current: &str, latest: &str) -> bool {
 fn asset_stem() -> Option<(&'static str, &'static str)> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some(("linux-x86_64", "tar.gz")),
+        ("linux", "aarch64") => Some(("linux-aarch64", "tar.gz")),
         ("macos", "aarch64") => Some(("darwin-arm64", "tar.gz")),
         ("macos", "x86_64") => Some(("darwin-x86_64", "tar.gz")),
         ("windows", _) => Some(("windows-x86_64", "zip")),
@@ -389,6 +390,8 @@ mod tests {
         let expected: Option<(&str, &str)> = if cfg!(target_os = "linux") {
             if cfg!(target_arch = "x86_64") {
                 Some(("linux-x86_64", "tar.gz"))
+            } else if cfg!(target_arch = "aarch64") {
+                Some(("linux-aarch64", "tar.gz"))
             } else {
                 None
             }

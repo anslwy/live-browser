@@ -52,14 +52,27 @@ jobs:
             gh release create "$TAG" --title "$TAG" --notes-file notes.md
           fi
 
-  linux-x86_64:
+  linux:
     needs: [notes]
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-22.04, rust_target: x86_64-unknown-linux-musl }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, rust_target: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools binutils
 
       - name: Node
         uses: actions/setup-node@v4
@@ -74,15 +87,33 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build binary
-        run: cargo build --release
+      - name: Build static musl binary
+        run: |
+          set -euo pipefail
+          case "${{ matrix.rust_target }}" in
+            x86_64-unknown-linux-musl) export CC_x86_64_unknown_linux_musl=musl-gcc ;;
+            aarch64-unknown-linux-musl) export CC_aarch64_unknown_linux_musl=musl-gcc ;;
+          esac
+          cargo build --release --target ${{ matrix.rust_target }}
+          bin="target/${{ matrix.rust_target }}/release/lb"
+          if readelf -d "$bin" 2>/dev/null | grep -q NEEDED; then
+            echo "::error::$bin has dynamic NEEDED libraries" >&2
+            readelf -d "$bin" >&2
+            exit 1
+          fi
+          if readelf -l "$bin" 2>/dev/null | grep -q INTERP; then
+            echo "::error::$bin has a dynamic interpreter (not static)" >&2
+            readelf -l "$bin" >&2
+            exit 1
+          fi
+          "$bin" --version
 
       - name: Package
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          OUT="live-browser-${TAG}-linux-x86_64"
+          OUT="live-browser-${TAG}-${{ matrix.name }}"
           mkdir -p "pkg/${OUT}/web"
-          cp target/release/lb "pkg/${OUT}/lb"
+          cp "target/${{ matrix.rust_target }}/release/lb" "pkg/${OUT}/lb"
           cp -r web/dist "pkg/${OUT}/web/dist"
           cp README.md install.sh "pkg/${OUT}/"
           tar -czf "${OUT}.tar.gz" -C pkg "${OUT}"

@@ -42,11 +42,8 @@ case "$ARCH" in
   arm64|aarch64)
     if [[ "$PLATFORM" == "darwin" ]]; then ASSET_ARCH="arm64";
     else ASSET_ARCH="aarch64"; fi ;;
-  *) err "unsupported architecture: $ARCH (x86_64, or arm64 on macOS)" ;;
+  *) err "unsupported architecture: $ARCH (x86_64 and arm64/aarch64 are supported)" ;;
 esac
-if [[ "$PLATFORM" == "linux" && "$ASSET_ARCH" == "aarch64" ]]; then
-  err "prebuilt Linux arm64 binaries are not published yet — re-run with --from-source"
-fi
 
 if ! have curl && ! have wget; then err "need curl or wget"; fi
 if ! have tar; then err "need tar"; fi
@@ -76,17 +73,25 @@ install_browser() {
   fi
   msg "installing a browser…"
   if have apt-get; then
-    # Prefer distro Chromium (no third-party repo); fall back to Google Chrome.
-    if ! sudo apt-get install -y chromium 2>/dev/null; then
-      tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-      fetch "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" "$tmp/chrome.deb"
-      sudo apt-get install -y "$tmp/chrome.deb"
+    # Prefer distro Chromium (works on both x86_64 and aarch64); fall back to Google Chrome on x86_64.
+    if ! sudo apt-get install -y chromium 2>/dev/null && ! sudo apt-get install -y chromium-browser 2>/dev/null; then
+      if [[ "$ASSET_ARCH" == "x86_64" ]]; then
+        tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+        fetch "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" "$tmp/chrome.deb"
+        sudo apt-get install -y "$tmp/chrome.deb"
+      else
+        err "could not install chromium via apt-get — install Chromium manually, then re-run"
+      fi
     fi
   elif have dnf; then
     if ! sudo dnf install -y chromium 2>/dev/null; then
-      tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-      fetch "https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm" "$tmp/chrome.rpm"
-      sudo dnf install -y "$tmp/chrome.rpm"
+      if [[ "$ASSET_ARCH" == "x86_64" ]]; then
+        tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+        fetch "https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm" "$tmp/chrome.rpm"
+        sudo dnf install -y "$tmp/chrome.rpm"
+      else
+        err "could not install chromium via dnf — install Chromium manually, then re-run"
+      fi
     fi
   elif have pacman; then
     if have yay; then yay -S --noconfirm google-chrome;
