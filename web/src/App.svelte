@@ -1226,6 +1226,39 @@
     window.parent.postMessage({ type: 'live-browser:open-external', url: href }, '*');
   }
 
+  // Embedded use (e.g. Vicuna's iframe): live theme updates from the host
+  // without reloading the frame. Accepts `{ type: 'live-browser:theme',
+  // theme?: 'light'|'dark', vars?: Record<string, string | null> }`.
+  const THEME_VARS = new Set([
+    '--bg', '--fg', '--card', '--border', '--input-bg', '--input-border',
+    '--ghost-bg', '--ghost-fg', '--link', '--danger', '--marker',
+    '--accent', '--accent-fg', '--live',
+  ]);
+  const SAFE_COLOR = /^(#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})|(rgb|rgba|hsl|hsla)\([0-9 .,%/deg]+\)|inherit)$/i;
+  function onHostMessage(e: MessageEvent) {
+    if (window.parent === window || e.source !== window.parent) return;
+    const d = e.data;
+    if (!d || typeof d !== 'object' || d.type !== 'live-browser:theme') return;
+    if (d.theme === 'light' || d.theme === 'dark') {
+      theme = d.theme;
+      document.documentElement.dataset.theme = d.theme;
+      if (kurisu) {
+        document.querySelector('meta[name="theme-color"]')?.setAttribute('content', d.theme === 'light' ? '#fffaf6' : '#240c0e');
+      }
+    }
+    if (d.vars && typeof d.vars === 'object') {
+      const style = document.documentElement.style;
+      for (const [k, v] of Object.entries(d.vars as Record<string, unknown>)) {
+        if (!THEME_VARS.has(k)) continue;
+        if (v === null || v === '') {
+          style.removeProperty(k);
+        } else if (typeof v === 'string' && SAFE_COLOR.test(v.trim())) {
+          style.setProperty(k, v.trim());
+        }
+      }
+    }
+  }
+
   onMount(() => {
     (async () => {
       // Tabs first so viewId is pinned before any per-tab fetch runs.
@@ -1239,6 +1272,7 @@
     window.addEventListener('resize', measureShot);
     window.addEventListener('click', settingsOutside);
     window.addEventListener('click', externalLinkBridge, true);
+    window.addEventListener('message', onHostMessage);
     attachShotWheel();
     // Liveness tick — always on. Interactions queue their own frames on top.
     // Tabs first (it may recover viewId after a close), then per-view fetches.
@@ -1258,6 +1292,7 @@
     window.removeEventListener('resize', measureShot);
     window.removeEventListener('click', settingsOutside);
     window.removeEventListener('click', externalLinkBridge, true);
+    window.removeEventListener('message', onHostMessage);
   });
 </script>
 

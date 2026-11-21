@@ -11,8 +11,11 @@
       // ?theme=light|dark selects the theme; ?theme=kurisu opts into the
       // Kurisu skin (its own palette, brand top bar, follows system light/dark
       // unless a saved choice exists); ?accent=rrggbb + ?accentfg=rrggbb
-      // re-tint --accent/--accent-fg and the --live indicators. Invalid
-      // values are ignored (saved theme, built-in accents). Default is dark.
+      // re-tint --accent/--accent-fg and the --live indicators; optional
+      // palette params (bg, fg, card, border, inputbg, inputborder, ghostbg,
+      // ghostfg, link, danger, marker) override the matching CSS variables
+      // so custom host themes match seamlessly. Invalid values are ignored
+      // (saved theme, built-in palette). Default is dark.
       try {
         var qs = new URLSearchParams(window.location.search);
         var q = qs.get('theme');
@@ -27,18 +30,45 @@
           document.title = 'Kurisu · Live Browser';
           document.querySelector('link[rel="icon"]').setAttribute('href', './icon.svg');
           var meta = document.querySelector('meta[name="theme-color"]') || document.head.appendChild(document.createElement('meta'));
-        meta.setAttribute('name', 'theme-color');
-        meta.setAttribute('content', theme === 'light' ? '#fffaf6' : '#240c0e');
+          meta.setAttribute('name', 'theme-color');
+          meta.setAttribute('content', theme === 'light' ? '#fffaf6' : '#240c0e');
         }
-        var hex = /^[0-9a-fA-F]{6}$/;
+        var hex = /^([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+        var rootStyle = document.documentElement.style;
         var acc = qs.get('accent');
         if (acc !== null && hex.test(acc)) {
-          document.documentElement.style.setProperty('--accent', '#' + acc);
-          document.documentElement.style.setProperty('--live', '#' + acc);
+          rootStyle.setProperty('--accent', '#' + acc);
+          rootStyle.setProperty('--live', '#' + acc);
         }
         var fg = qs.get('accentfg');
         if (fg !== null && hex.test(fg)) {
-          document.documentElement.style.setProperty('--accent-fg', '#' + fg);
+          rootStyle.setProperty('--accent-fg', '#' + fg);
+        }
+        var paletteMap = {
+          bg: '--bg',
+          fg: '--fg',
+          card: '--card',
+          border: '--border',
+          inputbg: '--input-bg',
+          inputborder: '--input-border',
+          ghostbg: '--ghost-bg',
+          ghostfg: '--ghost-fg',
+          link: '--link',
+          danger: '--danger',
+          marker: '--marker',
+        };
+        var hasFg = false;
+        var hasGhostFg = false;
+        for (var param in paletteMap) {
+          var v = qs.get(param);
+          if (v !== null && hex.test(v)) {
+            rootStyle.setProperty(paletteMap[param], '#' + v);
+            if (param === 'fg') hasFg = true;
+            if (param === 'ghostfg') hasGhostFg = true;
+          }
+        }
+        if (hasFg && !hasGhostFg) {
+          rootStyle.setProperty('--ghost-fg', 'inherit');
         }
       } catch (e) {
         document.documentElement.dataset.theme = 'dark';
