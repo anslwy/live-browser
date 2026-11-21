@@ -157,6 +157,70 @@ jobs:
         continue-on-error: true
         run: cargo build --release --target x86_64-apple-darwin
 
+      - name: Sign & notarize macOS binaries
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLE_CERTIFICATE:-}" || -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+            echo "Apple signing secrets not configured — skipping macOS signing."
+            exit 0
+          fi
+          KEYCHAIN_PATH="$RUNNER_TEMP/lb-signing.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -base64 32)"
+          CERT_PATH="$RUNNER_TEMP/lb-certificate.p12"
+
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security default-keychain -s "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+          BINS=(target/release/lb)
+          if [[ -f target/x86_64-apple-darwin/release/lb ]]; then
+            BINS+=(target/x86_64-apple-darwin/release/lb)
+          fi
+
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "${BINS[@]}"
+          codesign --verify --verbose=2 "${BINS[@]}"
+
+          if [[ -n "${APPLE_ID:-}" && -n "${APPLE_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
+            NOTARY_ZIP="$RUNNER_TEMP/lb-notary.zip"
+            mkdir -p "$RUNNER_TEMP/notary-stage"
+            cp target/release/lb "$RUNNER_TEMP/notary-stage/lb-arm64"
+            if [[ -f target/x86_64-apple-darwin/release/lb ]]; then
+              cp target/x86_64-apple-darwin/release/lb "$RUNNER_TEMP/notary-stage/lb-x86_64"
+            fi
+            ditto -c -k "$RUNNER_TEMP/notary-stage" "$NOTARY_ZIP"
+            OUT="$(xcrun notarytool submit "$NOTARY_ZIP" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --output-format json)"
+            echo "$OUT"
+            STATUS="$(printf '%s' "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
+            SUB_ID="$(printf '%s' "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+            rm -rf "$NOTARY_ZIP" "$RUNNER_TEMP/notary-stage"
+            if [[ "$STATUS" != "Accepted" ]]; then
+              echo "::error::Notarization failed with status: $STATUS"
+              [[ -n "$SUB_ID" ]] && xcrun notarytool log "$SUB_ID" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+              exit 1
+            fi
+          fi
+
+      - name: Clean up signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/lb-signing.keychain-db" 2>/dev/null || true
+
       - name: Package
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
