@@ -182,6 +182,27 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Resize the tab viewport (CSS pixels, --preset mobile/tablet/desktop/desktop-lg/fhd, or --reset)
+    Resize {
+        /// Viewport width in CSS pixels (200-3840)
+        width: Option<u32>,
+        /// Viewport height in CSS pixels (200-2160)
+        height: Option<u32>,
+        /// Device pixel ratio (0.5-4.0)
+        #[arg(long)]
+        dpr: Option<f64>,
+        /// Emulate a mobile viewport + touch
+        #[arg(long)]
+        mobile: Option<bool>,
+        /// Named preset: desktop, desktop-lg, fhd, tablet, mobile, mobile-sm
+        #[arg(long)]
+        preset: Option<String>,
+        /// Reset to default desktop viewport (1280x900)
+        #[arg(long)]
+        reset: bool,
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Type text into an element by ref or CSS (clears first; --append keeps content)
     Type {

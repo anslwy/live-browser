@@ -4,7 +4,8 @@
 
   type Handover = { active: boolean; message: string; claimed?: boolean; requested_at?: string };
   type Cursor = { x: number; y: number; kind: string; by?: string; at: number };
-  type Status = { ok: boolean; url: string; title: string; handover: Handover; zoom?: number; cursor?: Cursor; locked?: boolean };
+  type Viewport = { width: number; height: number; dpr?: number; mobile?: boolean };
+  type Status = { ok: boolean; url: string; title: string; handover: Handover; zoom?: number; viewport?: Viewport; cursor?: Cursor; locked?: boolean };
   type SnapOpt = { value: string; text: string; selected: boolean };
   type SnapEl = { ref: number; tag: string; type: string; name: string; href: string; placeholder: string; value: string; options?: SnapOpt[] };
   type LogEntry = { at: string; action: string; detail: string };
@@ -790,6 +791,10 @@
       connected = true;
       needAuth = false;
       error = '';
+      if (status?.viewport?.width && status?.viewport?.height) {
+        viewW = status.viewport.width;
+        viewH = status.viewport.height;
+      }
       // Mirror the current URL into the address bar — unless the user is
       // actively typing in it.
       const ae = document.activeElement as HTMLElement | null;

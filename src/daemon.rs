@@ -43,11 +43,34 @@ struct CursorState {
     at: i64,
 }
 
+const DEFAULT_VIEWPORT_W: u32 = 1280;
+const DEFAULT_VIEWPORT_H: u32 = 900;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ViewportState {
+    width: u32,
+    height: u32,
+    dpr: f64,
+    mobile: bool,
+}
+
+impl Default for ViewportState {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_VIEWPORT_W,
+            height: DEFAULT_VIEWPORT_H,
+            dpr: 1.0,
+            mobile: false,
+        }
+    }
+}
+
 /// Per-tab state (a tab is one CDP target / Page).
 struct TabState {
     page: Page,
     handover: HandoverState,
     zoom: f64,
+    viewport: ViewportState,
     cursor: CursorState,
     last_url: String,
     /// Last mutating action on this tab (e.g. "click", "open") — drives the
@@ -104,6 +127,7 @@ impl TabState {
             page,
             handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
             zoom: 1.0,
+            viewport: ViewportState::default(),
             cursor: CursorState::default(),
             last_url,
             last_action: "open".to_string(),
@@ -430,7 +454,12 @@ async fn chrome_supports_new_headless(path: Option<&str>) -> bool {
 async fn build_browser_config(launch: &LaunchConfig) -> Result<BrowserConfig, String> {
     let mut cfg = BrowserConfig::builder()
         .user_data_dir(std::path::PathBuf::from(&launch.profile))
-        .window_size(1280, 900)
+        .window_size(DEFAULT_VIEWPORT_W, DEFAULT_VIEWPORT_H)
+        .viewport(chromiumoxide::handler::viewport::Viewport {
+            width: DEFAULT_VIEWPORT_W,
+            height: DEFAULT_VIEWPORT_H,
+            ..Default::default()
+        })
         .launch_timeout(Duration::from_secs(60))
         .request_timeout(Duration::from_secs(20));
     if let Some(chrome) = &launch.chrome {
@@ -1204,6 +1233,7 @@ async fn api_status(
         "title": title,
         "handover": ts.handover,
         "zoom": ts.zoom,
+        "viewport": ts.viewport,
         "cursor": ts.cursor,
         "locked": s.user_lock.is_locked(),
     }))
@@ -2751,6 +2781,126 @@ async fn api_zoom(State(s): State<AppState>, Json(b): Json<ZoomReq>) -> Json<ser
     apply_zoom(&page, zoom).await;
     tokio::time::sleep(Duration::from_millis(60)).await;
     Json(serde_json::json!({ "ok": true, "zoom": zoom, "message": format!("zoom {zoom}") }))
+}
+
+#[derive(Deserialize, Default)]
+struct ResizeReq {
+    /// Tab id (default: active tab).
+    #[serde(default)]
+    tab: Option<u32>,
+    /// Viewport width in CSS pixels (200..=3840).
+    #[serde(default)]
+    width: Option<u32>,
+    /// Viewport height in CSS pixels (200..=2160).
+    #[serde(default)]
+    height: Option<u32>,
+    /// Device pixel ratio (0.5..=4.0, default 1.0 or preset default).
+    #[serde(default)]
+    dpr: Option<f64>,
+    /// Emulate a mobile device (meta viewport + touch).
+    #[serde(default)]
+    mobile: Option<bool>,
+    /// Named preset: desktop, desktop-lg, fhd, tablet, mobile/iphone, mobile-sm.
+    #[serde(default)]
+    preset: Option<String>,
+    /// Reset to the default desktop viewport (1280x900, dpr 1, mobile false).
+    #[serde(default)]
+    reset: bool,
+}
+
+fn preset_viewport(name: &str) -> Option<ViewportState> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "desktop" | "default" => Some(ViewportState::default()),
+        "desktop-lg" | "laptop" => Some(ViewportState { width: 1440, height: 900, dpr: 1.0, mobile: false }),
+        "fhd" | "1080p" => Some(ViewportState { width: 1920, height: 1080, dpr: 1.0, mobile: false }),
+        "tablet" | "ipad" => Some(ViewportState { width: 768, height: 1024, dpr: 2.0, mobile: true }),
+        "mobile" | "iphone" => Some(ViewportState { width: 390, height: 844, dpr: 3.0, mobile: true }),
+        "mobile-sm" | "iphone-se" => Some(ViewportState { width: 375, height: 667, dpr: 2.0, mobile: true }),
+        _ => None,
+    }
+}
+
+fn resolve_viewport_req(req: &ResizeReq) -> Result<ViewportState, String> {
+    let mut vp = if req.reset {
+        ViewportState::default()
+    } else if let Some(preset) = req.preset.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        preset_viewport(preset).ok_or_else(|| {
+            format!(
+                "unknown preset {preset:?} (use desktop, desktop-lg, fhd, tablet, mobile/iphone, or mobile-sm)"
+            )
+        })?
+    } else {
+        let w = req.width.ok_or_else(|| "missing width (provide width & height, a preset, or reset=true)".to_string())?;
+        let h = req.height.ok_or_else(|| "missing height (provide width & height, a preset, or reset=true)".to_string())?;
+        ViewportState { width: w, height: h, dpr: 1.0, mobile: false }
+    };
+    if !req.reset {
+        if let Some(w) = req.width {
+            vp.width = w;
+        }
+        if let Some(h) = req.height {
+            vp.height = h;
+        }
+        if let Some(dpr) = req.dpr {
+            vp.dpr = dpr;
+        }
+        if let Some(mobile) = req.mobile {
+            vp.mobile = mobile;
+        }
+    }
+    if !(200..=3840).contains(&vp.width) {
+        return Err(format!("width {} out of range (200..=3840)", vp.width));
+    }
+    if !(200..=2160).contains(&vp.height) {
+        return Err(format!("height {} out of range (200..=2160)", vp.height));
+    }
+    if !vp.dpr.is_finite() || !(0.5..=4.0).contains(&vp.dpr) {
+        return Err(format!("dpr {} out of range (0.5..=4.0)", vp.dpr));
+    }
+    Ok(vp)
+}
+
+async fn apply_viewport(page: &Page, vp: &ViewportState) -> Result<(), String> {
+    use chromiumoxide::cdp::browser_protocol::emulation::{
+        SetDeviceMetricsOverrideParams, SetTouchEmulationEnabledParams,
+    };
+    let metrics = SetDeviceMetricsOverrideParams::new(
+        vp.width as i64,
+        vp.height as i64,
+        vp.dpr,
+        vp.mobile,
+    );
+    match tokio::time::timeout(CDP_TIMEOUT, page.execute(metrics)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(format!("{e:#}")),
+        Err(_) => return Err(format!("timed out after {}s", CDP_TIMEOUT.as_secs())),
+    }
+    let touch = SetTouchEmulationEnabledParams::new(vp.mobile);
+    let _ = tokio::time::timeout(CDP_TIMEOUT, page.execute(touch)).await;
+    Ok(())
+}
+
+async fn api_resize(State(s): State<AppState>, Json(b): Json<ResizeReq>) -> Json<serde_json::Value> {
+    let vp = match resolve_viewport_req(&b) {
+        Ok(vp) => vp,
+        Err(e) => return err(e),
+    };
+    let (tab_id, page) = tab!(&s, b.tab);
+    if let Err(e) = apply_viewport(&page, &vp).await {
+        return err(friendly_cdp_error(s.port, "resize failed", e));
+    }
+    with_tab(&s, tab_id, |ts| ts.viewport = vp.clone()).await;
+    let mode = if vp.mobile { ", mobile" } else { "" };
+    let desc = format!("{}x{} (dpr {}{mode})", vp.width, vp.height, vp.dpr);
+    s.push_log("resize", &format!("tab {tab_id} -> {desc}"));
+    s.mark_action(tab_id, "resize").await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    Json(serde_json::json!({
+        "ok": true,
+        "tab": tab_id,
+        "viewport": vp,
+        "message": format!("viewport {desc}"),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -4562,6 +4712,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .route("/api/wheel", post(api_wheel))
         .route("/api/drag", post(api_drag))
         .route("/api/zoom", post(api_zoom))
+        .route("/api/resize", post(api_resize))
         .route("/api/type", post(api_type))
         .route("/api/press", post(api_press))
         .route("/api/eval", post(api_eval))
@@ -5051,8 +5202,55 @@ mod user_lock_tests {
     fn default_unlocked_and_gate_is_default_deny() {
         assert!(!UserLock::default().is_locked());
         assert!(lock_blocks(&Method::POST, "/api/anything-new", false, true));
+        assert!(lock_blocks(&Method::POST, "/api/resize", false, true));
         assert!(lock_blocks(&Method::DELETE, "/api/tabs", false, true));
         assert!(!lock_blocks(&Method::POST, "/api/anything-new", false, false));
         assert!(!lock_blocks(&Method::GET, "/api/status", false, true));
+    }
+
+    #[test]
+    fn resolve_viewport_req_presets_overrides_and_bounds() {
+        // Reset always restores default desktop viewport.
+        let r = ResizeReq { reset: true, width: Some(390), ..Default::default() };
+        assert_eq!(resolve_viewport_req(&r).unwrap(), ViewportState::default());
+
+        // Mobile preset sets mobile=true and dpr=3.
+        let r = ResizeReq { preset: Some("mobile".into()), ..Default::default() };
+        assert_eq!(
+            resolve_viewport_req(&r).unwrap(),
+            ViewportState { width: 390, height: 844, dpr: 3.0, mobile: true }
+        );
+
+        // Preset + explicit override.
+        let r = ResizeReq {
+            preset: Some("tablet".into()),
+            dpr: Some(1.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_viewport_req(&r).unwrap(),
+            ViewportState { width: 768, height: 1024, dpr: 1.0, mobile: true }
+        );
+
+        // Explicit width & height.
+        let r = ResizeReq {
+            width: Some(1440),
+            height: Some(900),
+            dpr: Some(2.0),
+            mobile: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_viewport_req(&r).unwrap(),
+            ViewportState { width: 1440, height: 900, dpr: 2.0, mobile: false }
+        );
+
+        // Missing dimensions / unknown preset / out-of-bounds all error.
+        assert!(resolve_viewport_req(&ResizeReq::default()).is_err());
+        assert!(resolve_viewport_req(&ResizeReq { preset: Some("nope".into()), ..Default::default() }).is_err());
+        assert!(resolve_viewport_req(&ResizeReq { width: Some(100), height: Some(800), ..Default::default() }).is_err());
+        assert!(resolve_viewport_req(&ResizeReq { width: Some(800), height: Some(5000), ..Default::default() }).is_err());
+        assert!(resolve_viewport_req(&ResizeReq { width: Some(800), height: Some(600), dpr: Some(f64::NAN), ..Default::default() }).is_err());
+        assert!(resolve_viewport_req(&ResizeReq { width: Some(800), height: Some(600), dpr: Some(5.0), ..Default::default() }).is_err());
     }
 }

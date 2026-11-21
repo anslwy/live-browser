@@ -85,7 +85,7 @@ without agents interfering:
 
 - **Agents are blocked server-side.** One gate in front of every `/api/*`
   route refuses every call that could change the browser (open, click, type,
-  press, scroll, eval, close/activate tabs, zoom, upload, recover, claim, …)
+  press, scroll, eval, close/activate tabs, zoom, resize, upload, recover, claim, …)
   from MCP, the CLI or raw HTTP with:
   `Browser is locked by the user, who is controlling it manually. Do not retry in a loop; …`.
   It is default-deny: every non-GET route is blocked unless it's on a short
@@ -239,6 +239,7 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb insert <text>` | Fast paste at the cursor (focus target first) |
 | `lb select <ref> <value>` | Set a dropdown option by value or visible text |
 | `lb zoom [in\|out\|reset]` | Page zoom for small viewports (persists across navigations) |
+| `lb resize [w h] [--preset mobile\|tablet\|desktop\|desktop-lg\|fhd] [--dpr N] [--mobile true\|false] [--reset]` | Resize a tab's viewport (persists across navigations) |
 | `lb eval <js>` | Run JS, print JSON-ified result (JS errors reported readably) |
 | `lb back / forward / reload` | History navigation |
 | `lb handover "msg" [--timeout s]` | Request human takeover, block until Done |
@@ -308,7 +309,7 @@ natively. Standalone use keeps the native anchor behavior.
 ## API (for scripts)
 
 `GET /api/status`, `POST /api/open`, `GET /api/snapshot`, `GET /api/screenshot` (JPEG),
-`GET /api/metrics`, `POST /api/click|click-at|hover|type|type-raw|insert|press|key|eval|nav|scroll|wheel|drag|zoom|select|wait|text|html|upload`,
+`GET /api/metrics`, `POST /api/click|click-at|hover|type|type-raw|insert|press|key|eval|nav|scroll|wheel|drag|zoom|resize|select|wait|text|html|upload`,
 `GET /api/downloads`, `GET /api/handover`, `POST /api/handover/request|claim|done`,
 `GET /api/log`, `GET|POST /api/lock` (POST only from the web UI; see User lock). All POSTs take/return JSON with `{ok: …}`.
 While the user lock is on, agent POSTs other than `wait|text|html|handover/request` return `{ok:false, locked:true, error:"Browser is locked by the user…"}`.

@@ -140,6 +140,29 @@ async fn main() -> Result<()> {
             client::drag(&server, pass, x1, y1, x2, y2, steps, tab, json).await
         }
         Commands::Zoom { action, json } => client::zoom(&server, pass, &action, tab, json).await,
+        Commands::Resize {
+            width,
+            height,
+            dpr,
+            mobile,
+            preset,
+            reset,
+            json,
+        } => {
+            client::resize(
+                &server,
+                pass,
+                width,
+                height,
+                dpr,
+                mobile,
+                preset.as_deref(),
+                reset,
+                tab,
+                json,
+            )
+            .await
+        }
         Commands::Type {
             target,
             text,

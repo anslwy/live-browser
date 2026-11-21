@@ -253,6 +253,31 @@ pub struct ZoomArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ResizeArgs {
+    /// Viewport width in CSS pixels (200-3840). Required unless `preset` or `reset` is set.
+    #[serde(default)]
+    pub width: Option<u32>,
+    /// Viewport height in CSS pixels (200-2160). Required unless `preset` or `reset` is set.
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// Device pixel ratio (0.5-4.0; default 1.0, or preset default).
+    #[serde(default)]
+    pub dpr: Option<f64>,
+    /// Emulate a mobile device (meta viewport + touch). Default false (or preset default).
+    #[serde(default)]
+    pub mobile: Option<bool>,
+    /// Named preset: "desktop" (1280x900), "desktop-lg" (1440x900), "fhd" (1920x1080),
+    /// "tablet" (768x1024, mobile), "mobile" / "iphone" (390x844, mobile), "mobile-sm" (375x667, mobile).
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// Reset to the default desktop viewport (1280x900, dpr=1, mobile=false).
+    #[serde(default)]
+    pub reset: bool,
+    #[serde(default)]
+    pub tab: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TypeArgs {
     /// Snapshot ref (e.g. "3") or CSS selector.
     pub target: String,
@@ -392,7 +417,7 @@ impl LbMcp {
         Ok(Self::daemon_result(v))
     }
 
-    #[tool(description = "Current URL, title, handover state of a tab, and `locked` (true = the user locked the browser from the web UI; actions fail until they unlock).")]
+    #[tool(description = "Current URL, title, viewport ({width, height, dpr, mobile}), handover state of a tab, and `locked` (true = the user locked the browser from the web UI; actions fail until they unlock).")]
     async fn status(
         &self,
         Parameters(a): Parameters<TabArgs>,
@@ -575,6 +600,28 @@ impl LbMcp {
                 "/api/zoom",
                 serde_json::json!({
                     "action": a.action.unwrap_or_else(|| "in".to_string()),
+                    "tab": self.tab(a.tab),
+                }),
+            )
+            .await?;
+        Ok(Self::daemon_result(v))
+    }
+
+    #[tool(description = "Resize a tab's viewport (CSS pixels, optional dpr & mobile emulation, or a named preset like mobile/tablet/desktop/desktop-lg/fhd, or reset=true). Persists across navigations; check `status` for current viewport dimensions.")]
+    async fn resize(
+        &self,
+        Parameters(a): Parameters<ResizeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let v = self
+            .post_json(
+                "/api/resize",
+                serde_json::json!({
+                    "width": a.width,
+                    "height": a.height,
+                    "dpr": a.dpr,
+                    "mobile": a.mobile,
+                    "preset": a.preset,
+                    "reset": a.reset,
                     "tab": self.tab(a.tab),
                 }),
             )

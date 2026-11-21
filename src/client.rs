@@ -386,6 +386,37 @@ pub async fn zoom(server: &str, passcode: Option<&str>, action: &str, tab: Optio
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn resize(
+    server: &str,
+    passcode: Option<&str>,
+    width: Option<u32>,
+    height: Option<u32>,
+    dpr: Option<f64>,
+    mobile: Option<bool>,
+    preset: Option<&str>,
+    reset: bool,
+    tab: Option<u32>,
+    json: bool,
+) -> Result<()> {
+    let v = post(
+        server,
+        passcode,
+        "/api/resize",
+        serde_json::json!({
+            "width": width,
+            "height": height,
+            "dpr": dpr,
+            "mobile": mobile,
+            "preset": preset,
+            "reset": reset,
+            "tab": tab,
+        }),
+    )
+    .await?;
+    check_ok(&v, json)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn type_text(
     server: &str,
     passcode: Option<&str>,
