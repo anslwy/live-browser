@@ -3,6 +3,7 @@ mod client;
 mod cloak;
 mod daemon;
 mod mcp;
+mod screenshot;
 mod update;
 mod webctl;
 
