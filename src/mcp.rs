@@ -1062,7 +1062,8 @@ mod screenshot_tests {
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            stream.read(&mut request).await.unwrap();
+            let received = stream.read(&mut request).await.unwrap();
+            assert!(received > 0);
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n\xff\xd8\xff").await.unwrap();
         });
         let mcp = LbMcp::new(format!("http://{addr}"), None, None, "test".into(), false);
