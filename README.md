@@ -92,6 +92,7 @@ without agents interfering:
   read-only allowlist, so new routes can't slip past it.
 - **Reads still work**: `status` (reports `locked: true`), `snapshot`,
   `screenshot`, `text`, `html`, `wait`, `list_tabs`, `log`, `downloads`,
+  `record` (passive capture, so an agent can record you driving),
   plus `handover_request` (which only posts a banner message, so an agent can
   ask you to unlock). Agents can watch what you do but can't act.
 - **Your own input keeps working**: the UI marks its requests with
@@ -239,6 +240,7 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb insert <text>` | Fast paste at the cursor (focus target first) |
 | `lb select <ref> <value>` | Set a dropdown option by value or visible text |
 | `lb zoom [in\|out\|reset]` | Page zoom for small viewports (persists across navigations) |
+| `lb record start [--fps 5] [--max-secs 300]` / `lb record stop [--out demo.mp4]` / `lb record status` | Screen-record a tab. Stop downloads the video: MP4 (h264) when `ffmpeg` is on the daemon host's PATH (or `LB_FFMPEG`), otherwise a built-in MJPEG AVI. MCP: `record` tool (`action: start\|stop\|status`, `out`) |
 | `lb resize [w h] [--preset mobile\|tablet\|desktop\|desktop-lg\|fhd] [--dpr N] [--mobile true\|false] [--reset]` | Resize a tab's viewport (persists across navigations) |
 | `lb eval <js>` | Run JS, print JSON-ified result (JS errors reported readably) |
 | `lb back / forward / reload` | History navigation |
@@ -310,9 +312,10 @@ natively. Standalone use keeps the native anchor behavior.
 
 `GET /api/status`, `POST /api/open`, `GET /api/snapshot`, `GET /api/screenshot` (JPEG),
 `GET /api/metrics`, `POST /api/click|click-at|hover|type|type-raw|insert|press|key|eval|nav|scroll|wheel|drag|zoom|resize|select|wait|text|html|upload`,
+`POST /api/record {action: start|stop|status, fps, max_secs}` → stop returns `download`, `GET /api/recording?id=…` (the video),
 `GET /api/downloads`, `GET /api/handover`, `POST /api/handover/request|claim|done`,
 `GET /api/log`, `GET|POST /api/lock` (POST only from the web UI; see User lock). All POSTs take/return JSON with `{ok: …}`.
-While the user lock is on, agent POSTs other than `wait|text|html|handover/request` return `{ok:false, locked:true, error:"Browser is locked by the user…"}`.
+While the user lock is on, agent POSTs other than `wait|text|html|handover/request|record` return `{ok:false, locked:true, error:"Browser is locked by the user…"}`.
 
 ## Layout
 

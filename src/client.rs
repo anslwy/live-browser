@@ -863,3 +863,45 @@ pub async fn link(server: &str, passcode: Option<&str>, tab: Option<u32>, json: 
         }
     }
 }
+
+pub async fn record_start(server: &str, passcode: Option<&str>, fps: f64, max_secs: u64, tab: Option<u32>, json: bool) -> Result<()> {
+    let body = serde_json::json!({ "action": "start", "fps": fps, "max_secs": max_secs, "tab": tab });
+    let v = post(server, passcode, "/api/record", body).await?;
+    check_ok(&v, json)
+}
+
+pub async fn record_status(server: &str, passcode: Option<&str>, json: bool) -> Result<()> {
+    let v = post(server, passcode, "/api/record", serde_json::json!({ "action": "status" })).await?;
+    check_ok(&v, json)
+}
+
+/// Stop, then download the encoded video from the daemon (which may be remote).
+pub async fn record_stop(server: &str, passcode: Option<&str>, out: Option<&str>, tab: Option<u32>, json: bool) -> Result<()> {
+    let v = post(server, passcode, "/api/record", serde_json::json!({ "action": "stop", "tab": tab })).await?;
+    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        return check_ok(&v, json);
+    }
+    let ext = v.get("ext").and_then(|x| x.as_str()).unwrap_or("mp4");
+    let default_out = format!("recording.{ext}");
+    let out = out.unwrap_or(&default_out);
+    let dl = v.get("download").and_then(|x| x.as_str()).context("daemon gave no download link")?;
+    let res = with_auth(http().get(api(server, dl)), passcode).send().await.context("daemon not reachable")?;
+    if !res.status().is_success() {
+        anyhow::bail!("download failed: HTTP {}", res.status());
+    }
+    let bytes = res.bytes().await?;
+    tokio::fs::write(out, &bytes).await.with_context(|| format!("writing {out}"))?;
+    if json {
+        let mut v = v;
+        v["saved"] = serde_json::json!(out);
+        print_json(&v);
+    } else {
+        let secs = v.get("seconds").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let enc = v.get("encoder").and_then(|x| x.as_str()).unwrap_or("");
+        println!("saved {out} ({} bytes, {secs:.1}s) [{enc}]", bytes.len());
+        if let Some(r) = v.get("stopped_early").and_then(|x| x.as_str()) {
+            println!("note: recording had stopped early: {r}");
+        }
+    }
+    Ok(())
+}

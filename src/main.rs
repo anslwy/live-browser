@@ -3,12 +3,13 @@ mod client;
 mod cloak;
 mod daemon;
 mod mcp;
+mod record;
 mod screenshot;
 mod update;
 mod webctl;
 
 use anyhow::Result;
-use cli::{BrowsersAction, Cli, Commands, WebAction};
+use cli::{BrowsersAction, Cli, Commands, RecordAction, WebAction};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -141,6 +142,11 @@ async fn main() -> Result<()> {
             client::drag(&server, pass, x1, y1, x2, y2, steps, tab, json).await
         }
         Commands::Zoom { action, json } => client::zoom(&server, pass, &action, tab, json).await,
+        Commands::Record { action } => match action {
+            RecordAction::Start { fps, max_secs, json } => client::record_start(&server, pass, fps, max_secs, tab, json).await,
+            RecordAction::Stop { out, json } => client::record_stop(&server, pass, out.as_deref(), tab, json).await,
+            RecordAction::Status { json } => client::record_status(&server, pass, json).await,
+        },
         Commands::Resize {
             width,
             height,

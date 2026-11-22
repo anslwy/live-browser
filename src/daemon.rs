@@ -163,6 +163,10 @@ struct AppState {
     close_on_disconnect: bool,
     /// User lock (UI "Lock" button): while set, agents can't drive the browser.
     user_lock: UserLock,
+    /// In-progress tab recordings, keyed by tab id.
+    recordings: Arc<Mutex<std::collections::HashMap<u32, crate::record::Active>>>,
+    /// Finished recordings, keyed by recording id (`GET /api/recording?id=`).
+    recorded: Arc<Mutex<std::collections::HashMap<String, crate::record::Done>>>,
 }
 
 impl axum::extract::FromRef<AppState> for UserLock {
@@ -1501,7 +1505,8 @@ impl UserLock {
 /// - wait/text/html: pure reads (agents can watch the user's progress).
 /// - handover/request: only posts a message to the UI banner, letting an
 ///   agent ask the user for something (e.g. to unlock) without retrying.
-const LOCK_EXEMPT_POSTS: &[&str] = &["/api/wait", "/api/text", "/api/html", "/api/handover/request"];
+/// - record: passive frame capture (recording the user driving is a key use).
+const LOCK_EXEMPT_POSTS: &[&str] = &["/api/wait", "/api/text", "/api/html", "/api/handover/request", "/api/record"];
 
 /// Is this request from the user's web UI (as opposed to an agent: MCP,
 /// CLI, raw HTTP)? Agent sessions always carry `X-LB-Session`, which wins.
@@ -1857,6 +1862,142 @@ async fn api_screenshot(
             b"screenshot timed out (page still loading?)".to_vec(),
         )
             .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RecordReq {
+    /// "start", "stop" or "status".
+    action: String,
+    #[serde(default)]
+    tab: Option<u32>,
+    /// Frames per second (0.5-15, default 5).
+    #[serde(default)]
+    fps: Option<f64>,
+    /// Auto-stop after this many seconds (default 300, max 3600).
+    #[serde(default)]
+    max_secs: Option<u64>,
+}
+
+async fn api_record(State(s): State<AppState>, Json(b): Json<RecordReq>) -> Json<serde_json::Value> {
+    match b.action.to_lowercase().as_str() {
+        "start" => record_start(&s, b).await,
+        "stop" => record_stop(&s, b.tab).await,
+        "status" => {
+            let recs = s.recordings.lock().await;
+            let list: Vec<_> = recs
+                .values()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id, "tab": r.tab, "fps": r.fps,
+                        "seconds": r.started.elapsed().as_secs_f64(),
+                        "started_at": r.started_at,
+                        "finished": r.task.is_finished(),
+                    })
+                })
+                .collect();
+            let message = if list.is_empty() { "no active recordings".to_string() } else { format!("{} active recording(s)", list.len()) };
+            Json(serde_json::json!({ "ok": true, "recordings": list, "message": message }))
+        }
+        other => err(format!("unknown record action: {other:?} (use start, stop or status)")),
+    }
+}
+
+async fn record_start(s: &AppState, b: RecordReq) -> Json<serde_json::Value> {
+    let (tab_id, page) = tab!(s, b.tab);
+    let mut recs = s.recordings.lock().await;
+    if let Some(r) = recs.get(&tab_id) {
+        return err(format!("tab {tab_id} is already recording ({}); stop it first", r.id));
+    }
+    let fps = crate::record::clamp_fps(b.fps);
+    let max_secs = crate::record::clamp_max_secs(b.max_secs);
+    let id = crate::record::new_id(tab_id);
+    let dir = crate::record::root_dir().join(&id);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return err(format!("cannot create {}: {e}", dir.display()));
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn(crate::record::capture_loop(page, dir.clone(), fps, Duration::from_secs(max_secs), stop.clone()));
+    recs.insert(
+        tab_id,
+        crate::record::Active {
+            id: id.clone(),
+            tab: tab_id,
+            fps,
+            dir,
+            started: std::time::Instant::now(),
+            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            stop,
+            task,
+        },
+    );
+    drop(recs);
+    s.push_log("record", &format!("tab {tab_id} start {fps}fps (max {max_secs}s)"));
+    Json(serde_json::json!({
+        "ok": true, "id": id, "tab": tab_id, "fps": fps, "max_secs": max_secs,
+        "message": format!("recording tab {tab_id} at {fps} fps (auto-stops after {max_secs}s) — run `record stop` to finish"),
+    }))
+}
+
+async fn record_stop(s: &AppState, tab: Option<u32>) -> Json<serde_json::Value> {
+    let active = {
+        let mut recs = s.recordings.lock().await;
+        let key = match tab {
+            Some(t) => Some(t),
+            None if recs.len() == 1 => recs.keys().next().copied(),
+            None => match tab_page(s, None).await {
+                Ok((t, _)) => Some(t),
+                Err(_) => None,
+            },
+        };
+        match key.and_then(|k| recs.remove(&k)) {
+            Some(r) => r,
+            None => return err("no active recording for that tab (see `record status`)".into()),
+        }
+    };
+    active.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let end = match active.task.await {
+        Ok(e) => e,
+        Err(e) => return err(format!("recorder task failed: {e}")),
+    };
+    if end.frames.is_empty() {
+        let _ = tokio::fs::remove_dir_all(&active.dir).await;
+        return err(format!("no frames captured{}", end.reason.map(|r| format!(" ({r})")).unwrap_or_default()));
+    }
+    let seconds = end.frames.last().map(|f| f.t_ms).unwrap_or(0) as f64 / 1000.0 + 1.0 / active.fps;
+    match crate::record::encode(&active.dir, &end.frames, active.fps).await {
+        Ok((path, mime, encoder)) => {
+            crate::record::cleanup_frames(&active.dir).await;
+            let bytes = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
+            s.recorded.lock().await.insert(active.id.clone(), crate::record::Done { path: path.clone(), mime });
+            s.push_log("record", &format!("tab {} stop {:.1}s -> {}", active.tab, seconds, path.display()));
+            Json(serde_json::json!({
+                "ok": true, "id": active.id, "tab": active.tab,
+                "path": path.to_string_lossy(), "mime": mime, "ext": ext, "bytes": bytes,
+                "frames": end.frames.len(), "seconds": seconds, "encoder": encoder,
+                "stopped_early": end.reason,
+                "download": format!("/api/recording?id={}", active.id),
+                "message": format!("recorded {seconds:.1}s ({} frames) -> {} [{encoder}]", end.frames.len(), path.display()),
+            }))
+        }
+        Err(e) => err(format!("encode failed: {e:#} (frames kept in {})", active.dir.display())),
+    }
+}
+
+#[derive(Deserialize)]
+struct RecordingQuery {
+    id: String,
+}
+
+async fn api_recording(State(s): State<AppState>, Query(q): Query<RecordingQuery>) -> impl IntoResponse {
+    let done = s.recorded.lock().await.get(&q.id).cloned();
+    let Some(done) = done else {
+        return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/plain")], b"unknown recording id".to_vec()).into_response();
+    };
+    match tokio::fs::read(&done.path).await {
+        Ok(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, done.mime), (header::CACHE_CONTROL, "no-store")], bytes).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/plain")], format!("recording file gone: {e}").into_bytes()).into_response(),
     }
 }
 
@@ -4694,6 +4835,8 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         tab_idle: Duration::from_secs(args.tab_idle_secs),
         close_on_disconnect: args.close_on_disconnect,
         user_lock: UserLock::default(),
+        recordings: Default::default(),
+        recorded: Default::default(),
     };
     // Kept for shutdown: closing the browser releases the profile lock so
     // the next `lb web` starts clean (no orphaned Chrome).
@@ -4721,6 +4864,8 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .route("/api/drag", post(api_drag))
         .route("/api/zoom", post(api_zoom))
         .route("/api/resize", post(api_resize))
+        .route("/api/record", post(api_record))
+        .route("/api/recording", get(api_recording))
         .route("/api/type", post(api_type))
         .route("/api/press", post(api_press))
         .route("/api/eval", post(api_eval))
@@ -5211,6 +5356,7 @@ mod user_lock_tests {
         assert!(!UserLock::default().is_locked());
         assert!(lock_blocks(&Method::POST, "/api/anything-new", false, true));
         assert!(lock_blocks(&Method::POST, "/api/resize", false, true));
+        assert!(!lock_blocks(&Method::POST, "/api/record", false, true));
         assert!(lock_blocks(&Method::DELETE, "/api/tabs", false, true));
         assert!(!lock_blocks(&Method::POST, "/api/anything-new", false, false));
         assert!(!lock_blocks(&Method::GET, "/api/status", false, true));

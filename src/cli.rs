@@ -182,6 +182,12 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Record the tab as a video: `lb record start`, then `lb record stop --out demo.mp4`
+    /// (MP4 when ffmpeg is installed on the daemon host, else MJPEG AVI)
+    Record {
+        #[command(subcommand)]
+        action: RecordAction,
+    },
     /// Resize the tab viewport (CSS pixels, --preset mobile/tablet/desktop/desktop-lg/fhd, or --reset)
     Resize {
         /// Viewport width in CSS pixels (200-3840)
@@ -466,4 +472,32 @@ impl DaemonArgs {
     pub fn background_mode(&self) -> bool {
         !self.foreground || self.background
     }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RecordAction {
+    /// Start recording the tab
+    Start {
+        /// Frames per second (0.5-15)
+        #[arg(long, default_value_t = 5.0)]
+        fps: f64,
+        /// Auto-stop after this many seconds (max 3600)
+        #[arg(long, default_value_t = 300)]
+        max_secs: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop recording and download the video
+    Stop {
+        /// Output file (default: recording.mp4 / recording.avi by encoder)
+        #[arg(long)]
+        out: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List active recordings
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }

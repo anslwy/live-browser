@@ -253,6 +253,23 @@ pub struct ZoomArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecordArgs {
+    /// "start", "stop" or "status".
+    pub action: String,
+    /// start: frames per second (0.5-15, default 5).
+    #[serde(default)]
+    pub fps: Option<f64>,
+    /// start: auto-stop after this many seconds (default 300, max 3600).
+    #[serde(default)]
+    pub max_secs: Option<u64>,
+    /// stop: local path to save the video to (default: ./recording.mp4 or .avi).
+    #[serde(default)]
+    pub out: Option<String>,
+    #[serde(default)]
+    pub tab: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ResizeArgs {
     /// Viewport width in CSS pixels (200-3840). Required unless `preset` or `reset` is set.
     #[serde(default)]
@@ -590,6 +607,42 @@ impl LbMcp {
                 }),
             )
             .await?;
+        Ok(Self::daemon_result(v))
+    }
+
+    #[tool(description = "Screen-record a tab. action=start begins capturing (fps, max_secs); keep driving the page; action=stop encodes the video (MP4 if ffmpeg is on the daemon host, else MJPEG AVI) and saves it to `out` locally; action=status lists active recordings. Works while the user lock is on, so you can record the user driving.")]
+    async fn record(
+        &self,
+        Parameters(a): Parameters<RecordArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let action = a.action.to_lowercase();
+        let v = self
+            .post_json(
+                "/api/record",
+                serde_json::json!({ "action": action, "fps": a.fps, "max_secs": a.max_secs, "tab": self.tab(a.tab) }),
+            )
+            .await?;
+        if action != "stop" || v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+            return Ok(Self::daemon_result(v));
+        }
+        let ext = v.get("ext").and_then(|x| x.as_str()).unwrap_or("mp4").to_string();
+        let out = a.out.unwrap_or_else(|| format!("recording.{ext}"));
+        let dl = v.get("download").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+        let saved = async {
+            let res = self.auth(self.http.get(self.api(&dl))).send().await?;
+            if !res.status().is_success() {
+                anyhow::bail!("HTTP {}", res.status());
+            }
+            let bytes = res.bytes().await?;
+            tokio::fs::write(&out, &bytes).await?;
+            Ok::<_, anyhow::Error>(std::fs::canonicalize(&out).map(|p| p.display().to_string()).unwrap_or(out.clone()))
+        }
+        .await;
+        let mut v = v;
+        match saved {
+            Ok(p) => v["saved"] = serde_json::json!(p),
+            Err(e) => v["save_error"] = serde_json::json!(format!("could not save locally ({e:#}); file stays on the daemon host at `path`")),
+        }
         Ok(Self::daemon_result(v))
     }
 
