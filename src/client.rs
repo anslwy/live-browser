@@ -231,7 +231,9 @@ pub async fn shot(server: &str, passcode: Option<&str>, tab: Option<u32>, out: O
         eprintln!("error: unauthorized — wrong or missing passcode (set --passcode / LB_PASSCODE)");
         std::process::exit(1);
     }
+    let status = res.status();
     let bytes = res.bytes().await?;
+    let mime = crate::screenshot::validate_response(status, &bytes)?;
     if out == "-" {
         let b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -239,26 +241,14 @@ pub async fn shot(server: &str, passcode: Option<&str>, tab: Option<u32>, out: O
         );
         println!("{b64}");
     } else {
-        // Guard against saving a JSON error body as a screenshot.
-        if bytes.starts_with(b"{") {
-            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                if v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
-                    eprintln!(
-                        "error: {}",
-                        v.get("error").and_then(|x| x.as_str()).unwrap_or("screenshot failed")
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
         tokio::fs::write(out, &bytes).await?;
         // The daemon captures JPEG (q70); say so, and nudge `.png` names.
-        let note = if out.ends_with(".png") {
+        let note = if out.ends_with(".png") && mime == "image/jpeg" {
             " (note: data is JPEG despite the .png name — prefer .jpg)"
         } else {
             ""
         };
-        println!("saved {out} ({} bytes JPEG) — live view: {}/{note}", bytes.len(), server.trim_end_matches('/'));
+        println!("saved {out} ({} bytes {mime}) — live view: {}/{note}", bytes.len(), server.trim_end_matches('/'));
     }
     Ok(())
 }

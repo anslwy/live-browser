@@ -1799,6 +1799,14 @@ async fn api_screenshot(
     let shot = tokio::time::timeout(Duration::from_secs(10), page.screenshot(params)).await;
     match shot {
         Ok(Ok(bytes)) => {
+            let mime = match crate::screenshot::validate(&bytes) {
+                Ok(mime) => mime,
+                Err(e) => return (
+                    StatusCode::BAD_GATEWAY,
+                    [(header::CONTENT_TYPE, "text/plain"), (header::CACHE_CONTROL, "no-store")],
+                    format!("invalid browser screenshot: {e:#}").into_bytes(),
+                ).into_response(),
+            };
             let hash = image_hash(&bytes);
             let etag = format!("\"{hash}\"");
             // Conditional request? `?have=` (fetch flow) or standard
@@ -1821,7 +1829,7 @@ async fn api_screenshot(
                 return (StatusCode::NOT_MODIFIED, hm, Vec::new()).into_response();
             }
             let mut hm = axum::http::HeaderMap::new();
-            hm.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("image/jpeg"));
+            hm.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(mime));
             hm.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
             if let Ok(v) = axum::http::HeaderValue::from_str(&etag) {
                 hm.insert(header::ETAG, v);

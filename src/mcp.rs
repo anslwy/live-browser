@@ -458,34 +458,20 @@ impl LbMcp {
         Parameters(a): Parameters<TabArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let url = self.api(&format!("/api/screenshot{}", self.qs(a.tab)));
-        let res = self
-            .auth(self.http.get(&url))
-            .send()
-            .await
-            .map_err(|e| self.unreachable(e))?;
-        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(ErrorData::internal_error(
-                "unauthorized — wrong or missing passcode (set LB_PASSCODE)",
-                None,
-            ));
-        }
-        let bytes = res
-            .bytes()
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("screenshot failed: {e:#}"), None))?;
-        // A JSON error body is not a screenshot.
-        if bytes.starts_with(b"{") {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
-                    return Ok(Self::daemon_result(v));
-                }
-            }
-        }
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-        Ok(CallToolResult::success(vec![
-            ContentBlock::image(b64, "image/jpeg"),
-            ContentBlock::text(format!("screenshot ({} bytes JPEG)", bytes.len())),
-        ]))
+        let result = async {
+            let res = self.auth(self.http.get(&url)).send().await?;
+            let status = res.status();
+            let bytes = res.bytes().await?;
+            let mime = crate::screenshot::validate_response(status, &bytes)?;
+            let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+            Ok::<_, anyhow::Error>(CallToolResult::success(vec![
+                ContentBlock::image(b64, mime),
+                ContentBlock::text(format!("screenshot ({} bytes, {mime})", bytes.len())),
+            ]))
+        }.await;
+        Ok(result.unwrap_or_else(|e| CallToolResult::error(vec![
+            ContentBlock::text(format!("Screenshot failed: {e:#}. Check browser health; run lb recover if the browser is dead.")),
+        ])))
     }
 
     #[tool(
@@ -1026,4 +1012,80 @@ pub async fn run(
     // Exit now: tokio's blocking stdin reader would otherwise keep the
     // process alive after a signal until stdin closes.
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod screenshot_tests {
+    use super::*;
+    use axum::{http::StatusCode, routing::get, Router};
+
+    async fn call(status: StatusCode, body: Vec<u8>) -> serde_json::Value {
+        // Deliberately wrong header: MIME must come from validated bytes.
+        let app = Router::new().route("/api/screenshot", get(move || async move {
+            (status, [("content-type", "image/jpeg")], body)
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mcp = LbMcp::new(format!("http://{addr}"), None, None, "test".into(), false);
+        let result = mcp.screenshot(Parameters(TabArgs { tab: None })).await.unwrap();
+        task.abort();
+        serde_json::to_value(result).unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_capture_is_text_tool_error_never_image() {
+        for (status, body) in [
+            (StatusCode::OK, b"".as_slice()),
+            (StatusCode::OK, b"{\"error\":\"failed\"}"),
+            (StatusCode::OK, b"<html>error</html>"),
+            (StatusCode::OK, b"\xff\xd8\xffgarbage\xff\xd9"),
+            (StatusCode::NOT_FOUND, b"no tab"),
+            (StatusCode::UNAUTHORIZED, b"unauthorized"),
+            (StatusCode::BAD_GATEWAY, b"screenshot failed: browser dead"),
+            (StatusCode::GATEWAY_TIMEOUT, b"screenshot timed out"),
+        ] {
+            let result = call(status, body.to_vec()).await;
+            assert_eq!(result["isError"], true, "{result}");
+            for block in result["content"].as_array().unwrap() {
+                assert_eq!(block["type"], "text");
+                assert!(block["text"].as_str().unwrap().contains("Screenshot failed"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_http_body_is_a_text_tool_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let received = stream.read(&mut request).await.unwrap();
+            assert!(received > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n\xff\xd8\xff").await.unwrap();
+        });
+        let mcp = LbMcp::new(format!("http://{addr}"), None, None, "test".into(), false);
+        let result = serde_json::to_value(mcp.screenshot(Parameters(TabArgs { tab: None })).await.unwrap()).unwrap();
+        task.await.unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(result["content"].as_array().unwrap().iter().all(|block| block["type"] == "text"));
+    }
+
+    #[tokio::test]
+    async fn successful_capture_has_detected_mime_and_original_bytes() {
+        for (format, mime) in [(image::ImageFormat::Png, "image/png"), (image::ImageFormat::Jpeg, "image/jpeg")] {
+            let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut bytes, format).unwrap();
+            let bytes = bytes.into_inner();
+            let result = call(StatusCode::OK, bytes.clone()).await;
+            assert_ne!(result["isError"], true);
+            assert_eq!(result["content"][0]["type"], "image");
+            assert_eq!(result["content"][0]["mimeType"], mime);
+            let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, result["content"][0]["data"].as_str().unwrap()).unwrap();
+            assert_eq!(decoded, bytes);
+        }
+    }
 }
