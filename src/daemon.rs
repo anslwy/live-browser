@@ -519,6 +519,8 @@ async fn build_browser_config(launch: &LaunchConfig) -> Result<BrowserConfig, St
 const CDP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Tighter bound for per-tab probes inside fan-out endpoints.
 const TAB_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(25);
+const SELECTOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// True when `e` looks like a dead transport (covers chromiumoxide's
 /// "send failed because receiver is gone"). Ambiguous on its own: a dropped
@@ -1625,7 +1627,7 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
                 let mut t = s.tabs.lock().await;
                 let id = t.next_id;
                 t.next_id += 1;
-                let mut ts = TabState::new(new_page.clone(), url.clone());
+                let mut ts = TabState::new(new_page.clone(), "about:blank".into());
                 ts.owner = me.id.clone();
                 t.map.insert(id, ts);
                 match &me.id {
@@ -1653,73 +1655,103 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
     open_navigate(&s, tab_id, page, &url).await
 }
 
+/// A fragment-only navigation has no new document load to wait for.
+fn is_fragment_navigation(current: &str, target: &str) -> bool {
+    let (Ok(mut current), Ok(mut target)) = (reqwest::Url::parse(current), reqwest::Url::parse(target)) else {
+        return false;
+    };
+    if target.fragment().is_none() {
+        return false;
+    }
+    current.set_fragment(None);
+    target.set_fragment(None);
+    current == target
+}
+
+fn healthy_url(url: &str) -> bool {
+    !url.is_empty() && !url.starts_with("chrome-error:")
+}
+
+/// chromiumoxide's goto already waits for the navigation's load lifecycle.
+/// Read the committed URL after it resolves, including any server redirect.
+async fn navigate_loaded(page: &Page, url: &str, before: &str) -> Result<String, String> {
+    tokio::time::timeout(NAVIGATION_TIMEOUT, async {
+        let goto = page.goto(url).await;
+        let landed = page_url(page).await;
+        match goto {
+            Ok(_) if healthy_url(&landed) => Ok(landed),
+            Ok(_) => Err(format!("no healthy document after navigating to {url}")),
+            // A reported network change can coincide with a completed load.
+            // An unchanged URL may still be the previous document.
+            Err(chromiumoxide::error::CdpError::ChromeMessage(ref e))
+                if e.contains("ERR_NETWORK_CHANGED")
+                    && !before.is_empty()
+                    && landed != before
+                    && healthy_url(&landed) => Ok(landed),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    })
+    .await
+    .map_err(|_| "goto timed out after 25s".to_string())?
+}
+
+/// Save the actual destination for reload recovery and refresh the reaper
+/// clock. Confirm the tab still points to this target after a browser reset.
+async fn record_navigation(s: &AppState, tab_id: u32, page: &Page, landed: &str) -> Option<f64> {
+    let mut tabs = s.tabs.lock().await;
+    let ts = tabs.map.get_mut(&tab_id)?;
+    if ts.page.target_id() != page.target_id() {
+        return None;
+    }
+    ts.last_url = landed.to_string();
+    ts.last_used = std::time::Instant::now();
+    Some(ts.zoom)
+}
+
 /// Shared goto-with-retry used by open (new or existing tab).
-/// Never hangs: every CDP step is bounded so the UI/CLI always get a response.
 async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json<serde_json::Value> {
     s.mark_action(tab_id, "open").await;
-    // about:blank needs no navigation at all — just confirm the tab.
+    // Preserve the existing blank-tab acknowledgement, including on a tab
+    // that is already open. Its recovery URL should reflect the real page.
     if url == "about:blank" {
-        with_tab(s, tab_id, |ts| ts.last_url = "about:blank".into()).await;
         return Json(serde_json::json!({ "ok": true, "tab": tab_id,
             "message": format!("tab {tab_id}: blank tab ready") }));
-    }
-    // Same-document (only the #fragment differs): CDP goto never sees a
-    // load event and used to burn 3×25s retries. Hash-navigate via JS.
-    if url.contains('#') {
-        let current = page_url(&page).await;
-        // `https://x.com` and `https://x.com/#a` are the same document.
-        let base = |u: &str| u.split('#').next().unwrap_or("").trim_end_matches('/').to_string();
-        if !current.is_empty() && base(&current) == base(url) {
-            let js = format!("location.href = {}", serde_json::Value::String(url.to_string()));
-            let _ = tokio::time::timeout(TAB_PROBE_TIMEOUT, page.evaluate(js.as_str())).await;
-            with_tab(s, tab_id, |ts| {
-                ts.last_url = url.to_string();
-                ts.last_used = std::time::Instant::now();
-            })
-            .await;
-            return Json(serde_json::json!({ "ok": true, "tab": tab_id,
-                "message": format!("tab {tab_id}: opened {url} (same-document)") }));
-        }
     }
     // The network here can flap (VPN/tailscale), so retry transient failures.
     let mut last_err = String::new();
     for attempt in 1..=3 {
-        let goto = tokio::time::timeout(Duration::from_secs(25), page.goto(url)).await;
-        let goto = match goto {
-            Ok(r) => r,
-            Err(_) => {
-                last_err = "goto timed out after 25s".into();
-                s.push_log("open/retry", &format!("attempt {attempt}: {last_err}"));
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-        // goto may report transient network errors (e.g. ERR_NETWORK_CHANGED)
-        // while the navigation still succeeds — verify by current URL.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let current = page_url(&page).await;
-        if goto.is_ok() || !current.starts_with("chrome-error") {
-            // Give the page a moment to keep loading; don't hard-fail on waits.
-            // Non-http(s) targets (about:blank, data:, …) settle instantly.
-            let wait = if url.starts_with("http") { 10 } else { 1 };
-            let _ = tokio::time::timeout(Duration::from_secs(wait), page.wait_for_navigation()).await;
-            let landed = page_url(&page).await;
-            // Remember the last healthy URL so reload can recover from errors.
-            if !landed.starts_with("chrome-error") && !landed.is_empty() {
-                with_tab(s, tab_id, |ts| ts.last_url = landed.clone()).await;
-            }
-            // A slow load must not look idle to the reaper / cap.
-            with_tab(s, tab_id, |ts| ts.last_used = std::time::Instant::now()).await;
-            // Navigations reset document zoom — re-apply the stored level.
-            let zoom = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.zoom).unwrap_or(1.0);
-            apply_zoom(&page, zoom).await;
-            let note = if attempt > 1 { format!(" (after {attempt} attempts)") } else { String::new() };
+        let before = tokio::time::timeout(TAB_PROBE_TIMEOUT, page_url(&page))
+            .await.unwrap_or_default();
+        if is_fragment_navigation(&before, url) {
+            let js = format!("(() => {{ location.href = {}; return location.href; }})()", serde_json::Value::String(url.to_string()));
+            let landed = match tokio::time::timeout(TAB_PROBE_TIMEOUT, page.evaluate(js.as_str())).await {
+                Ok(Ok(result)) => match result.into_value::<String>() {
+                    Ok(landed) if healthy_url(&landed) => landed,
+                    _ => return err("could not read the URL after hash navigation".into()),
+                },
+                Ok(Err(e)) => return err(friendly_cdp_error(s.port, "hash navigation failed", e)),
+                Err(_) => return err("hash navigation timed out".into()),
+            };
+            record_navigation(s, tab_id, &page, &landed).await;
             return Json(serde_json::json!({ "ok": true, "tab": tab_id,
-                "message": format!("tab {tab_id}: opened {url} (now at {landed}){note}") }));
+                "message": format!("tab {tab_id}: opened {url} (same-document)") }));
         }
-        last_err = format!("{:#}", goto.unwrap_err());
+        match navigate_loaded(&page, url, &before).await {
+            Ok(landed) => {
+                // Navigations reset document zoom — re-apply the stored level.
+                if let Some(zoom) = record_navigation(s, tab_id, &page, &landed).await {
+                    let _ = tokio::time::timeout(TAB_PROBE_TIMEOUT, apply_zoom(&page, zoom)).await;
+                }
+                let note = if attempt > 1 { format!(" (after {attempt} attempts)") } else { String::new() };
+                return Json(serde_json::json!({ "ok": true, "tab": tab_id,
+                    "message": format!("tab {tab_id}: opened {url} (now at {landed}){note}") }));
+            }
+            Err(e) => last_err = e,
+        }
         s.push_log("open/retry", &format!("attempt {attempt}: {last_err}"));
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if attempt < 3 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
     }
     err(format!("goto failed after 3 attempts (network flapping?): {last_err}"))
 }
@@ -2030,7 +2062,8 @@ async fn api_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> Json<s
     // Ensure refs exist (snapshot tags elements) — but only for numeric refs.
     // Raw `css=` selectors don't need DOM re-tagging; skipping the full
     // SNAPSHOT_JS scan here saves a costly layout-forcing evaluate.
-    if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
+    let snapshot_ref = b.target.trim().parse::<u32>().is_ok();
+    if snapshot_ref {
         let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
     }
     let do_click = async {
@@ -2057,10 +2090,12 @@ async fn api_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> Json<s
                 };
                 match res {
                     Ok(_) => {
-                        // Brief settle so SPAs commit DOM updates; the caller
-                        // (UI poll / next snapshot) observes the rest. Kept short
-                        // on purpose — this sleep is on the latency hot path.
-                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        // Keep the grace period for the UI's ref-click flow.
+                        // CSS clicks return after dispatch. Use wait for an
+                        // asynchronous DOM postcondition.
+                        if snapshot_ref {
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                        }
                         Ok(format!("clicked {sel}{label}"))
                     }
                     Err(e) => Err(friendly_cdp_error(s.port, "click failed", e)),
@@ -2633,22 +2668,18 @@ async fn api_nav(State(s): State<AppState>, Json(b): Json<NavReq>) -> Json<serde
     // Reloading a chrome-error page just redisplays the error — recover by
     // re-opening the last healthy URL instead.
     if b.action == "reload" {
-        let current = page_url(&page).await;
-        if current.starts_with("chrome-error") {
+        let current = tokio::time::timeout(TAB_PROBE_TIMEOUT, page_url(&page))
+            .await.unwrap_or_default();
+        if current.starts_with("chrome-error:") {
             let last = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.last_url.clone()).unwrap_or_default();
             if last.is_empty() {
                 return err("error page with no previous URL — use open instead".into());
             }
             s.push_log("reload/recover", &last);
-            let goto = page.goto(&last).await;
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            let landed = page_url(&page).await;
-            if goto.is_ok() || !landed.starts_with("chrome-error") {
-                if !landed.starts_with("chrome-error") && !landed.is_empty() {
-                    with_tab(&s, tab_id, |ts| ts.last_url = landed.clone()).await;
+            if let Ok(landed) = navigate_loaded(&page, &last, &current).await {
+                if let Some(zoom) = record_navigation(&s, tab_id, &page, &landed).await {
+                    let _ = tokio::time::timeout(TAB_PROBE_TIMEOUT, apply_zoom(&page, zoom)).await;
                 }
-                let zoom = s.tabs.lock().await.map.get(&tab_id).map(|ts| ts.zoom).unwrap_or(1.0);
-                apply_zoom(&page, zoom).await;
                 return ok(&format!("recovered to {landed}"));
             }
             return err("still failing — the network is flapping, try again in a bit".into());
@@ -3119,7 +3150,7 @@ struct WaitReq {
     tab: Option<u32>,
     /// Snapshot ref ("12"), `css=` selector or plain CSS to wait for.
     target: String,
-    /// Poll interval seconds is fixed (0.5s); total wait budget:
+    /// Total wait budget in seconds.
     #[serde(default = "default_wait_timeout")]
     timeout: u64,
     /// When true, wait until the target *disappears* instead of appears.
@@ -3144,38 +3175,41 @@ async fn api_wait(State(s): State<AppState>, Json(b): Json<WaitReq>) -> Json<ser
         &format!("tab {tab_id} <- {:?}{}", b.target, if b.gone { " (gone)" } else { "" }),
     );
     s.mark_action(tab_id, "wait").await;
-    // Tag refs first so waiting on a snapshot ref works right after navigation.
-    let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
-    let start = std::time::Instant::now();
-    loop {
-        let present = match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(probe_js.as_str())).await {
-            Ok(Ok(ev)) => ev.into_value::<bool>().unwrap_or(false),
-            Ok(Err(e)) => {
-                let msg = format!("{e:#}");
-                if is_tab_gone_msg(&msg) {
-                    return err(tab_gone_msg(s.port));
+    let start = tokio::time::Instant::now();
+    let wait = async {
+        // Tag refs first so waiting on a snapshot ref works right after navigation.
+        let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
+        loop {
+            let present = match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(probe_js.as_str())).await {
+                Ok(Ok(ev)) => ev.into_value::<bool>().ok(),
+                Ok(Err(e)) => {
+                    let msg = format!("{e:#}");
+                    if is_tab_gone_msg(&msg) {
+                        return err(tab_gone_msg(s.port));
+                    }
+                    if is_browser_gone_msg(&msg) {
+                        return Json(gone_err(s.port));
+                    }
+                    None
                 }
-                if is_browser_gone_msg(&msg) {
-                    return Json(gone_err(s.port));
-                }
-                false
+                Err(_) => None,
+            };
+            if present == Some(!b.gone) {
+                let after = start.elapsed().as_secs_f64();
+                return Json(serde_json::json!({ "ok": true, "tab": tab_id,
+                    "message": format!("wait satisfied after {after:.1}s ({} {})",
+                        b.target, if b.gone { "gone" } else { "present" }) }));
             }
-            Err(_) => false,
-        };
-        if present != b.gone {
-            let after = start.elapsed().as_secs_f64();
-            return Json(serde_json::json!({ "ok": true, "tab": tab_id,
-                "message": format!("wait satisfied after {after:.1}s ({} {})",
-                    b.target, if b.gone { "gone" } else { "present" }) }));
+            tokio::time::sleep(SELECTOR_POLL_INTERVAL).await;
         }
-        if start.elapsed().as_secs() >= budget {
-            return err(format!(
-                "wait timed out after {budget}s: {:?} never {} (page may still be loading — raise --timeout or re-check `lb snapshot`)",
-                b.target,
-                if b.gone { "disappeared" } else { "appeared" }
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    match tokio::time::timeout_at(start + Duration::from_secs(budget), wait).await {
+        Ok(result) => result,
+        Err(_) => err(format!(
+            "wait timed out after {budget}s: {:?} never {} (page may still be loading — raise --timeout or re-check `lb snapshot`)",
+            b.target,
+            if b.gone { "disappeared" } else { "appeared" }
+        )),
     }
 }
 
@@ -5020,6 +5054,16 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_navigation_compares_canonical_document_urls() {
+        assert!(is_fragment_navigation("https://example.com/", "https://EXAMPLE.com#one"));
+        assert!(is_fragment_navigation("https://example.com/#one", "https://example.com/#one"));
+        assert!(is_fragment_navigation("data:text/plain,hello", "data:text/plain,hello#one"));
+        assert!(!is_fragment_navigation("https://example.com/a/", "https://example.com/a#one"));
+        assert!(!is_fragment_navigation("https://example.com/?q=1", "https://example.com/?q=2#one"));
+        assert!(!is_fragment_navigation("https://example.com/#one", "https://example.com/"));
+    }
 
     /// Regression test for the macOS install: the daemon runs via a symlink
     /// (`~/.local/bin/lb` → `~/.local/share/live-browser/lb`) and

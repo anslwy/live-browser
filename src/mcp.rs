@@ -492,7 +492,7 @@ impl LbMcp {
     }
 
     #[tool(
-        description = "Click an element by snapshot ref (e.g. \"12\") or CSS selector (\"css=.login\"). Works for same-origin iframe elements too. Set kind to double/right for double- or right-click."
+        description = "Click an element by snapshot ref (e.g. \"12\") or CSS selector (\"css=.login\"). Works for same-origin iframe elements too. Set kind to double/right for double- or right-click. CSS clicks return after input dispatch. Use wait for any asynchronous DOM change you need to observe."
     )]
     async fn click(
         &self,

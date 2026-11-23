@@ -251,7 +251,9 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb log` | Recent action log (includes auto-dismissed JS dialogs) |
 
 Targets accept a snapshot ref (`lb click 12`) or a raw CSS selector
-(`lb click css=.login-button`).
+(`lb click css=.login-button`). CSS clicks return after input dispatch.
+Use `lb wait css=.login-form` (MCP `wait` or `POST /api/wait`) when the click
+triggers an asynchronous change you need to observe before continuing.
 
 Notes:
 
