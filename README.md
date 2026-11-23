@@ -138,6 +138,15 @@ cargo build                      # builds the `lb` binary (target/debug/lb)
 cd web && npm install && npm run build   # builds the monitor UI into web/dist
 ```
 
+From the repository root on Linux, run the browser wait regressions with a
+built `lb` and a Chrome executable. The test uses loopback fixtures and a
+temporary profile.
+
+```sh
+unshare --user --map-root-user --net sh -c 'ip link set lo up && exec "$@"' sh \
+  node tests/browser-waits.mjs "$PWD/target/debug/lb" /absolute/path/to/chrome
+```
+
 ## Run
 
 ```sh
@@ -251,7 +260,9 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb log` | Recent action log (includes auto-dismissed JS dialogs) |
 
 Targets accept a snapshot ref (`lb click 12`) or a raw CSS selector
-(`lb click css=.login-button`).
+(`lb click css=.login-button`). CSS clicks return after input dispatch.
+Use `lb wait css=.login-form` (MCP `wait` or `POST /api/wait`) when the click
+triggers an asynchronous change you need to observe before continuing.
 
 Notes:
 
