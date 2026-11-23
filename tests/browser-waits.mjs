@@ -139,8 +139,11 @@ try {
   const blank = ok(await open('about:blank', { tab: null, new_tab: true }));
   assert.notEqual(blank.tab, 1);
   assert.equal(ok(await status(blank.tab)).url, 'about:blank');
-  ok(await open('data:text/html,<p>fixture</p>', { tab: blank.tab }));
+  const data = 'data:text/html,<p>fixture</p>';
+  ok(await open(data, { tab: blank.tab }));
   assert.equal(await evaluate('document.body.textContent', blank.tab), 'fixture');
+  assert.match(ok(await open(data + '#marker', { tab: blank.tab })).message, /same-document/);
+  assert.equal(await evaluate('location.hash', blank.tab), '#marker');
 
   const failed = await open(base + '/failed');
   assert.equal(failed.ok, false);
@@ -157,6 +160,8 @@ try {
   assert.match((await api('open', { url: base + '/fast', tab: owned }, secondOwner)).error,
     /belongs to another agent session/);
 
+  // CSS clicks resolve element geometry in the foreground renderer.
+  ok(await api('activate', { tab: 1 }));
   ok(await api('click', { tab: 1, target: 'css=#click' }));
   assert.equal(await evaluate('document.querySelector("#clicks").value'), '1');
   const waitStart = performance.now();

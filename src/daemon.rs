@@ -1655,17 +1655,16 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
     open_navigate(&s, tab_id, page, &url).await
 }
 
-/// A fragment-only navigation has no new document load to wait for.
-fn is_fragment_navigation(current: &str, target: &str) -> bool {
-    let (Ok(mut current), Ok(mut target)) = (reqwest::Url::parse(current), reqwest::Url::parse(target)) else {
-        return false;
-    };
-    if target.fragment().is_none() {
-        return false;
+/// Return the canonical destination when only the fragment can change.
+fn fragment_destination(current: &str, target: &str) -> Option<reqwest::Url> {
+    if !target.contains('#') {
+        return None;
     }
-    current.set_fragment(None);
-    target.set_fragment(None);
-    current == target
+    let current = reqwest::Url::parse(current).ok()?;
+    let target = reqwest::Url::parse(target).ok()?;
+    let (target_base, _) = target.as_str().split_once('#')?;
+    let current_base = current.as_str().split('#').next().unwrap_or_default();
+    (current_base == target_base).then_some(target)
 }
 
 fn healthy_url(url: &str) -> bool {
@@ -1722,24 +1721,24 @@ async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json
     for attempt in 1..=3 {
         let before = tokio::time::timeout(TAB_PROBE_TIMEOUT, page_url(&page))
             .await.unwrap_or_default();
-        if is_fragment_navigation(&before, url) {
-            let js = format!("(() => {{ location.href = {}; return location.href; }})()", serde_json::Value::String(url.to_string()));
-            let landed = match tokio::time::timeout(TAB_PROBE_TIMEOUT, page.evaluate(js.as_str())).await {
-                Ok(Ok(result)) => match result.into_value::<String>() {
-                    Ok(landed) if healthy_url(&landed) => landed,
-                    _ => return err("could not read the URL after hash navigation".into()),
-                },
-                Ok(Err(e)) => return err(friendly_cdp_error(s.port, "hash navigation failed", e)),
-                Err(_) => return err("hash navigation timed out".into()),
-            };
-            record_navigation(s, tab_id, &page, &landed).await;
-            return Json(serde_json::json!({ "ok": true, "tab": tab_id,
-                "message": format!("tab {tab_id}: opened {url} (same-document)") }));
-        }
-        match navigate_loaded(&page, url, &before).await {
+        let fragment = fragment_destination(&before, url);
+        // Chrome may emit no navigation event when the fragment is already
+        // current. Changed fragments go through CDP, including data URLs,
+        // where Chrome can block a script's location assignment.
+        let navigation = if fragment.as_ref().is_some_and(|target| target.as_str() == before) {
+            Ok(before)
+        } else {
+            navigate_loaded(&page, url, &before).await
+        };
+        match navigation {
             Ok(landed) => {
-                // Navigations reset document zoom — re-apply the stored level.
-                if let Some(zoom) = record_navigation(s, tab_id, &page, &landed).await {
+                let zoom = record_navigation(s, tab_id, &page, &landed).await;
+                if fragment.is_some() {
+                    return Json(serde_json::json!({ "ok": true, "tab": tab_id,
+                        "message": format!("tab {tab_id}: opened {url} (same-document)") }));
+                }
+                // New documents reset zoom. Restore the tab's stored level.
+                if let Some(zoom) = zoom {
                     let _ = tokio::time::timeout(TAB_PROBE_TIMEOUT, apply_zoom(&page, zoom)).await;
                 }
                 let note = if attempt > 1 { format!(" (after {attempt} attempts)") } else { String::new() };
@@ -5057,12 +5056,13 @@ mod tests {
 
     #[test]
     fn fragment_navigation_compares_canonical_document_urls() {
-        assert!(is_fragment_navigation("https://example.com/", "https://EXAMPLE.com#one"));
-        assert!(is_fragment_navigation("https://example.com/#one", "https://example.com/#one"));
-        assert!(is_fragment_navigation("data:text/plain,hello", "data:text/plain,hello#one"));
-        assert!(!is_fragment_navigation("https://example.com/a/", "https://example.com/a#one"));
-        assert!(!is_fragment_navigation("https://example.com/?q=1", "https://example.com/?q=2#one"));
-        assert!(!is_fragment_navigation("https://example.com/#one", "https://example.com/"));
+        let root = fragment_destination("https://example.com/", "https://EXAMPLE.com#one").unwrap();
+        assert_eq!(root.as_str(), "https://example.com/#one");
+        assert!(fragment_destination(root.as_str(), root.as_str()).is_some());
+        assert!(fragment_destination("data:text/plain,hello", "data:text/plain,hello#one").is_some());
+        assert!(fragment_destination("https://example.com/a/", "https://example.com/a#one").is_none());
+        assert!(fragment_destination("https://example.com/?q=1", "https://example.com/?q=2#one").is_none());
+        assert!(fragment_destination(root.as_str(), "https://example.com/").is_none());
     }
 
     /// Regression test for the macOS install: the daemon runs via a symlink
