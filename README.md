@@ -138,6 +138,15 @@ cargo build                      # builds the `lb` binary (target/debug/lb)
 cd web && npm install && npm run build   # builds the monitor UI into web/dist
 ```
 
+From the repository root on Linux, run the browser wait regressions with a
+built `lb` and a Chrome executable. The test uses loopback fixtures and a
+temporary profile.
+
+```sh
+unshare --user --map-root-user --net sh -c 'ip link set lo up && exec "$@"' sh \
+  node tests/browser-waits.mjs "$PWD/target/debug/lb" /absolute/path/to/chrome
+```
+
 ## Run
 
 ```sh
