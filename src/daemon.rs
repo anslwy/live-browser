@@ -1657,7 +1657,7 @@ async fn api_open(State(s): State<AppState>, Json(b): Json<OpenReq>) -> Json<ser
 
 /// Return the canonical destination when only the fragment can change.
 fn fragment_destination(current: &str, target: &str) -> Option<reqwest::Url> {
-    if !target.contains('#') {
+    if !target.contains('#') || !healthy_url(current) {
         return None;
     }
     let current = reqwest::Url::parse(current).ok()?;
@@ -5062,6 +5062,7 @@ mod tests {
         assert!(fragment_destination("data:text/plain,hello", "data:text/plain,hello#one").is_some());
         assert!(fragment_destination("https://example.com/a/", "https://example.com/a#one").is_none());
         assert!(fragment_destination("https://example.com/?q=1", "https://example.com/?q=2#one").is_none());
+        assert!(fragment_destination("chrome-error://chromewebdata/", "chrome-error://chromewebdata/#one").is_none());
         assert!(fragment_destination(root.as_str(), "https://example.com/").is_none());
     }
 
