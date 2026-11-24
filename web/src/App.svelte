@@ -186,6 +186,8 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ x: p.x, y: p.y, by: 'human', tab: viewId ?? null })
       });
+    } catch {
+      // The viewer may disconnect after it has already received the result frame.
     } finally {
       busy = '';
       // Screenshot first (starts preloading ASAP), metadata in parallel,
