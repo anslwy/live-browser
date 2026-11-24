@@ -855,6 +855,11 @@
     void pumpShot();
   }
 
+  function refreshShot() {
+    shotPending = true;
+    void pumpShot(true);
+  }
+
   function stopViewportStream() {
     const previous = viewportConnection;
     viewportConnection = null;
@@ -870,7 +875,7 @@
     const connection = new AbortController();
     viewportConnection = connection;
     const current = () => viewportConnection === connection && viewId === tab && passcode === code;
-    let watchdog: ReturnType<typeof setTimeout>;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
     const resetWatchdog = () => {
       clearTimeout(watchdog);
       watchdog = setTimeout(() => connection.abort(), 12000);
@@ -992,13 +997,15 @@
     }
   }
 
-  async function pumpShot() {
-    if (shotLoading || !shotPending || !mounted || streamHealthy) return;
+  async function pumpShot(force = false) {
+    if (shotLoading || !shotPending || !mounted || (streamHealthy && !force)) return;
     shotPending = false;
     shotLoading = true;
     const tab = viewId;
     const code = passcode;
-    const current = () => mounted && !streamHealthy && viewId === tab && passcode === code;
+    const shown = shotUrl;
+    const current = () => mounted && viewId === tab && passcode === code
+      && (!streamHealthy || (force && shotUrl === shown));
     try {
       // Passcode travels as a header (primary) and query param (fallback);
       // `have` carries the hash of the frame we already show.
@@ -1481,7 +1488,7 @@
         <button on:click={handoverDone} disabled={busy === 'done'}>
           {busy === 'done' ? 'Returning…' : 'Done — return to agent'}
         </button>
-        <button class="ghost" on:click={requestShot}>Refresh view</button>
+        <button class="ghost" on:click={refreshShot}>Refresh view</button>
       </div>
     </div>
   {/if}

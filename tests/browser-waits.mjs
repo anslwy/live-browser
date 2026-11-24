@@ -6,6 +6,7 @@ import { createServer } from 'node:http';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { readViewportFrames } from '../web/src/viewport-stream.ts';
 
 const [lb, chrome] = process.argv.slice(2);
 assert(lb && chrome && isAbsolute(lb) && isAbsolute(chrome),
@@ -172,6 +173,75 @@ try {
   assert.match((await api('wait', { tab: 1, target: 'css=[', gone: true, timeout: 1 })).error,
     /wait timed out after 1s/);
   console.log(`Browser wait regressions passed (fast open ${fastMs.toFixed(0)} ms, delayed selector ${waitMs.toFixed(0)} ms)`);
+
+  const streamUrl = tab => `http://127.0.0.1:${port}/api/viewport-stream?tab=${tab}`;
+  assert.equal((await fetch(streamUrl(1))).status, 401);
+  const forbidden = await fetch(streamUrl(owned), {
+    headers: { ...secondOwner, 'x-lb-passcode': passcode },
+  });
+  assert.equal(forbidden.status, 404);
+
+  async function viewer() {
+    const controller = new AbortController();
+    const res = await fetch(streamUrl(1), {
+      headers: { 'x-lb-passcode': passcode },
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'application/x-lb-frames');
+    let last;
+    let wake;
+    let closed = false;
+    const done = readViewportFrames(res.body, frame => {
+      last = Buffer.from(frame);
+      wake?.();
+    }, () => {}).catch(() => {}).finally(() => {
+      closed = true;
+      wake?.();
+    });
+    return {
+      async frameAfter(previous) {
+        while (!last || (previous && last.equals(previous))) {
+          assert(!closed, 'viewport stream closed before the expected frame');
+          await new Promise(resolve => { wake = resolve; });
+        }
+        assert.equal(last.readUInt16BE(0), 0xffd8);
+        return last;
+      },
+      close: () => controller.abort(),
+      done,
+    };
+  }
+
+  const first = await viewer();
+  const initial = await first.frameAfter();
+  const second = await viewer();
+  const secondInitial = await second.frameAfter();
+  const changedAt = performance.now();
+  await evaluate('document.body.style.background = "rgb(0, 255, 0)"');
+  const [, green] = await Promise.all([first.frameAfter(initial), second.frameAfter(secondInitial)]);
+  const frameMs = performance.now() - changedAt;
+  assert(frameMs < 1500, `next viewport frame took ${frameMs.toFixed(0)} ms`);
+  first.close();
+  await first.done;
+  await evaluate('document.body.style.background = "rgb(0, 0, 255)"');
+  await second.frameAfter(green);
+
+  // A viewer holding a live response must not delay daemon shutdown.
+  daemon.kill('SIGTERM');
+  const deadline = new AbortController();
+  try {
+    await Promise.race([
+      Promise.all([second.done, exited]),
+      delay(8000, undefined, { signal: deadline.signal }).then(() => {
+        assert.fail('daemon did not shut down with an active viewport stream');
+      }),
+    ]);
+  } finally {
+    deadline.abort();
+  }
+  assert.equal(daemon.exitCode, 0);
+  console.log(`Viewport stream checks passed (two viewers received an updated frame in ${frameMs.toFixed(0)} ms)`);
 } catch (error) {
   console.error(logs);
   throw error;
