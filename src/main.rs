@@ -5,6 +5,7 @@ mod daemon;
 mod mcp;
 mod record;
 mod screenshot;
+mod viewport_stream;
 mod update;
 mod webctl;
 

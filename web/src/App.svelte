@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import Icon from './Icon.svelte';
+  import { readViewportFrames } from './viewport-stream';
 
   type Handover = { active: boolean; message: string; claimed?: boolean; requested_at?: string };
   type Cursor = { x: number; y: number; kind: string; by?: string; at: number };
@@ -104,10 +105,6 @@
     return qs ? `/api/screenshot?${qs}` : '/api/screenshot';
   }
 
-  function shotUrlWithAuth(): string {
-    return screenshotFetchUrl();
-  }
-
   async function apiFetch(url: string, opts: RequestInit = {}): Promise<Response> {
     const headers = { ...(opts.headers as Record<string, string> | undefined), ...authHeaders() };
     const r = await fetch(url, { ...opts, headers });
@@ -189,6 +186,8 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ x: p.x, y: p.y, by: 'human', tab: viewId ?? null })
       });
+    } catch {
+      // The viewer may disconnect after it has already received the result frame.
     } finally {
       busy = '';
       // Screenshot first (starts preloading ASAP), metadata in parallel,
@@ -229,10 +228,7 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ x: p.x, y: p.y, tab: viewId ?? null })
     }).catch(() => {});
-    // Deliberately no requestShot() here: hover fires continuously while the
-    // mouse moves, and each screenshot contends on the single CDP session —
-    // a hover frame in flight directly delays the click frame that follows.
-    // The 2s liveness poll picks up :hover visuals shortly.
+    // Chrome pushes hover changes while the viewport stream is connected.
   }
 
   function onShotPointerDown(e: PointerEvent) {
@@ -819,6 +815,10 @@
 
   let shotLoading = false;
   let shotPending = false;
+  let mounted = false;
+  let streamHealthy = false;
+  let viewportConnection: AbortController | null = null;
+  let viewportRetry: ReturnType<typeof setTimeout> | undefined;
   let shotImg: HTMLImageElement | null = null;
   let imgBox = { w: 0, h: 0 };
 
@@ -850,13 +850,100 @@
     };
   })();
 
-  // Coalescing refresh: at most one screenshot request in flight; every
-  // interaction marks a frame pending and it fires ASAP after the current one
-  // lands. Frames preload off-DOM and swap on decode (no blink, no jump).
-  // Unchanged frames (HTTP 304) keep the current <img> untouched.
+  // Screenshots keep the view usable while Chrome cannot push frames.
   function requestShot() {
+    if (!mounted || streamHealthy) return;
     shotPending = true;
     void pumpShot();
+  }
+
+  function refreshShot() {
+    shotPending = true;
+    void pumpShot(true);
+  }
+
+  function stopViewportStream() {
+    const previous = viewportConnection;
+    viewportConnection = null;
+    previous?.abort();
+    clearTimeout(viewportRetry);
+    streamHealthy = false;
+  }
+
+  function startViewportStream(tab: number | null, code: string) {
+    stopViewportStream();
+    if (tab == null) return;
+    lastShotHash = null;
+    const connection = new AbortController();
+    viewportConnection = connection;
+    const current = () => viewportConnection === connection && viewId === tab && passcode === code;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const resetWatchdog = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => connection.abort(), 12000);
+    };
+    resetWatchdog();
+    let latest: Uint8Array<ArrayBuffer> | null = null;
+    let drawing = false;
+    async function draw() {
+      if (drawing) return;
+      drawing = true;
+      try {
+        while (latest && current() && !connection.signal.aborted) {
+          const frame = latest;
+          latest = null;
+          await showFrame(new Blob([frame], { type: 'image/jpeg' }), () => {
+            if (!current() || connection.signal.aborted) return false;
+            streamHealthy = true;
+            lastShotHash = null;
+            shotFails = 0;
+            browserDead = false;
+            return true;
+          });
+        }
+      } finally {
+        drawing = false;
+      }
+    }
+    void (async () => {
+      try {
+        const res = await apiFetch(`/api/viewport-stream?tab=${tab}`, { signal: connection.signal });
+        if (!res.ok || !res.body || res.headers.get('content-type') !== 'application/x-lb-frames') return;
+        await readViewportFrames(res.body, frame => {
+          latest = frame;
+          void draw();
+        }, resetWatchdog);
+      } catch {
+        // A disconnected stream falls back to screenshots during reconnect.
+      } finally {
+        clearTimeout(watchdog);
+        if (current()) {
+          viewportConnection = null;
+          streamHealthy = false;
+          requestShot();
+          if (!needAuth) viewportRetry = setTimeout(() => startViewportStream(tab, code), 5000);
+        }
+      }
+    })();
+  }
+
+  $: if (mounted) startViewportStream(viewId, passcode);
+
+  async function showFrame(blob: Blob, accept: () => boolean) {
+    const objUrl = URL.createObjectURL(blob);
+    const pre = new Image();
+    pre.src = objUrl;
+    try {
+      await pre.decode();
+      if (accept()) {
+        if (shotUrl.startsWith('blob:')) URL.revokeObjectURL(shotUrl);
+        shotUrl = objUrl;
+        return;
+      }
+    } catch {
+      // Keep the last good frame when an image fails to decode.
+    }
+    URL.revokeObjectURL(objUrl);
   }
 
   // Sleep/wake resilience: after macOS lid-close the browser's CDP
@@ -912,14 +999,20 @@
     }
   }
 
-  async function pumpShot() {
-    if (shotLoading || !shotPending) return;
+  async function pumpShot(force = false) {
+    if (shotLoading || !shotPending || !mounted || (streamHealthy && !force)) return;
     shotPending = false;
     shotLoading = true;
+    const tab = viewId;
+    const code = passcode;
+    const shown = shotUrl;
+    const current = () => mounted && viewId === tab && passcode === code
+      && (!streamHealthy || (force && shotUrl === shown));
     try {
       // Passcode travels as a header (primary) and query param (fallback);
       // `have` carries the hash of the frame we already show.
       const res = await fetch(screenshotFetchUrl(), { headers: authHeaders() });
+      if (!current()) return;
       if (res.status === 304) {
         // Identical frame — keep current image, no decode cost.
         shotFails = 0;
@@ -927,26 +1020,13 @@
         const etag = res.headers.get('ETag') ?? res.headers.get('X-Image-Hash') ?? '';
         const hash = etag.replace(/^W\//, '').replace(/"/g, '').trim() || null;
         const blob = await res.blob();
-        const objUrl = URL.createObjectURL(blob);
-        await new Promise<void>((resolve) => {
-          const pre = new Image();
-          pre.onload = () => {
-            if (shotUrl.startsWith('blob:')) {
-              try { URL.revokeObjectURL(shotUrl); } catch {}
-            }
-            shotUrl = objUrl;
-            // Only remember the hash once the frame actually decodes.
-            if (hash) lastShotHash = hash;
-            resolve();
-          };
-          pre.onerror = () => {
-            try { URL.revokeObjectURL(objUrl); } catch {}
-            resolve();
-          };
-          pre.src = objUrl;
+        await showFrame(blob, () => {
+          if (!current()) return false;
+          lastShotHash = hash;
+          shotFails = 0;
+          browserDead = false;
+          return true;
         });
-        shotFails = 0;
-        if (browserDead) browserDead = false;
       } else if (res.status === 401) {
         needAuth = true;
       } else if (res.status === 502 || res.status === 503 || res.status === 504 || res.status === 500) {
@@ -1179,13 +1259,16 @@
 
   async function loadSnapshot() {
     snapLoading = true;
+    const tab = viewId;
     try {
-      const r = await apiFetch(viewId != null ? `/api/snapshot?tab=${viewId}` : '/api/snapshot');
+      const r = await apiFetch(tab != null ? `/api/snapshot?tab=${tab}` : '/api/snapshot');
       const j = await r.json();
-      if (j.ok) {
+      if (j.ok && viewId === tab) {
         snapshot = j.elements ?? [];
         snapHint = j.hint ?? '';
       }
+    } catch {
+      // A viewer can leave while the background metadata refresh is running.
     } finally {
       snapLoading = false;
     }
@@ -1260,6 +1343,7 @@
   }
 
   onMount(() => {
+    mounted = true;
     (async () => {
       // Tabs first so viewId is pinned before any per-tab fetch runs.
       await fetchTabs();
@@ -1274,17 +1358,20 @@
     window.addEventListener('click', externalLinkBridge, true);
     window.addEventListener('message', onHostMessage);
     attachShotWheel();
-    // Liveness tick — always on. Interactions queue their own frames on top.
+    // Poll metadata independently of live frame delivery.
     // Tabs first (it may recover viewId after a close), then per-view fetches.
     timer = setInterval(async () => {
+      requestShot(); // Fallback only. Active screencasts never poll for frames.
       await fetchTabs();
       await Promise.all([fetchStatus(), fetchLog()]);
       measureShot();
-      requestShot();
     }, 2000);
   });
 
   onDestroy(() => {
+    mounted = false;
+    stopViewportStream();
+    if (shotUrl.startsWith('blob:')) URL.revokeObjectURL(shotUrl);
     clearInterval(timer);
     stopSettingsTimer();
     window.removeEventListener('keydown', onKeyDown);
@@ -1406,7 +1493,7 @@
         <button on:click={handoverDone} disabled={busy === 'done'}>
           {busy === 'done' ? 'Returning…' : 'Done — return to agent'}
         </button>
-        <button class="ghost" on:click={requestShot}>Refresh view</button>
+        <button class="ghost" on:click={refreshShot}>Refresh view</button>
       </div>
     </div>
   {/if}

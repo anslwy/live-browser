@@ -138,9 +138,9 @@ cargo build                      # builds the `lb` binary (target/debug/lb)
 cd web && npm install && npm run build   # builds the monitor UI into web/dist
 ```
 
-From the repository root on Linux, run the browser wait regressions with a
-built `lb` and a Chrome executable. The test uses loopback fixtures and a
-temporary profile.
+From the repository root on Linux, run the browser wait and viewport stream
+regressions with Node 24, a built `lb`, and a Chrome executable. The test uses
+loopback fixtures and a temporary profile.
 
 ```sh
 unshare --user --map-root-user --net sh -c 'ip link set lo up && exec "$@"' sh \
@@ -281,7 +281,8 @@ Notes:
 
 ## Web UI (http://127.0.0.1:8765/ by default)
 
-- **Live page view** — always-on coalesced polling (no blink, no scroll jump).
+- **Live page view** — Chrome pushes frames for the viewed tab, with screenshot
+  refreshes available when screencasting is unavailable.
   **Click** the screenshot to click · **drag** on it to drag (select text, sliders, resize panes) ·
   **move the mouse** over it for hover states · **scroll wheel** over it to scroll the container under the cursor.
   A fake cursor + ripple marks the agent's latest click so you can follow along.
