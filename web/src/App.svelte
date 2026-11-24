@@ -1257,13 +1257,16 @@
 
   async function loadSnapshot() {
     snapLoading = true;
+    const tab = viewId;
     try {
-      const r = await apiFetch(viewId != null ? `/api/snapshot?tab=${viewId}` : '/api/snapshot');
+      const r = await apiFetch(tab != null ? `/api/snapshot?tab=${tab}` : '/api/snapshot');
       const j = await r.json();
-      if (j.ok) {
+      if (j.ok && viewId === tab) {
         snapshot = j.elements ?? [];
         snapHint = j.hint ?? '';
       }
+    } catch {
+      // A viewer can leave while the background metadata refresh is running.
     } finally {
       snapLoading = false;
     }
