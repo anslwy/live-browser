@@ -68,6 +68,7 @@ impl Default for ViewportState {
 /// Per-tab state (a tab is one CDP target / Page).
 struct TabState {
     page: Page,
+    view_stream: crate::viewport_stream::ViewportStream,
     handover: HandoverState,
     zoom: f64,
     viewport: ViewportState,
@@ -125,6 +126,7 @@ impl TabState {
     fn new(page: Page, last_url: String) -> Self {
         Self {
             page,
+            view_stream: Default::default(),
             handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
             zoom: 1.0,
             viewport: ViewportState::default(),
@@ -141,6 +143,7 @@ impl TabState {
 #[derive(Clone)]
 struct AppState {
     tabs: Arc<Mutex<Tabs>>,
+    stream_shutdown: tokio::sync::watch::Receiver<bool>,
     browser: Arc<Mutex<Browser>>,
     log: Arc<Mutex<Vec<LogEntry>>>,
     /// Optional passcode guarding the HTTP API. `None`/empty = open server.
@@ -1202,6 +1205,23 @@ async fn page_title(page: &Page) -> String {
 struct TabQuery {
     #[serde(default)]
     tab: Option<u32>,
+}
+
+async fn api_viewport_stream(State(s): State<AppState>, Query(q): Query<TabQuery>) -> impl IntoResponse {
+    let (tab_id, page) = match tab_page(&s, q.tab).await {
+        Ok(tab) => tab,
+        Err(e) => return (StatusCode::NOT_FOUND, format!("{e:#}")).into_response(),
+    };
+    let mut tabs = s.tabs.lock().await;
+    let Some(tab) = tabs.map.get_mut(&tab_id).filter(|tab| tab.page.target_id() == page.target_id()) else {
+        return (StatusCode::NOT_FOUND, "tab changed").into_response();
+    };
+    let body = tab.view_stream.subscribe(page, s.stream_shutdown.clone());
+    ([
+        (header::CONTENT_TYPE, "application/x-lb-frames"),
+        (header::CACHE_CONTROL, "no-store, no-transform"),
+        (header::HeaderName::from_static("x-accel-buffering"), "no"),
+    ], body).into_response()
 }
 
 async fn api_status(
@@ -4855,7 +4875,9 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         // Best-effort: downloads still work with default behavior if this fails.
         let _ = browser.execute(params).await;
     }
+    let (stream_shutdown, stream_shutdown_rx) = tokio::sync::watch::channel(false);
     let state = AppState {
+        stream_shutdown: stream_shutdown_rx,
         tabs: Arc::new(Mutex::new(Tabs::new(tabs_map))),
         browser: Arc::new(Mutex::new(browser)),
         log,
@@ -4884,6 +4906,7 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
         .route("/api/open", post(api_open))
         .route("/api/snapshot", get(api_snapshot))
         .route("/api/screenshot", get(api_screenshot))
+        .route("/api/viewport-stream", get(api_viewport_stream))
         .route("/api/click", post(api_click))
         .route("/api/click-at", post(api_click_at))
         .route("/api/scroll", post(api_scroll))
@@ -5017,7 +5040,10 @@ pub async fn run_daemon(args: DaemonArgs, passcode: Option<String>) -> Result<()
     // / `restart` and the next start find a clean slate. SIGKILL can't be
     // caught — `stop` reaps those leftovers by profile dir.
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            stream_shutdown.send_replace(true);
+        })
         .await?;
     {
         let mut b = browser_handle.lock().await;
