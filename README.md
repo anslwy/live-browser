@@ -234,7 +234,7 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb snapshot [--full]` | Interactive elements as `[ref] tag "name"` (`--json` for full JSON, `--full` for type/value/frame/coords) |
 | `lb shot [--out f.jpg]` | Save a JPEG screenshot (`--out -` prints base64) |
 | `lb click <ref\|css=…> [--double\|--right]` | Click by snapshot ref or CSS selector (same-origin iframes included) |
-| `lb click-at <x> <y> [--double\|--right]` | Click at viewport coordinates (CSS pixels) |
+| `lb click-at <x> <y> [--coord-space css\|image\|normalized] [--double\|--right]` | Click at viewport CSS pixels (`css`, default), screenshot image pixels (`image`, auto-scaled for DPR), or normalized (`0..1`) coordinates; reports the resolved CSS `(x, y)` and hit element |
 | `lb hover <x> <y> \| --on <ref\|css=…>` | Move mouse (hover states, tooltips, menus) |
 | `lb type <ref> <text> [--submit] [--append]` | Type into an input (Enter with `--submit`; `--append` keeps content) |
 | `lb press <key\|chord>` | Key press (`Enter`, `F5`, …) or chord (`ctrl+c`, `ctrl+shift+t`, `alt+F4`) |
@@ -273,7 +273,11 @@ Notes:
   daemon (logged as `dialog` in `lb log`) so one popup can never wedge a
   tab or the daemon. `beforeunload` is accepted.
 - **Screenshots are JPEG** (quality 70), not PNG — despite any `.png`
-  filename you choose. Default output is `screenshot.jpg`.
+  filename you choose. Default output is `screenshot.jpg`. `GET /api/screenshot`
+  includes `X-LB-Image-Width`, `X-LB-Image-Height`, `X-LB-Viewport-Width`,
+  `X-LB-Viewport-Height`, and `X-LB-DPR` headers (also reported in MCP
+  `screenshot` output) so coordinate clicks with `--coord-space image` or
+  `normalized` match the screenshot across HiDPI/mobile viewports.
 - **Snapshots pierce same-origin iframes** (flagged `frame=iframe[0]` in
   `--full`/`--json`, with viewport `@x,y` coordinates). Truly cross-origin
   frames stay invisible — use `lb click-at` with UI coordinates there.

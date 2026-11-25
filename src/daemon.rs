@@ -72,6 +72,9 @@ struct TabState {
     handover: HandoverState,
     zoom: f64,
     viewport: ViewportState,
+    /// Decoded pixel dimensions of the most recent screenshot for this tab
+    /// (cleared on viewport resize so `coord_space: "image"` never uses stale dims).
+    last_screenshot_dims: Option<(u32, u32)>,
     cursor: CursorState,
     last_url: String,
     /// Last mutating action on this tab (e.g. "click", "open") — drives the
@@ -130,6 +133,7 @@ impl TabState {
             handover: HandoverState { active: false, message: String::new(), claimed: false, requested_at: None },
             zoom: 1.0,
             viewport: ViewportState::default(),
+            last_screenshot_dims: None,
             cursor: CursorState::default(),
             last_url,
             last_action: "open".to_string(),
@@ -1835,7 +1839,7 @@ async fn api_screenshot(
     headers: axum::http::HeaderMap,
     Query(q): Query<ScreenshotQuery>,
 ) -> impl IntoResponse {
-    let (_tab_id, page) = match tab_page(&s, q.tab).await {
+    let (tab_id, page) = match tab_page(&s, q.tab).await {
         Ok(x) => x,
         Err(e) => {
             return (
@@ -1855,16 +1859,42 @@ async fn api_screenshot(
     let shot = tokio::time::timeout(Duration::from_secs(10), page.screenshot(params)).await;
     match shot {
         Ok(Ok(bytes)) => {
-            let mime = match crate::screenshot::validate(&bytes) {
-                Ok(mime) => mime,
+            let img = match crate::screenshot::validate_with_dimensions(&bytes) {
+                Ok(img) => img,
                 Err(e) => return (
                     StatusCode::BAD_GATEWAY,
                     [(header::CONTENT_TYPE, "text/plain"), (header::CACHE_CONTROL, "no-store")],
                     format!("invalid browser screenshot: {e:#}").into_bytes(),
                 ).into_response(),
             };
+            let vp = {
+                let mut tabs = s.tabs.lock().await;
+                if let Some(ts) = tabs.map.get_mut(&tab_id) {
+                    ts.last_screenshot_dims = Some((img.width, img.height));
+                    ts.viewport.clone()
+                } else {
+                    ViewportState::default()
+                }
+            };
             let hash = image_hash(&bytes);
             let etag = format!("\"{hash}\"");
+            let insert_meta_headers = |hm: &mut axum::http::HeaderMap| {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&img.width.to_string()) {
+                    hm.insert(axum::http::HeaderName::from_static("x-lb-image-width"), v);
+                }
+                if let Ok(v) = axum::http::HeaderValue::from_str(&img.height.to_string()) {
+                    hm.insert(axum::http::HeaderName::from_static("x-lb-image-height"), v);
+                }
+                if let Ok(v) = axum::http::HeaderValue::from_str(&vp.width.to_string()) {
+                    hm.insert(axum::http::HeaderName::from_static("x-lb-viewport-width"), v);
+                }
+                if let Ok(v) = axum::http::HeaderValue::from_str(&vp.height.to_string()) {
+                    hm.insert(axum::http::HeaderName::from_static("x-lb-viewport-height"), v);
+                }
+                if let Ok(v) = axum::http::HeaderValue::from_str(&format!("{}", vp.dpr)) {
+                    hm.insert(axum::http::HeaderName::from_static("x-lb-dpr"), v);
+                }
+            };
             // Conditional request? `?have=` (fetch flow) or standard
             // `If-None-Match` (browser / curl flow).
             let client_have = q.have.as_deref().map(normalize_etag_value).unwrap_or("");
@@ -1882,10 +1912,11 @@ async fn api_screenshot(
                     hm.insert(header::ETAG, v);
                 }
                 hm.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+                insert_meta_headers(&mut hm);
                 return (StatusCode::NOT_MODIFIED, hm, Vec::new()).into_response();
             }
             let mut hm = axum::http::HeaderMap::new();
-            hm.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(mime));
+            hm.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(img.mime));
             hm.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
             if let Ok(v) = axum::http::HeaderValue::from_str(&etag) {
                 hm.insert(header::ETAG, v);
@@ -1893,6 +1924,7 @@ async fn api_screenshot(
             if let Ok(v) = axum::http::HeaderValue::from_str(&hash) {
                 hm.insert(axum::http::HeaderName::from_static("x-image-hash"), v);
             }
+            insert_meta_headers(&mut hm);
             (StatusCode::OK, hm, bytes).into_response()
         }
         Ok(Err(e)) => {
@@ -2727,6 +2759,182 @@ async fn api_nav(State(s): State<AppState>, Json(b): Json<NavReq>) -> Json<serde
     ok(&format!("navigated {}", b.action))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordSpace {
+    Css,
+    Image,
+    Normalized,
+}
+
+impl CoordSpace {
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(Self::Css),
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "css" => Ok(Self::Css),
+                "image" => Ok(Self::Image),
+                "normalized" => Ok(Self::Normalized),
+                other => Err(format!(
+                    "unknown coord_space: {other:?} (use css, image or normalized)"
+                )),
+            },
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Css => "css",
+            Self::Image => "image",
+            Self::Normalized => "normalized",
+        }
+    }
+}
+
+/// Map `(x, y)` in `space` to CSS viewport coordinates `(0..=vp.width, 0..=vp.height)`.
+/// `last_screenshot_dims` (when present) provides the exact pixel dimensions of the
+/// last captured screenshot; otherwise falls back to `(vp.width * vp.dpr, vp.height * vp.dpr)`.
+fn resolve_click_coords(
+    x: f64,
+    y: f64,
+    space: CoordSpace,
+    vp: &ViewportState,
+    last_screenshot_dims: Option<(u32, u32)>,
+) -> Result<(f64, f64), String> {
+    if !x.is_finite() || !y.is_finite() {
+        return Err("invalid coordinates: x and y must be finite numbers".into());
+    }
+    let vp_w = vp.width as f64;
+    let vp_h = vp.height as f64;
+    match space {
+        CoordSpace::Css => {
+            if x < 0.0 || x > vp_w || y < 0.0 || y > vp_h {
+                return Err(format!(
+                    "coordinates ({x}, {y}) out of bounds for coord_space=\"css\" (valid range: x in 0..={}, y in 0..={})",
+                    vp.width, vp.height
+                ));
+            }
+            Ok((x, y))
+        }
+        CoordSpace::Image => {
+            let (img_w, img_h) = last_screenshot_dims
+                .filter(|&(w, h)| w > 0 && h > 0)
+                .unwrap_or_else(|| {
+                    (
+                        (vp_w * vp.dpr).round().max(1.0) as u32,
+                        (vp_h * vp.dpr).round().max(1.0) as u32,
+                    )
+                });
+            let img_wf = img_w as f64;
+            let img_hf = img_h as f64;
+            if x < 0.0 || x > img_wf || y < 0.0 || y > img_hf {
+                return Err(format!(
+                    "coordinates ({x}, {y}) out of bounds for coord_space=\"image\" (valid range: x in 0..={img_w}, y in 0..={img_h})"
+                ));
+            }
+            Ok((x * vp_w / img_wf, y * vp_h / img_hf))
+        }
+        CoordSpace::Normalized => {
+            if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+                return Err(format!(
+                    "coordinates ({x}, {y}) out of bounds for coord_space=\"normalized\" (valid range: x in 0.0..=1.0, y in 0.0..=1.0)"
+                ));
+            }
+            Ok((x * vp_w, y * vp_h))
+        }
+    }
+}
+
+/// Probe the element at viewport CSS coordinates `(x, y)`, piercing open shadow
+/// roots and same-origin iframes. Returns a compact JSON summary or `None`.
+async fn probe_element_at(page: &Page, x: f64, y: f64) -> Option<serde_json::Value> {
+    const PROBE_JS: &str = r#"((x, y) => {
+      let el = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
+      let depth = 0;
+      while (el && el.shadowRoot && depth < 10) {
+        const inner = el.shadowRoot.elementFromPoint ? el.shadowRoot.elementFromPoint(x, y) : null;
+        if (!inner || inner === el) break;
+        el = inner;
+        depth++;
+      }
+      let curX = x, curY = y;
+      let iframeDepth = 0;
+      while (el && el.tagName === 'IFRAME' && iframeDepth < 5) {
+        try {
+          const doc = el.contentDocument;
+          if (!doc || !doc.elementFromPoint) break;
+          const r = el.getBoundingClientRect();
+          curX -= r.left;
+          curY -= r.top;
+          let inner = doc.elementFromPoint(curX, curY);
+          let sd = 0;
+          while (inner && inner.shadowRoot && sd < 10) {
+            const sInner = inner.shadowRoot.elementFromPoint ? inner.shadowRoot.elementFromPoint(curX, curY) : null;
+            if (!sInner || sInner === inner) break;
+            inner = sInner;
+            sd++;
+          }
+          if (!inner) break;
+          el = inner;
+          iframeDepth++;
+        } catch (_) {
+          break;
+        }
+      }
+      if (!el) return null;
+      const tag = (el.tagName || '').toLowerCase();
+      const id = el.id ? String(el.id) : '';
+      const role = el.getAttribute ? (el.getAttribute('role') || '') : '';
+      const ariaLabel = el.getAttribute ? (el.getAttribute('aria-label') || '') : '';
+      const rawText = String(
+        el.innerText || el.textContent || el.value ||
+        (el.getAttribute ? (el.getAttribute('placeholder') || el.getAttribute('title') || '') : '')
+      ).replace(/\s+/g, ' ').trim();
+      const text = rawText.length > 80 ? rawText.slice(0, 80) + '…' : rawText;
+      const out = { tag };
+      if (id) out.id = id;
+      if (role) out.role = role;
+      if (ariaLabel) out.aria_label = ariaLabel;
+      if (text) out.text = text;
+      return out;
+    })"#;
+    let call = format!("({PROBE_JS})({x}, {y})");
+    let res = tokio::time::timeout(TAB_PROBE_TIMEOUT, page.evaluate(call)).await;
+    match res {
+        Ok(Ok(eval)) => match eval.into_value::<serde_json::Value>() {
+            Ok(v) if !v.is_null() => Some(v),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn format_hit_summary(hit: &serde_json::Value) -> Option<String> {
+    let tag = hit.get("tag").and_then(|v| v.as_str())?;
+    let mut s = format!("<{tag}");
+    if let Some(id) = hit.get("id").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+        s.push('#');
+        s.push_str(id);
+    }
+    if let Some(role) = hit.get("role").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+        s.push_str(&format!(" role={role:?}"));
+    }
+    if let Some(label) = hit
+        .get("aria_label")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+    {
+        s.push_str(&format!(" aria-label={label:?}"));
+    } else if let Some(text) = hit
+        .get("text")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+    {
+        s.push_str(&format!(" {text:?}"));
+    }
+    s.push('>');
+    Some(s)
+}
+
 #[derive(Deserialize)]
 struct ClickAtReq {
     /// Tab id (default: active tab).
@@ -2734,6 +2942,9 @@ struct ClickAtReq {
     tab: Option<u32>,
     x: f64,
     y: f64,
+    /// Coordinate space: "css" (default), "image", or "normalized".
+    #[serde(default)]
+    coord_space: Option<String>,
     /// "human" when triggered from the web UI; anything else = agent.
     #[serde(default)]
     by: String,
@@ -2741,20 +2952,36 @@ struct ClickAtReq {
     #[serde(default = "default_click_kind")]
     kind: String,
 }
-/// Click at viewport CSS-pixel coordinates (used by the clickable screenshot).
+/// Click at viewport or screenshot coordinates (supports `css`, `image`, and `normalized`).
 async fn api_click_at(State(s): State<AppState>, Json(b): Json<ClickAtReq>) -> Json<serde_json::Value> {
-    if !b.x.is_finite() || !b.y.is_finite() || b.x < 0.0 || b.y < 0.0 {
-        return err("invalid coordinates".into());
-    }
-    let (tab_id, page) = tab!(&s, b.tab);
+    let space = match CoordSpace::parse(b.coord_space.as_deref()) {
+        Ok(sp) => sp,
+        Err(e) => return err(e),
+    };
     let kind = b.kind.to_lowercase();
     if kind != "single" && kind != "double" && kind != "right" {
         return err(format!("unknown click kind: {:?} (use single, double or right)", b.kind));
     }
-    s.push_log("click-at", &format!("{}, {} [{kind}]", b.x.round(), b.y.round()));
+    let (tab_id, page) = tab!(&s, b.tab);
+    let (vp, last_dims) = {
+        let tabs = s.tabs.lock().await;
+        tabs.map
+            .get(&tab_id)
+            .map(|ts| (ts.viewport.clone(), ts.last_screenshot_dims))
+            .unwrap_or_else(|| (ViewportState::default(), None))
+    };
+    let (css_x, css_y) = match resolve_click_coords(b.x, b.y, space, &vp, last_dims) {
+        Ok(pt) => pt,
+        Err(e) => return err(e),
+    };
+    let hit = probe_element_at(&page, css_x, css_y).await;
+    s.push_log(
+        "click-at",
+        &format!("{}, {} [{} {kind}]", css_x.round(), css_y.round(), space.as_str()),
+    );
     s.mark_action(tab_id, "click").await;
-    s.set_cursor(tab_id, b.x, b.y, "click", &b.by).await;
-    let point = chromiumoxide::layout::Point::new(b.x, b.y);
+    s.set_cursor(tab_id, css_x, css_y, "click", &b.by).await;
+    let point = chromiumoxide::layout::Point::new(css_x, css_y);
     let run = async {
         if kind == "double" {
             page.click_with(point, chromiumoxide::types::ClickOptions::builder().click_count(2).build()).await.map(|_| ()).map_err(|e| format!("{e:#}"))
@@ -2767,7 +2994,19 @@ async fn api_click_at(State(s): State<AppState>, Json(b): Json<ClickAtReq>) -> J
     match tokio::time::timeout(CDP_TIMEOUT, run).await {
         Ok(Ok(_)) => {
             tokio::time::sleep(Duration::from_millis(120)).await;
-            ok("clicked")
+            let message = match hit.as_ref().and_then(format_hit_summary) {
+                Some(summary) => format!("clicked ({css_x:.1}, {css_y:.1}) -> {summary}"),
+                None => format!("clicked ({css_x:.1}, {css_y:.1})"),
+            };
+            Json(serde_json::json!({
+                "ok": true,
+                "x": css_x,
+                "y": css_y,
+                "coord_space": space.as_str(),
+                "input": { "x": b.x, "y": b.y },
+                "hit": hit,
+                "message": message,
+            }))
         }
         Ok(Err(e)) => err(friendly_cdp_error(s.port, "click failed", e)),
         Err(_) => err(format!("click timed out after {}s", CDP_TIMEOUT.as_secs())),
@@ -3088,7 +3327,11 @@ async fn api_resize(State(s): State<AppState>, Json(b): Json<ResizeReq>) -> Json
     if let Err(e) = apply_viewport(&page, &vp).await {
         return err(friendly_cdp_error(s.port, "resize failed", e));
     }
-    with_tab(&s, tab_id, |ts| ts.viewport = vp.clone()).await;
+    with_tab(&s, tab_id, |ts| {
+        ts.viewport = vp.clone();
+        ts.last_screenshot_dims = None;
+    })
+    .await;
     let mode = if vp.mobile { ", mobile" } else { "" };
     let desc = format!("{}x{} (dpr {}{mode})", vp.width, vp.height, vp.dpr);
     s.push_log("resize", &format!("tab {tab_id} -> {desc}"));
@@ -5477,5 +5720,53 @@ mod user_lock_tests {
         assert!(resolve_viewport_req(&ResizeReq { width: Some(800), height: Some(5000), ..Default::default() }).is_err());
         assert!(resolve_viewport_req(&ResizeReq { width: Some(800), height: Some(600), dpr: Some(f64::NAN), ..Default::default() }).is_err());
         assert!(resolve_viewport_req(&ResizeReq { width: Some(800), height: Some(600), dpr: Some(5.0), ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn coord_space_parsing_and_conversion() {
+        assert_eq!(CoordSpace::parse(None).unwrap(), CoordSpace::Css);
+        assert_eq!(CoordSpace::parse(Some("")).unwrap(), CoordSpace::Css);
+        assert_eq!(CoordSpace::parse(Some("css")).unwrap(), CoordSpace::Css);
+        assert_eq!(CoordSpace::parse(Some("IMAGE")).unwrap(), CoordSpace::Image);
+        assert_eq!(CoordSpace::parse(Some(" normalized ")).unwrap(), CoordSpace::Normalized);
+        assert!(CoordSpace::parse(Some("screen")).is_err());
+
+        let desktop = ViewportState::default(); // 1280x900, dpr=1
+        assert_eq!(
+            resolve_click_coords(640.0, 450.0, CoordSpace::Css, &desktop, None).unwrap(),
+            (640.0, 450.0)
+        );
+        assert_eq!(
+            resolve_click_coords(640.0, 450.0, CoordSpace::Image, &desktop, None).unwrap(),
+            (640.0, 450.0)
+        );
+        assert_eq!(
+            resolve_click_coords(0.5, 0.25, CoordSpace::Normalized, &desktop, None).unwrap(),
+            (640.0, 225.0)
+        );
+
+        // Tablet DPR=2 (768x1024 CSS -> 1536x2048 image)
+        let tablet = ViewportState { width: 768, height: 1024, dpr: 2.0, mobile: true };
+        let (x, y) = resolve_click_coords(768.0, 1024.0, CoordSpace::Image, &tablet, None).unwrap();
+        assert!((x - 384.0).abs() < 1e-9 && (y - 512.0).abs() < 1e-9);
+
+        // Mobile DPR=3 (390x844 CSS -> 1170x2532 image)
+        let mobile = ViewportState { width: 390, height: 844, dpr: 3.0, mobile: true };
+        let (x, y) = resolve_click_coords(585.0, 1266.0, CoordSpace::Image, &mobile, Some((1170, 2532))).unwrap();
+        assert!((x - 195.0).abs() < 1e-9 && (y - 422.0).abs() < 1e-9);
+
+        // Actual captured screenshot dims override nominal vp * dpr when present.
+        let (x, y) = resolve_click_coords(1000.0, 500.0, CoordSpace::Image, &desktop, Some((2000, 1000))).unwrap();
+        assert!((x - 640.0).abs() < 1e-9 && (y - 450.0).abs() < 1e-9);
+
+        // Bounds and non-finite checks.
+        assert!(resolve_click_coords(-1.0, 10.0, CoordSpace::Css, &desktop, None).is_err());
+        assert!(resolve_click_coords(1281.0, 10.0, CoordSpace::Css, &desktop, None).is_err());
+        assert!(resolve_click_coords(10.0, 901.0, CoordSpace::Css, &desktop, None).is_err());
+        assert!(resolve_click_coords(1171.0, 100.0, CoordSpace::Image, &mobile, Some((1170, 2532))).is_err());
+        assert!(resolve_click_coords(1.01, 0.5, CoordSpace::Normalized, &desktop, None).is_err());
+        assert!(resolve_click_coords(0.5, -0.01, CoordSpace::Normalized, &desktop, None).is_err());
+        assert!(resolve_click_coords(f64::NAN, 10.0, CoordSpace::Css, &desktop, None).is_err());
+        assert!(resolve_click_coords(f64::INFINITY, 10.0, CoordSpace::Image, &desktop, None).is_err());
     }
 }

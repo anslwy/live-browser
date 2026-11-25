@@ -112,10 +112,13 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Click at viewport coordinates (CSS pixels, e.g. from the web UI)
+    /// Click at viewport or screenshot coordinates (default: CSS pixels; see --coord-space)
     ClickAt {
         x: f64,
         y: f64,
+        /// Coordinate space for x/y: css (default), image (screenshot pixels), or normalized (0..1)
+        #[arg(long, default_value = "css", value_parser = ["css", "image", "normalized"])]
+        coord_space: String,
         /// Double-click instead of single-click
         #[arg(long, conflicts_with = "right")]
         double: bool,

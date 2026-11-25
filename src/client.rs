@@ -232,8 +232,10 @@ pub async fn shot(server: &str, passcode: Option<&str>, tab: Option<u32>, out: O
         std::process::exit(1);
     }
     let status = res.status();
+    let headers = res.headers().clone();
     let bytes = res.bytes().await?;
-    let mime = crate::screenshot::validate_response(status, &bytes)?;
+    let img = crate::screenshot::validate_response_with_dimensions(status, &bytes)?;
+    let mime = img.mime;
     if out == "-" {
         let b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -248,7 +250,15 @@ pub async fn shot(server: &str, passcode: Option<&str>, tab: Option<u32>, out: O
         } else {
             ""
         };
-        println!("saved {out} ({} bytes {mime}) — live view: {}/{note}", bytes.len(), server.trim_end_matches('/'));
+        let vp_note = match (
+            headers.get("x-lb-viewport-width").and_then(|v| v.to_str().ok()),
+            headers.get("x-lb-viewport-height").and_then(|v| v.to_str().ok()),
+            headers.get("x-lb-dpr").and_then(|v| v.to_str().ok()),
+        ) {
+            (Some(vw), Some(vh), Some(dpr)) => format!(", {}x{}px, viewport {vw}x{vh} dpr={dpr}", img.width, img.height),
+            _ => format!(", {}x{}px", img.width, img.height),
+        };
+        println!("saved {out} ({} bytes {mime}{vp_note}) — live view: {}/{note}", bytes.len(), server.trim_end_matches('/'));
     }
     Ok(())
 }
@@ -264,12 +274,22 @@ pub async fn click(server: &str, passcode: Option<&str>, target: &str, kind: &st
     check_ok(&v, json)
 }
 
-pub async fn click_at(server: &str, passcode: Option<&str>, x: f64, y: f64, kind: &str, tab: Option<u32>, json: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub async fn click_at(
+    server: &str,
+    passcode: Option<&str>,
+    x: f64,
+    y: f64,
+    coord_space: &str,
+    kind: &str,
+    tab: Option<u32>,
+    json: bool,
+) -> Result<()> {
     let v = post(
         server,
         passcode,
         "/api/click-at",
-        serde_json::json!({ "x": x, "y": y, "kind": kind, "tab": tab }),
+        serde_json::json!({ "x": x, "y": y, "coord_space": coord_space, "kind": kind, "tab": tab }),
     )
     .await?;
     check_ok(&v, json)
