@@ -417,6 +417,89 @@ pub struct UploadArgs {
     pub tab: Option<u32>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchStep {
+    /// Action to perform: "click", "click_at", "type_text", "insert", "select",
+    /// "press", "hover", "scroll", "wheel", "wait", "sleep", "eval", "open", or "navigate".
+    pub action: String,
+    /// Target ref or CSS selector (for click, type_text, select, hover, wait).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Text to type or insert (for type_text, insert).
+    #[serde(default)]
+    pub text: Option<String>,
+    /// X coordinate (for click_at, hover, wheel).
+    #[serde(default)]
+    pub x: Option<f64>,
+    /// Y coordinate (for click_at, hover, wheel).
+    #[serde(default)]
+    pub y: Option<f64>,
+    /// Coordinate space for click_at: "css" (default), "image", or "normalized".
+    #[serde(default)]
+    pub coord_space: Option<String>,
+    /// Click kind ("single", "double", "right") for click / click_at.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Dropdown option value/text (for select) or navigation action ("back", "forward", "reload" for navigate).
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Key name or chord (for press).
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Horizontal delta (for scroll, wheel).
+    #[serde(default)]
+    pub dx: Option<f64>,
+    /// Vertical delta (for scroll, wheel).
+    #[serde(default)]
+    pub dy: Option<f64>,
+    /// Press Enter after type_text (default false).
+    #[serde(default)]
+    pub submit: bool,
+    /// Append instead of clearing in type_text (default false).
+    #[serde(default)]
+    pub append: bool,
+    /// Wait timeout in seconds (for wait, default 15).
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    /// Wait until target disappears (for wait, default false).
+    #[serde(default)]
+    pub gone: bool,
+    /// Sleep duration in milliseconds (for sleep, max 10000).
+    #[serde(default)]
+    pub ms: Option<u64>,
+    /// JavaScript expression (for eval).
+    #[serde(default)]
+    pub js: Option<String>,
+    /// URL to open (for open).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Optional tab id override for this step.
+    #[serde(default)]
+    pub tab: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchArgs {
+    /// Ordered list of actions to run sequentially (max 50).
+    pub actions: Vec<BatchStep>,
+    /// Default tab id for all actions in the batch.
+    #[serde(default)]
+    pub tab: Option<u32>,
+    /// Stop on the first failed action (default true).
+    #[serde(default = "default_true")]
+    pub stop_on_error: bool,
+    /// Include a fresh snapshot of interactive elements after the batch finishes (default false).
+    #[serde(default)]
+    pub snapshot_after: bool,
+    /// Capture and return a screenshot after the batch finishes (default false).
+    #[serde(default)]
+    pub screenshot_after: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Tools (one per CLI command; back/forward/reload share `navigate`)
 // ---------------------------------------------------------------------------
@@ -1031,6 +1114,246 @@ impl LbMcp {
         let v = self.get_json("/api/downloads").await?;
         Ok(Self::daemon_result(v))
     }
+
+    #[tool(
+        description = "Run a sequence of browser actions in order in a single call (ideal for filling forms: click_at+insert, type_text, select, press, scroll, wait, sleep, eval, etc.). Stops on first error by default; set snapshot_after=true or screenshot_after=true to inspect the result without an extra round-trip."
+    )]
+    async fn batch(
+        &self,
+        Parameters(a): Parameters<BatchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        const MAX_BATCH: usize = 50;
+        if a.actions.is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "error: actions list is empty",
+            )]));
+        }
+        if a.actions.len() > MAX_BATCH {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "error: too many actions ({}, max {MAX_BATCH})",
+                a.actions.len()
+            ))]));
+        }
+
+        let total = a.actions.len();
+        let mut results: Vec<serde_json::Value> = Vec::with_capacity(total);
+        let mut failed_index: Option<usize> = None;
+
+        for (idx, step) in a.actions.into_iter().enumerate() {
+            let tab = self.tab(step.tab.or(a.tab));
+            let action = step.action.trim().to_lowercase();
+            let res: serde_json::Value = match action.as_str() {
+                "click" => match step.target {
+                    Some(target) => {
+                        self.post_json(
+                            "/api/click",
+                            serde_json::json!({
+                                "target": target,
+                                "kind": step.kind.unwrap_or_else(|| "single".into()),
+                                "tab": tab,
+                            }),
+                        )
+                        .await?
+                    }
+                    None => serde_json::json!({ "ok": false, "error": "click requires `target`" }),
+                },
+                "click_at" => match (step.x, step.y) {
+                    (Some(x), Some(y)) => {
+                        self.post_json(
+                            "/api/click-at",
+                            serde_json::json!({
+                                "x": x,
+                                "y": y,
+                                "coord_space": step.coord_space.unwrap_or_else(|| "css".into()),
+                                "kind": step.kind.unwrap_or_else(|| "single".into()),
+                                "tab": tab,
+                            }),
+                        )
+                        .await?
+                    }
+                    _ => serde_json::json!({ "ok": false, "error": "click_at requires `x` and `y`" }),
+                },
+                "type_text" | "type" => match (step.target, step.text) {
+                    (Some(target), Some(text)) => {
+                        self.post_json(
+                            "/api/type",
+                            serde_json::json!({
+                                "target": target,
+                                "text": text,
+                                "submit": step.submit,
+                                "append": step.append,
+                                "tab": tab,
+                            }),
+                        )
+                        .await?
+                    }
+                    _ => serde_json::json!({ "ok": false, "error": "type_text requires `target` and `text`" }),
+                },
+                "insert" => match step.text {
+                    Some(text) => {
+                        self.post_json(
+                            "/api/insert",
+                            serde_json::json!({ "text": text, "tab": tab }),
+                        )
+                        .await?
+                    }
+                    None => serde_json::json!({ "ok": false, "error": "insert requires `text`" }),
+                },
+                "select" => match (step.target, step.value) {
+                    (Some(target), Some(value)) => {
+                        self.post_json(
+                            "/api/select",
+                            serde_json::json!({ "target": target, "value": value, "tab": tab }),
+                        )
+                        .await?
+                    }
+                    _ => serde_json::json!({ "ok": false, "error": "select requires `target` and `value`" }),
+                },
+                "press" => match step.key {
+                    Some(key) => {
+                        self.post_json(
+                            "/api/press",
+                            serde_json::json!({ "key": key, "tab": tab }),
+                        )
+                        .await?
+                    }
+                    None => serde_json::json!({ "ok": false, "error": "press requires `key`" }),
+                },
+                "hover" => {
+                    self.post_json(
+                        "/api/hover",
+                        serde_json::json!({
+                            "x": step.x,
+                            "y": step.y,
+                            "target": step.target,
+                            "tab": tab,
+                        }),
+                    )
+                    .await?
+                }
+                "scroll" => {
+                    self.post_json(
+                        "/api/scroll",
+                        serde_json::json!({
+                            "dx": step.dx.unwrap_or(0.0),
+                            "dy": step.dy.unwrap_or(600.0),
+                            "tab": tab,
+                        }),
+                    )
+                    .await?
+                }
+                "wheel" => match (step.x, step.y) {
+                    (Some(x), Some(y)) => {
+                        self.post_json(
+                            "/api/wheel",
+                            serde_json::json!({
+                                "x": x,
+                                "y": y,
+                                "dx": step.dx.unwrap_or(0.0),
+                                "dy": step.dy.unwrap_or(300.0),
+                                "tab": tab,
+                            }),
+                        )
+                        .await?
+                    }
+                    _ => serde_json::json!({ "ok": false, "error": "wheel requires `x` and `y`" }),
+                },
+                "wait" => match step.target {
+                    Some(target) => {
+                        self.post_json(
+                            "/api/wait",
+                            serde_json::json!({
+                                "target": target,
+                                "timeout": step.timeout.unwrap_or(15),
+                                "gone": step.gone,
+                                "tab": tab,
+                            }),
+                        )
+                        .await?
+                    }
+                    None => serde_json::json!({ "ok": false, "error": "wait requires `target`" }),
+                },
+                "sleep" => {
+                    let ms = step.ms.unwrap_or(200).min(10_000);
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    serde_json::json!({ "ok": true, "slept_ms": ms })
+                }
+                "eval" => match step.js {
+                    Some(js) => {
+                        self.post_json("/api/eval", serde_json::json!({ "js": js, "tab": tab }))
+                            .await?
+                    }
+                    None => serde_json::json!({ "ok": false, "error": "eval requires `js`" }),
+                },
+                "open" => match step.url {
+                    Some(url) => {
+                        self.post_json(
+                            "/api/open",
+                            serde_json::json!({ "url": url, "tab": tab, "new_tab": false }),
+                        )
+                        .await?
+                    }
+                    None => serde_json::json!({ "ok": false, "error": "open requires `url`" }),
+                },
+                "navigate" => match step.value {
+                    Some(nav_action) => {
+                        self.post_json(
+                            "/api/nav",
+                            serde_json::json!({ "action": nav_action, "tab": tab }),
+                        )
+                        .await?
+                    }
+                    None => serde_json::json!({ "ok": false, "error": "navigate requires `value` (back/forward/reload)" }),
+                },
+                other => serde_json::json!({
+                    "ok": false,
+                    "error": format!("unknown batch action: {other:?}")
+                }),
+            };
+
+            let step_ok = res.get("ok").and_then(|x| x.as_bool()) == Some(true);
+            results.push(serde_json::json!({
+                "index": idx,
+                "action": action,
+                "ok": step_ok,
+                "result": res,
+            }));
+            if !step_ok {
+                if failed_index.is_none() {
+                    failed_index = Some(idx);
+                }
+                if a.stop_on_error {
+                    break;
+                }
+            }
+        }
+
+        let mut summary = serde_json::json!({
+            "ok": failed_index.is_none(),
+            "completed": results.len(),
+            "total": total,
+            "failed_index": failed_index,
+            "results": results,
+        });
+
+        if a.snapshot_after {
+            let snap = self.get_json(&format!("/api/snapshot{}", self.qs(a.tab))).await?;
+            summary["snapshot"] = snap;
+        }
+
+        let mut blocks = vec![ContentBlock::text(pretty(&summary))];
+
+        if a.screenshot_after {
+            let shot = self.screenshot(Parameters(TabArgs { tab: a.tab })).await?;
+            blocks.extend(shot.content);
+        }
+
+        if failed_index.is_some() {
+            Ok(CallToolResult::error(blocks))
+        } else {
+            Ok(CallToolResult::success(blocks))
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1040,6 +1363,7 @@ impl ServerHandler for LbMcp {
             .with_instructions(
                 "Live Browser: drive the shared browser tab. Typical loop: \
                  status -> snapshot -> click/type_text -> snapshot. \
+                 Use batch to run multiple sequential actions (e.g. click_at+insert, type_text, select, press, scroll) in one call instead of one round-trip per field; pass screenshot_after=true or snapshot_after=true to verify in the same call. \
                  Use wait after navigation instead of guessing load timing; \
                  use text/html to read page content; use screenshot when layout/coordinates matter. \
                  For logins/captchas use handover_request, poll handover_status, then snapshot again. \
@@ -1177,5 +1501,151 @@ mod screenshot_tests {
             let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, result["content"][0]["data"].as_str().unwrap()).unwrap();
             assert_eq!(decoded, bytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use axum::{
+        extract::State,
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn step(action: &str) -> BatchStep {
+        BatchStep {
+            action: action.into(),
+            target: None,
+            text: None,
+            x: None,
+            y: None,
+            coord_space: None,
+            kind: None,
+            value: None,
+            key: None,
+            dx: None,
+            dy: None,
+            submit: false,
+            append: false,
+            timeout: None,
+            gone: false,
+            ms: None,
+            js: None,
+            url: None,
+            tab: None,
+        }
+    }
+
+    async fn mock_server() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/api/click-at",
+                post(|State(log): State<Arc<Mutex<Vec<String>>>>, Json(b): Json<serde_json::Value>| async move {
+                    log.lock().unwrap().push(format!("click_at:{},{}", b["x"], b["y"]));
+                    Json(serde_json::json!({ "ok": true, "x": b["x"], "y": b["y"] }))
+                }),
+            )
+            .route(
+                "/api/insert",
+                post(|State(log): State<Arc<Mutex<Vec<String>>>>, Json(b): Json<serde_json::Value>| async move {
+                    log.lock().unwrap().push(format!("insert:{}", b["text"].as_str().unwrap_or("")));
+                    Json(serde_json::json!({ "ok": true }))
+                }),
+            )
+            .route(
+                "/api/click",
+                post(|State(log): State<Arc<Mutex<Vec<String>>>>, Json(b): Json<serde_json::Value>| async move {
+                    let t = b["target"].as_str().unwrap_or("");
+                    log.lock().unwrap().push(format!("click:{t}"));
+                    if t == "bad" {
+                        Json(serde_json::json!({ "ok": false, "error": "element not found" }))
+                    } else {
+                        Json(serde_json::json!({ "ok": true }))
+                    }
+                }),
+            )
+            .route(
+                "/api/snapshot",
+                get(|| async { Json(serde_json::json!({ "ok": true, "elements": [] })) }),
+            )
+            .with_state(log.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), log, task)
+    }
+
+    #[tokio::test]
+    async fn batch_executes_in_order_and_supports_snapshot_after() {
+        let (base, log, task) = mock_server().await;
+        let mcp = LbMcp::new(base, None, Some(2), "test".into(), false);
+
+        let mut s1 = step("click_at");
+        s1.x = Some(400.0);
+        s1.y = Some(502.0);
+        let mut s2 = step("insert");
+        s2.text = Some("Vicuna".into());
+        let mut s3 = step("click");
+        s3.target = Some("12".into());
+
+        let res = mcp
+            .batch(Parameters(BatchArgs {
+                actions: vec![s1, s2, s3],
+                tab: None,
+                stop_on_error: true,
+                snapshot_after: true,
+                screenshot_after: false,
+            }))
+            .await
+            .unwrap();
+        task.abort();
+
+        let v = serde_json::to_value(&res).unwrap();
+        assert_ne!(v["isError"], true);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["click_at:400.0,502.0", "insert:Vicuna", "click:12"]
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["completed"], 3);
+        assert_eq!(body["total"], 3);
+        assert_eq!(body["snapshot"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn batch_stops_on_first_error_by_default() {
+        let (base, log, task) = mock_server().await;
+        let mcp = LbMcp::new(base, None, None, "test".into(), false);
+
+        let mut s1 = step("click");
+        s1.target = Some("bad".into());
+        let mut s2 = step("insert");
+        s2.text = Some("never".into());
+
+        let res = mcp
+            .batch(Parameters(BatchArgs {
+                actions: vec![s1, s2],
+                tab: None,
+                stop_on_error: true,
+                snapshot_after: false,
+                screenshot_after: false,
+            }))
+            .await
+            .unwrap();
+        task.abort();
+
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["isError"], true);
+        assert_eq!(*log.lock().unwrap(), vec!["click:bad"]);
+        let body: serde_json::Value =
+            serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["completed"], 1);
+        assert_eq!(body["failed_index"], 0);
     }
 }

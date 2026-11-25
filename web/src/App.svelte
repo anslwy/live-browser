@@ -160,18 +160,27 @@
 
   function imgToPage(clientX: number, clientY: number, img: HTMLImageElement) {
     // Maps a point on the <img> to page CSS pixels, accounting for
-    // letterboxing: the image box may be taller/wider than the 4:3 frame
-    // when max-height caps it, so fit the frame inside the box first.
+    // letterboxing: the image box may be taller/wider than the frame
+    // when max-height caps it, so fit the frame inside the content box first.
+    // Use the displayed frame's actual aspect ratio (naturalWidth/naturalHeight)
+    // when available: Chrome's screencast frames can be shorter than viewH
+    // (e.g. 1280x727 inside a 1280x900 window), so object-fit: contain centers
+    // that frame rather than viewW x viewH.
     const rect = img.getBoundingClientRect();
-    if (!rect.width || !rect.height || !viewW) return null;
+    const cw = img.clientWidth || rect.width;
+    const ch = img.clientHeight || rect.height;
+    if (!cw || !ch || !viewW) return null;
     const vw = viewW;
-    const vh = viewH || viewW * 0.75;
-    const scale = Math.min(rect.width / vw, rect.height / vh);
+    const vh =
+      img.naturalWidth > 0 && img.naturalHeight > 0
+        ? (vw * img.naturalHeight) / img.naturalWidth
+        : viewH || vw * 0.75;
+    const scale = Math.min(cw / vw, ch / vh);
     if (!isFinite(scale) || scale <= 0) return null;
     const fw = vw * scale;
     const fh = vh * scale;
-    const ox = rect.left + (rect.width - fw) / 2;
-    const oy = rect.top + (rect.height - fh) / 2;
+    const ox = rect.left + img.clientLeft + (cw - fw) / 2;
+    const oy = rect.top + img.clientTop + (ch - fh) / 2;
     const x = ((clientX - ox) / fw) * vw;
     const y = ((clientY - oy) / fh) * vh;
     if (x < 0 || y < 0 || x > vw || y > vh) return null; // clicked a letterbox bar
@@ -820,12 +829,17 @@
   let viewportConnection: AbortController | null = null;
   let viewportRetry: ReturnType<typeof setTimeout> | undefined;
   let shotImg: HTMLImageElement | null = null;
-  let imgBox = { w: 0, h: 0 };
+  let imgBox = { w: 0, h: 0, nw: 0, nh: 0 };
 
   function measureShot() {
     if (!shotImg) return;
     const r = shotImg.getBoundingClientRect();
-    imgBox = { w: r.width, h: r.height };
+    imgBox = {
+      w: shotImg.clientWidth || r.width,
+      h: shotImg.clientHeight || r.height,
+      nw: shotImg.naturalWidth,
+      nh: shotImg.naturalHeight,
+    };
   }
 
   // Fake cursor position as % of the <img> box (mirrors imgToPage's fit math).
@@ -835,7 +849,10 @@
     if (!c || !c.at || c.by === 'human' || !imgBox.w || !imgBox.h || !viewW) return null;
     if (Date.now() - c.at > 8000) return null;
     const vw = viewW;
-    const vh = viewH || viewW * 0.75;
+    const vh =
+      imgBox.nw > 0 && imgBox.nh > 0
+        ? (vw * imgBox.nh) / imgBox.nw
+        : viewH || vw * 0.75;
     const scale = Math.min(imgBox.w / vw, imgBox.h / vh);
     if (!isFinite(scale) || scale <= 0) return null;
     const fw = vw * scale;
