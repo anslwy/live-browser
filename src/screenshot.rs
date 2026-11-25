@@ -2,7 +2,14 @@
 use anyhow::{bail, Context, Result};
 use image::ImageFormat;
 
-pub(crate) fn validate(bytes: &[u8]) -> Result<&'static str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidatedImage {
+    pub mime: &'static str,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub(crate) fn validate_with_dimensions(bytes: &[u8]) -> Result<ValidatedImage> {
     if bytes.is_empty() {
         bail!("empty screenshot data");
     }
@@ -26,32 +33,68 @@ pub(crate) fn validate(bytes: &[u8]) -> Result<&'static str> {
     // Use the reader's default allocation limits for untrusted HTTP payloads.
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
     reader.limits(image::Limits::default());
-    reader.decode().context("corrupted screenshot data")?;
-    Ok(mime)
+    let img = reader.decode().context("corrupted screenshot data")?;
+    Ok(ValidatedImage {
+        mime,
+        width: img.width(),
+        height: img.height(),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn validate(bytes: &[u8]) -> Result<&'static str> {
+    validate_with_dimensions(bytes).map(|v| v.mime)
 }
 
 /// Reject HTTP errors even if their bodies happen to contain valid images.
-pub(crate) fn validate_response(status: reqwest::StatusCode, bytes: &[u8]) -> Result<&'static str> {
+pub(crate) fn validate_response_with_dimensions(
+    status: reqwest::StatusCode,
+    bytes: &[u8],
+) -> Result<ValidatedImage> {
     if !status.is_success() {
         let detail: String = String::from_utf8_lossy(bytes).chars().take(500).collect();
         bail!("screenshot HTTP {status}: {detail}");
     }
-    validate(bytes)
+    validate_with_dimensions(bytes)
+}
+
+/// Reject HTTP errors even if their bodies happen to contain valid images.
+#[cfg(test)]
+pub(crate) fn validate_response(status: reqwest::StatusCode, bytes: &[u8]) -> Result<&'static str> {
+    validate_response_with_dimensions(status, bytes).map(|v| v.mime)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn capture(format: ImageFormat) -> Vec<u8> {
+    fn capture_sized(format: ImageFormat, w: u32, h: u32) -> Vec<u8> {
         let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
-            2,
-            2,
+            w,
+            h,
             image::Rgb([1, 2, 3]),
         ));
         let mut out = std::io::Cursor::new(Vec::new());
         image.write_to(&mut out, format).unwrap();
         out.into_inner()
+    }
+
+    fn capture(format: ImageFormat) -> Vec<u8> {
+        capture_sized(format, 2, 2)
+    }
+
+    #[test]
+    fn reports_exact_dimensions_for_png_and_jpeg() {
+        for (format, mime) in [
+            (ImageFormat::Png, "image/png"),
+            (ImageFormat::Jpeg, "image/jpeg"),
+        ] {
+            for (w, h) in [(2, 2), (320, 180), (1170, 2532)] {
+                let bytes = capture_sized(format, w, h);
+                let img = validate_with_dimensions(&bytes).unwrap();
+                assert_eq!(img, ValidatedImage { mime, width: w, height: h });
+            }
+        }
     }
 
     #[test]

@@ -130,9 +130,9 @@ async fn main() -> Result<()> {
             let kind = if double { "double" } else if right { "right" } else { "single" };
             client::click(&server, pass, &target, kind, tab, json).await
         }
-        Commands::ClickAt { x, y, double, right, json } => {
+        Commands::ClickAt { x, y, coord_space, double, right, json } => {
             let kind = if double { "double" } else if right { "right" } else { "single" };
-            client::click_at(&server, pass, x, y, kind, tab, json).await
+            client::click_at(&server, pass, x, y, &coord_space, kind, tab, json).await
         }
         Commands::Hover { x, y, on, json } => client::hover(&server, pass, x, y, on.as_deref(), tab, json).await,
         Commands::Scroll { dx, dy, json } => client::scroll(&server, pass, dx, dy, tab, json).await,

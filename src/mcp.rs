@@ -178,10 +178,13 @@ pub struct ClickArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ClickAtArgs {
-    /// Viewport X in CSS pixels.
+    /// X coordinate in `coord_space` (CSS pixels by default; screenshot pixels for "image"; 0.0..=1.0 for "normalized").
     pub x: f64,
-    /// Viewport Y in CSS pixels.
+    /// Y coordinate in `coord_space` (CSS pixels by default; screenshot pixels for "image"; 0.0..=1.0 for "normalized").
     pub y: f64,
+    /// Coordinate space: "css" (default, viewport CSS pixels), "image" (screenshot pixel coordinates), or "normalized" (0.0..=1.0).
+    #[serde(default)]
+    pub coord_space: Option<String>,
     /// "single" (default), "double" or "right".
     #[serde(default)]
     pub kind: Option<String>,
@@ -468,7 +471,7 @@ impl LbMcp {
     }
 
     #[tool(
-        description = "Screenshot of the current page viewport. Returns an image — call after navigation or when the snapshot is ambiguous."
+        description = "Screenshot of the current page viewport. Returns an image plus its exact pixel dimensions, CSS viewport dimensions, DPR, and coordinate mapping for click_at — call after navigation or when the snapshot is ambiguous."
     )]
     async fn screenshot(
         &self,
@@ -478,12 +481,38 @@ impl LbMcp {
         let result = async {
             let res = self.auth(self.http.get(&url)).send().await?;
             let status = res.status();
+            let headers = res.headers().clone();
             let bytes = res.bytes().await?;
-            let mime = crate::screenshot::validate_response(status, &bytes)?;
+            let img = crate::screenshot::validate_response_with_dimensions(status, &bytes)?;
+            let vp_w = headers
+                .get("x-lb-viewport-width")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(img.width);
+            let vp_h = headers
+                .get("x-lb-viewport-height")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(img.height);
+            let dpr = headers
+                .get("x-lb-dpr")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("1");
             let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+            let meta = format!(
+                "screenshot ({} bytes, {}) | image: {}x{}px | viewport: {}x{} CSS px (dpr={dpr}) | click_at coord_space: \"image\" (0..{}, 0..{}), \"css\" (0..{vp_w}, 0..{vp_h}, default), or \"normalized\" (0..1, 0..1)",
+                bytes.len(),
+                img.mime,
+                img.width,
+                img.height,
+                vp_w,
+                vp_h,
+                img.width,
+                img.height,
+            );
             Ok::<_, anyhow::Error>(CallToolResult::success(vec![
-                ContentBlock::image(b64, mime),
-                ContentBlock::text(format!("screenshot ({} bytes, {mime})", bytes.len())),
+                ContentBlock::image(b64, img.mime),
+                ContentBlock::text(meta),
             ]))
         }.await;
         Ok(result.unwrap_or_else(|e| CallToolResult::error(vec![
@@ -507,7 +536,9 @@ impl LbMcp {
         Ok(Self::daemon_result(v))
     }
 
-    #[tool(description = "Click at viewport coordinates in CSS pixels. Set kind to double/right for double- or right-click.")]
+    #[tool(
+        description = "Click at viewport or screenshot coordinates. Use coord_space=\"image\" for pixel coordinates directly from a screenshot (automatically scaled for DPR/HiDPI), \"normalized\" for (0..1, 0..1), or \"css\" (default) for CSS viewport pixels. Returns the resolved CSS (x, y) and hit element summary so you can verify the target. Set kind to double/right for double- or right-click."
+    )]
     async fn click_at(
         &self,
         Parameters(a): Parameters<ClickAtArgs>,
@@ -515,7 +546,13 @@ impl LbMcp {
         let v = self
             .post_json(
                 "/api/click-at",
-                serde_json::json!({ "x": a.x, "y": a.y, "kind": a.kind.unwrap_or_else(|| "single".into()), "tab": self.tab(a.tab) }),
+                serde_json::json!({
+                    "x": a.x,
+                    "y": a.y,
+                    "coord_space": a.coord_space.unwrap_or_else(|| "css".into()),
+                    "kind": a.kind.unwrap_or_else(|| "single".into()),
+                    "tab": self.tab(a.tab),
+                }),
             )
             .await?;
         Ok(Self::daemon_result(v))
