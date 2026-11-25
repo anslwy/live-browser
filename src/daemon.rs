@@ -1032,7 +1032,14 @@ fn spawn_dialog_guard(page: Page, log: Arc<Mutex<Vec<LogEntry>>>, tab_id: u32) {
 // Snapshot / interaction JS
 // ---------------------------------------------------------------------------
 
-const SNAPSHOT_JS: &str = r#"(() => {
+/// Snapshot collector, run once per document context:
+/// `(start, max, dx, dy, label) => { elements, next, xo }`. Tags up to `max`
+/// interactive elements with sequential `data-lb-ref`s from `start` (in this
+/// document and its same-origin iframes), offsetting coordinates by
+/// `(dx, dy)` — the frame's position in the top-level viewport. `xo` counts
+/// iframes whose document is inaccessible (cross-origin): when non-zero the
+/// daemon walks OOPIF sessions too (see `oopif.rs`).
+const SNAPSHOT_FN: &str = r#"((start, max, dx0, dy0, label) => {
   document.querySelectorAll('[data-lb-ref]').forEach(e => e.removeAttribute('data-lb-ref'));
   // data-lb-* inside same-origin iframes is namespaced per frame so a ref
   // query can be resolved without collisions.
@@ -1046,9 +1053,10 @@ const SNAPSHOT_JS: &str = r#"(() => {
   } catch (e) {}
   const SELECTOR = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [onclick], summary';
   const out = [];
-  let ref = 1;
+  let ref = start;
+  let xo = 0;
   const push = (el, frame, dx, dy) => {
-    if (out.length >= 200) return;
+    if (out.length >= max) return;
     try {
       const rect = el.getBoundingClientRect();
       const style = (el.ownerDocument.defaultView || window).getComputedStyle(el);
@@ -1085,21 +1093,106 @@ const SNAPSHOT_JS: &str = r#"(() => {
       ref++;
     } catch (e) {}
   };
-  document.querySelectorAll(SELECTOR).forEach(el => push(el, '', 0, 0));
+  document.querySelectorAll(SELECTOR).forEach(el => push(el, label, dx0, dy0));
   // Same-origin iframes: cross-origin frames throw on contentDocument access
-  // and are skipped (their elements still work via lb click-at with UI coords).
+  // and are counted in `xo` (the daemon reaches them via OOPIF sessions).
   try {
     document.querySelectorAll('iframe').forEach((f, i) => {
       try {
         const d = f.contentDocument;
-        if (!d) return;
+        if (!d) { xo++; return; }
         const r = f.getBoundingClientRect();
-        d.querySelectorAll(SELECTOR).forEach(el => push(el, 'iframe[' + i + ']', r.left, r.top));
-      } catch (e) { /* cross-origin: skip */ }
+        const ox = dx0 + r.left + f.clientLeft, oy = dy0 + r.top + f.clientTop;
+        const sub = (label ? label + ' > ' : '') + 'iframe[' + i + ']';
+        d.querySelectorAll(SELECTOR).forEach(el => push(el, sub, ox, oy));
+        d.querySelectorAll('iframe').forEach(g => { try { if (!g.contentDocument) xo++; } catch (e) { xo++; } });
+      } catch (e) { xo++; }
     });
   } catch (e) {}
-  return out;
-})()"#;
+  return { elements: out, next: ref, xo: xo };
+})"#;
+
+/// Max elements per snapshot (all frames together).
+const SNAPSHOT_MAX: usize = 200;
+
+/// Top-document snapshot call (refs from 1).
+fn main_snapshot_js() -> String {
+    format!("{SNAPSHOT_FN}(1, {SNAPSHOT_MAX}, 0, 0, '')")
+}
+
+/// Frame-local `(ref) => [x, y] | null`: scrolls the tagged element into
+/// view (this document or a same-origin child iframe) and returns its center
+/// in this frame's viewport. Used for refs inside OOPIFs.
+const LOCATE_REF_JS: &str = r#"((want) => {
+  const sel = '[data-lb-ref="' + want + '"]';
+  const pick = () => {
+    let el = document.querySelector(sel);
+    if (el) return [el, null];
+    for (const f of document.querySelectorAll('iframe')) {
+      try { const d = f.contentDocument; const hit = d && d.querySelector(sel); if (hit) return [hit, f]; } catch (e) {}
+    }
+    return null;
+  };
+  const hit = pick();
+  if (!hit) return null;
+  const [el, f] = hit;
+  if (f) f.scrollIntoView({ block: 'center', inline: 'center' });
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  const r = el.getBoundingClientRect();
+  let dx = 0, dy = 0;
+  if (f) { const fr = f.getBoundingClientRect(); dx = fr.left + f.clientLeft; dy = fr.top + f.clientTop; }
+  return [r.left + r.width / 2 + dx, r.top + r.height / 2 + dy];
+})"#;
+
+/// `(sel, text, append) => { value } | { error }`: React-safe value set for
+/// inputs/textareas (native prototype setter + input/change events). The
+/// fallback when trusted text insertion didn't land inside an OOPIF.
+const SET_VALUE_JS: &str = r#"((sel, text, append) => {
+  let el = document.querySelector(sel);
+  if (!el) for (const f of document.querySelectorAll('iframe')) { try { el = f.contentDocument && f.contentDocument.querySelector(sel); if (el) break; } catch (e) {} }
+  if (!el) return { error: 'not-found' };
+  if (el.isContentEditable) {
+    el.focus();
+    el.textContent = (append ? el.textContent : '') + text;
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+    return { value: el.textContent };
+  }
+  if (!('value' in el)) return { error: 'not a text field' };
+  const proto = Object.getPrototypeOf(el);
+  const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+  const next = (append ? String(el.value) : '') + text;
+  el.focus();
+  if (desc && desc.set) desc.set.call(el, next); else el.value = next;
+  el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return { value: String(el.value) };
+})"#;
+
+/// `(sel) => string | null`: current value/text of a tagged field.
+const READ_VALUE_JS: &str = r#"((sel) => {
+  let el = document.querySelector(sel);
+  if (!el) for (const f of document.querySelectorAll('iframe')) { try { el = f.contentDocument && f.contentDocument.querySelector(sel); if (el) break; } catch (e) {} }
+  if (!el) return null;
+  return 'value' in el ? String(el.value) : String(el.textContent || '');
+})"#;
+
+/// `(sel, want) => { value, text } | { error }`: choose a `<select>` option by
+/// value or visible text (case-insensitive fallback) via the native setter,
+/// firing input/change like a real pick — native popups never open.
+const SELECT_SET_JS: &str = r#"((sel, want) => {
+  let el = document.querySelector(sel);
+  if (!el) for (const f of document.querySelectorAll('iframe')) { try { el = f.contentDocument && f.contentDocument.querySelector(sel); if (el) break; } catch (e) {} }
+  if (!el || el.tagName !== 'SELECT') return { error: 'not a select element' };
+  const wantLc = String(want).toLowerCase();
+  const opt = Array.from(el.options).find(o =>
+    o.value === want || o.text.trim() === want || o.value.toLowerCase() === wantLc || o.text.trim().toLowerCase() === wantLc);
+  if (!opt) return { error: 'no such option: ' + want };
+  const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value');
+  if (desc && desc.set) desc.set.call(el, opt.value); else el.value = opt.value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return { value: opt.value, text: opt.text.trim() };
+})"#;
 
 /// Resolve a snapshot ref to viewport coordinates, searching the main
 /// document *and* same-origin iframes. Used as the fallback when a
@@ -1166,15 +1259,17 @@ const WAIT_PROBE_PREFIX: &str = r#"((target) => {
   } else {
     sel = sel.slice(4);
   }
-  if (document.querySelector(sel)) return true;
+  let xo = 0;
+  if (document.querySelector(sel)) return { hit: true, xo: 0 };
   const frames = document.querySelectorAll('iframe');
   for (let i = 0; i < frames.length; i++) {
     try {
       const d = frames[i].contentDocument;
-      if (d && d.querySelector(sel)) return true;
-    } catch (e) {}
+      if (!d) { xo++; continue; }
+      if (d.querySelector(sel)) return { hit: true, xo: 0 };
+    } catch (e) { xo++; }
   }
-  return false;
+  return { hit: false, xo: xo };
 })"#;
 
 /// Resolve a CLI target to a CSS selector.
@@ -1779,6 +1874,94 @@ async fn open_navigate(s: &AppState, tab_id: u32, page: Page, url: &str) -> Json
     err(format!("goto failed after 3 attempts (network flapping?): {last_err}"))
 }
 
+/// Budget for discovering + snapshotting cross-origin iframes.
+const OOPIF_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Result of a full snapshot: top document + same-origin iframes + OOPIFs.
+struct Snap {
+    elements: Vec<serde_json::Value>,
+    /// Attached cross-origin frames (None when the page has none).
+    oopifs: Option<crate::oopif::Oopifs>,
+}
+
+impl Snap {
+    /// OOPIF index owning a numeric ref target (None for main-frame refs).
+    fn oopif_owner(&self, target: &str) -> Option<(usize, u32)> {
+        let r = target.trim().parse::<u32>().ok()?;
+        let o = self.oopifs.as_ref()?;
+        crate::oopif::owner_of(&o.frames, r).map(|i| (i, r))
+    }
+}
+
+/// Tag and collect interactive elements across the top document, its
+/// same-origin iframes and every cross-origin (OOPIF) iframe. Refs are one
+/// sequence: main frame first, then OOPIFs in discovery (DFS) order.
+async fn snapshot_all(s: &AppState, page: &Page) -> Result<Snap, String> {
+    let js = main_snapshot_js();
+    let v: serde_json::Value = match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(js.as_str())).await {
+        Ok(Ok(eval)) => eval.into_value().map_err(|e| format!("decode snapshot failed: {e:#}"))?,
+        Ok(Err(e)) => return Err(friendly_cdp_error(s.port, "snapshot failed (page still loading?)", e)),
+        Err(_) => return Err(format!("snapshot timed out after {}s", CDP_TIMEOUT.as_secs())),
+    };
+    let mut elements = v.get("elements").and_then(|e| e.as_array()).cloned().unwrap_or_default();
+    let next = v.get("next").and_then(|n| n.as_u64()).unwrap_or(1) as u32;
+    if v.get("xo").and_then(|n| n.as_u64()).unwrap_or(0) == 0 {
+        return Ok(Snap { elements, oopifs: None });
+    }
+    let oopifs = match attach_oopifs(s, page).await {
+        Some(mut o) => {
+            let budget = SNAPSHOT_MAX.saturating_sub(elements.len());
+            match tokio::time::timeout(OOPIF_TIMEOUT, o.snapshot(SNAPSHOT_FN, next, budget)).await {
+                Ok(more) => elements.extend(more),
+                Err(_) => tracing::warn!("cross-origin iframe snapshot timed out"),
+            }
+            Some(o)
+        }
+        None => None,
+    };
+    Ok(Snap { elements, oopifs })
+}
+
+/// Open a private CDP connection and attach to the tab's OOPIFs.
+async fn attach_oopifs(s: &AppState, page: &Page) -> Option<crate::oopif::Oopifs> {
+    let ws = s.browser.lock().await.websocket_address().clone();
+    let target = page.target_id().as_ref().to_string();
+    match tokio::time::timeout(OOPIF_TIMEOUT, crate::oopif::discover(&ws, &target)).await {
+        Ok(Ok(o)) if !o.frames.is_empty() => Some(o),
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => {
+            tracing::debug!("cross-origin iframe discovery failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("cross-origin iframe discovery timed out");
+            None
+        }
+    }
+}
+
+/// Top-level viewport point of OOPIF ref `r` (scrolled into view).
+async fn oopif_point(o: &mut crate::oopif::Oopifs, idx: usize, r: u32) -> Result<(f64, f64), String> {
+    match tokio::time::timeout(OOPIF_TIMEOUT, o.element_point(idx, LOCATE_REF_JS, r)).await {
+        Ok(res) => res,
+        Err(_) => Err("timed out locating element inside cross-origin iframe".into()),
+    }
+}
+
+/// Click (single/double/right) at a top-level viewport point.
+async fn click_point(page: &Page, kind: &str, point: chromiumoxide::layout::Point) -> Result<(), String> {
+    if kind == "double" {
+        page.click_with(point, chromiumoxide::types::ClickOptions::builder().click_count(2).build())
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+    } else if kind == "right" {
+        right_click_point(page, point).await
+    } else {
+        page.click(point).await.map(|_| ()).map_err(|e| format!("{e:#}"))
+    }
+}
+
 async fn api_snapshot(
     State(s): State<AppState>,
     Query(q): Query<TabQuery>,
@@ -1786,19 +1969,31 @@ async fn api_snapshot(
     let (tab_id, page) = tab!(&s, q.tab);
     let url = page_url(&page).await;
     let title = page_title(&page).await;
-    match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await {
-        Ok(Ok(eval)) => match eval.into_value::<serde_json::Value>() {
-            Ok(elements) => Json(serde_json::json!({
-                "ok": true, "tab": tab_id, "url": url, "title": title, "elements": elements,
+    match snapshot_all(&s, &page).await {
+        Ok(snap) => {
+            let mut out = serde_json::json!({
+                "ok": true, "tab": tab_id, "url": url, "title": title, "elements": snap.elements,
                 "hint": "click with `lb click <ref>`, type with `lb type <ref> <text>`. Re-run snapshot after navigation."
-            })),
-            Err(e) => err(format!("decode snapshot failed: {e:#}")),
-        },
-        Ok(Err(e)) => err(friendly_cdp_error(s.port, "snapshot failed (page still loading?)", e)),
-        Err(_) => err(format!(
+            });
+            if let Some(o) = &snap.oopifs {
+                out["frames"] = o
+                    .frames
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| serde_json::json!({
+                        "frame": crate::oopif::frame_label(i, &f.url), "url": f.url,
+                        "offset": [f.offset.0, f.offset.1],
+                        "refs": if f.ref_count > 0 { serde_json::json!([f.first_ref, f.first_ref + f.ref_count - 1]) } else { serde_json::Value::Null },
+                    }))
+                    .collect();
+            }
+            Json(out)
+        }
+        Err(e) if e.contains("timed out") => err(format!(
             "snapshot timed out after {}s — the page may be stuck (heavy load, infinite loop). Try `lb reload --tab {tab_id}` (global --tab flag) or `lb eval` instead",
             CDP_TIMEOUT.as_secs()
         )),
+        Err(e) => err(e),
     }
 }
 
@@ -2112,12 +2307,23 @@ async fn api_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> Json<s
     let label = if kind == "single" { String::new() } else { format!(" [{kind}]") };
     // Ensure refs exist (snapshot tags elements) — but only for numeric refs.
     // Raw `css=` selectors don't need DOM re-tagging; skipping the full
-    // SNAPSHOT_JS scan here saves a costly layout-forcing evaluate.
+    // snapshot scan here saves a costly layout-forcing evaluate.
     let snapshot_ref = b.target.trim().parse::<u32>().is_ok();
-    if snapshot_ref {
-        let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
-    }
+    let mut snap = if snapshot_ref { snapshot_all(&s, &page).await.ok() } else { None };
     let do_click = async {
+        // Ref inside a cross-origin iframe: locate it in the frame's own
+        // session, translate to top-level coordinates and click there
+        // (Chrome hit-tests the click into the OOPIF).
+        if let Some((idx, r)) = snap.as_ref().and_then(|sn| sn.oopif_owner(&b.target)) {
+            let o = snap.as_mut().and_then(|sn| sn.oopifs.as_mut()).unwrap();
+            let (x, y) = oopif_point(o, idx, r).await?;
+            s.set_cursor(tab_id, x, y, "click", &b.by).await;
+            click_point(&page, &kind, chromiumoxide::layout::Point::new(x, y))
+                .await
+                .map_err(|e| friendly_cdp_error(s.port, "click failed", e))?;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            return Ok(format!("clicked {sel}{label} (inside cross-origin iframe)"));
+        }
         match page.find_element(&sel).await {
             Ok(el) => {
                 // Report the click point for the UI's fake cursor.
@@ -2160,14 +2366,7 @@ async fn api_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> Json<s
                     Some((x, y)) => {
                         s.set_cursor(tab_id, x, y, "click", &b.by).await;
                         let point = chromiumoxide::layout::Point::new(x, y);
-                        let res: Result<(), String> = if kind == "double" {
-                            page.click_with(point, chromiumoxide::types::ClickOptions::builder().click_count(2).build()).await.map(|_| ()).map_err(|e| format!("{e:#}"))
-                        } else if kind == "right" {
-                            right_click_point(&page, point).await
-                        } else {
-                            page.click(point).await.map(|_| ()).map_err(|e| format!("{e:#}"))
-                        };
-                        match res {
+                        match click_point(&page, &kind, point).await {
                             Ok(_) => {
                                 tokio::time::sleep(Duration::from_millis(150)).await;
                                 Ok(format!("clicked {sel}{label} (via coordinates — element is inside an iframe)"))
@@ -2267,8 +2466,13 @@ async fn api_type(State(s): State<AppState>, Json(b): Json<TypeReq>) -> Json<ser
     s.push_log("type", &format!("{sel} <- {:?}", b.text));
     s.mark_action(tab_id, "type").await;
     let run = async {
-        if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
-            let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
+        if b.target.trim().parse::<u32>().is_ok() {
+            if let Ok(mut snap) = snapshot_all(&s, &page).await {
+                if let Some((idx, r)) = snap.oopif_owner(&b.target) {
+                    let o = snap.oopifs.as_mut().unwrap();
+                    return type_in_oopif(&s, tab_id, &page, o, idx, r, &b).await;
+                }
+            }
         }
         match page.find_element(&sel).await {
             Ok(el) => type_into_element(&page, &el, &sel, &b.text, b.submit, b.append).await,
@@ -2307,6 +2511,65 @@ async fn api_type(State(s): State<AppState>, Json(b): Json<TypeReq>) -> Json<ser
             CDP_TIMEOUT.as_secs()
         )),
     }
+}
+
+/// Type into ref `r` inside cross-origin iframe `idx`: a trusted click
+/// focuses the frame + field, the field is cleared in the frame's JS
+/// context, then text goes in as trusted `Input.insertText` (real `input`
+/// events, so React/controlled inputs see it). If the value didn't land
+/// (e.g. a widget swallowing synthetic focus), fall back to the native value
+/// setter + input/change events inside the frame.
+async fn type_in_oopif(
+    s: &AppState,
+    tab_id: u32,
+    page: &Page,
+    o: &mut crate::oopif::Oopifs,
+    idx: usize,
+    r: u32,
+    b: &TypeReq,
+) -> Result<String, String> {
+    let (x, y) = oopif_point(o, idx, r).await?;
+    s.set_cursor(tab_id, x, y, "click", "").await;
+    page.click(chromiumoxide::layout::Point::new(x, y))
+        .await
+        .map_err(|e| friendly_cdp_error(s.port, "focus failed", e))?;
+    let sel = format!("[data-lb-ref=\"{r}\"]");
+    let sel_js = serde_json::to_string(&sel).unwrap();
+    let before = if b.append {
+        o.eval(idx, &format!("{READ_VALUE_JS}({sel_js})")).await.ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let focus = o
+        .eval(idx, &format!("{FOCUS_REF_JS}({}, {})", serde_json::to_string(&r.to_string()).unwrap(), !b.append))
+        .await?;
+    if focus.as_str() != Some("ok") {
+        return Err(format!("element not found for `{sel}` inside cross-origin iframe (run `lb snapshot` first)"));
+    }
+    let mut how = "";
+    if insert_text(page, &b.text).await.is_err() {
+        how = " (value set)";
+    }
+    let now = o
+        .eval(idx, &format!("{READ_VALUE_JS}({sel_js})"))
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(String::from));
+    let want = format!("{before}{}", b.text);
+    if matches!(&now, Some(v) if *v != want) || !how.is_empty() {
+        let res = o
+            .eval(idx, &format!("{SET_VALUE_JS}({sel_js}, {}, {})", serde_json::to_string(&b.text).unwrap(), b.append))
+            .await?;
+        if let Some(e) = res.get("error").and_then(|e| e.as_str()) {
+            return Err(format!("type failed inside cross-origin iframe: {e}"));
+        }
+        how = " (value set)";
+    }
+    if b.submit {
+        press_enter(page).await?;
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    Ok(format!("typed into {sel} (inside cross-origin iframe){how}"))
 }
 
 /// Core keystroke path for an already-resolved main-frame element.
@@ -3083,23 +3346,34 @@ async fn api_select(State(s): State<AppState>, Json(b): Json<SelectReq>) -> Json
     let (tab_id, page) = tab!(&s, b.tab);
     s.push_log("select", &format!("{sel} <- {:?}", b.value));
     s.mark_action(tab_id, "select").await;
-    if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
-        let _ = page.evaluate(SNAPSHOT_JS).await;
+    if b.target.trim().parse::<u32>().is_ok() {
+        if let Ok(mut snap) = snapshot_all(&s, &page).await {
+            if let Some((idx, r)) = snap.oopif_owner(&b.target) {
+                // Inside a cross-origin iframe: set it in the frame's own JS
+                // context — the native popup never opens.
+                let o = snap.oopifs.as_mut().unwrap();
+                let call = format!(
+                    "{SELECT_SET_JS}({}, {})",
+                    serde_json::to_string(&format!("[data-lb-ref=\"{r}\"]")).unwrap(),
+                    serde_json::to_string(&b.value).unwrap()
+                );
+                return match tokio::time::timeout(OOPIF_TIMEOUT, o.eval(idx, &call)).await {
+                    Ok(Ok(v)) => match v.get("error").and_then(|x| x.as_str()) {
+                        Some(e) => err(format!("select failed inside cross-origin iframe: {e}")),
+                        None => {
+                            tokio::time::sleep(Duration::from_millis(120)).await;
+                            Json(serde_json::json!({ "ok": true,
+                                "message": format!("selected {:?} (inside cross-origin iframe)", v.get("text").and_then(|x| x.as_str()).unwrap_or(&b.value)) }))
+                        }
+                    },
+                    Ok(Err(e)) => err(format!("select failed inside cross-origin iframe: {e}")),
+                    Err(_) => err("select timed out inside cross-origin iframe".into()),
+                };
+            }
+        }
     }
-    const SET_JS: &str = r#"((sel, want) => {
-      const el = document.querySelector(sel);
-      if (!el || el.tagName !== 'SELECT') return { error: 'not a select element' };
-      const wantLc = String(want).toLowerCase();
-      const opt = Array.from(el.options).find(o =>
-        o.value === want || o.text.trim() === want || o.value.toLowerCase() === wantLc || o.text.trim().toLowerCase() === wantLc);
-      if (!opt) return { error: 'no such option: ' + want };
-      el.value = opt.value;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return { value: opt.value, text: opt.text.trim() };
-    })"#;
     let call = format!(
-        "{SET_JS}({}, {})",
+        "{SELECT_SET_JS}({}, {})",
         serde_json::to_string(&sel).unwrap(),
         serde_json::to_string(&b.value).unwrap()
     );
@@ -3440,10 +3714,32 @@ async fn api_wait(State(s): State<AppState>, Json(b): Json<WaitReq>) -> Json<ser
     let start = tokio::time::Instant::now();
     let wait = async {
         // Tag refs first so waiting on a snapshot ref works right after navigation.
-        let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
+        // Keep the OOPIF connection from that snapshot for probing; refresh
+        // it periodically so frames that load later are found too.
+        let mut oopifs = snapshot_all(&s, &page).await.ok().and_then(|sn| sn.oopifs);
+        let mut last_attach = tokio::time::Instant::now();
         loop {
             let present = match tokio::time::timeout(CDP_TIMEOUT, page.evaluate(probe_js.as_str())).await {
-                Ok(Ok(ev)) => ev.into_value::<bool>().ok(),
+                Ok(Ok(ev)) => match ev.into_value::<serde_json::Value>() {
+                    Ok(v) if v.get("hit").and_then(|h| h.as_bool()) == Some(true) => Some(true),
+                    Ok(v) => {
+                        let xo = v.get("xo").and_then(|n| n.as_u64()).unwrap_or(0);
+                        if xo == 0 {
+                            oopifs = None;
+                            Some(false)
+                        } else {
+                            if oopifs.is_none() || last_attach.elapsed() > Duration::from_secs(2) {
+                                oopifs = attach_oopifs(&s, &page).await;
+                                last_attach = tokio::time::Instant::now();
+                            }
+                            match oopifs.as_mut() {
+                                Some(o) => Some(oopif_probe(o, &probe_js).await),
+                                None => Some(false),
+                            }
+                        }
+                    }
+                    Err(_) => None,
+                },
                 Ok(Err(e)) => {
                     let msg = format!("{e:#}");
                     if is_tab_gone_msg(&msg) {
@@ -3473,6 +3769,18 @@ async fn api_wait(State(s): State<AppState>, Json(b): Json<WaitReq>) -> Json<ser
             if b.gone { "disappeared" } else { "appeared" }
         )),
     }
+}
+
+/// True when the wait probe hits in any attached cross-origin frame.
+async fn oopif_probe(o: &mut crate::oopif::Oopifs, probe_js: &str) -> bool {
+    for i in 0..o.frames.len() {
+        if let Ok(Ok(v)) = tokio::time::timeout(CDP_TIMEOUT, o.eval(i, probe_js)).await {
+            if v.get("hit").and_then(|h| h.as_bool()) == Some(true) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Deserialize)]
@@ -3576,7 +3884,7 @@ async fn api_upload(State(s): State<AppState>, Json(b): Json<UploadReq>) -> Json
     s.mark_action(tab_id, "upload").await;
     let run = async {
         if !b.target.trim().starts_with("css=") && b.target.trim().parse::<u32>().is_ok() {
-            let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
+            let _ = snapshot_all(&s, &page).await;
         }
         let el = page
             .find_element(&sel)
@@ -3675,8 +3983,21 @@ async fn api_hover(State(s): State<AppState>, Json(b): Json<HoverReq>) -> Json<s
         (Some(t), _, _) => {
             let sel = target_to_selector(t);
             // Ensure refs exist (snapshot tags elements) — same as click.
-            if !t.trim().starts_with("css=") && t.trim().parse::<u32>().is_ok() {
-                let _ = tokio::time::timeout(CDP_TIMEOUT, page.evaluate(SNAPSHOT_JS)).await;
+            if t.trim().parse::<u32>().is_ok() {
+                if let Ok(mut snap) = snapshot_all(&s, &page).await {
+                    if let Some((idx, r)) = snap.oopif_owner(t) {
+                        let o = snap.oopifs.as_mut().unwrap();
+                        let (x, y) = match oopif_point(o, idx, r).await {
+                            Ok(p) => p,
+                            Err(e) => return err(e),
+                        };
+                        return match tokio::time::timeout(CDP_TIMEOUT, page.move_mouse(chromiumoxide::layout::Point::new(x, y))).await {
+                            Ok(Ok(_)) => Json(serde_json::json!({ "ok": true, "x": x, "y": y })),
+                            Ok(Err(e)) => err(friendly_cdp_error(s.port, "hover failed", e)),
+                            Err(_) => err(format!("hover timed out after {}s", CDP_TIMEOUT.as_secs())),
+                        };
+                    }
+                }
             }
             // Main-frame fast path: bounding rect via JS.
             let rect_js = format!(

@@ -233,7 +233,7 @@ Set a default server once and drop the flag: `export LB_SERVER=http://127.0.0.1:
 | `lb use <tab>` | Switch the active tab |
 | `lb snapshot [--full]` | Interactive elements as `[ref] tag "name"` (`--json` for full JSON, `--full` for type/value/frame/coords) |
 | `lb shot [--out f.jpg]` | Save a JPEG screenshot (`--out -` prints base64) |
-| `lb click <ref\|css=…> [--double\|--right]` | Click by snapshot ref or CSS selector (same-origin iframes included) |
+| `lb click <ref\|css=…> [--double\|--right]` | Click by snapshot ref or CSS selector (same- and cross-origin iframes included) |
 | `lb click-at <x> <y> [--coord-space css\|image\|normalized] [--double\|--right]` | Click at viewport CSS pixels (`css`, default), screenshot image pixels (`image`, auto-scaled for DPR), or normalized (`0..1`) coordinates; reports the resolved CSS `(x, y)` and hit element |
 | `lb hover <x> <y> \| --on <ref\|css=…>` | Move mouse (hover states, tooltips, menus) |
 | `lb type <ref> <text> [--submit] [--append]` | Type into an input (Enter with `--submit`; `--append` keeps content) |
@@ -279,8 +279,16 @@ Notes:
   `screenshot` output) so coordinate clicks with `--coord-space image` or
   `normalized` match the screenshot across HiDPI/mobile viewports.
 - **Snapshots pierce same-origin iframes** (flagged `frame=iframe[0]` in
-  `--full`/`--json`, with viewport `@x,y` coordinates). Truly cross-origin
-  frames stay invisible — use `lb click-at` with UI coordinates there.
+  `--full`/`--json`, with viewport `@x,y` coordinates).
+- **Cross-origin iframes work with normal refs too** (HubSpot, Stripe,
+  Typeform, Google Forms…). Chrome runs cross-site frames out of process
+  (OOPIF), so lb attaches a CDP session to each one, snapshots it, and keeps
+  numbering refs after the main frame. Those refs are marked
+  `[in oopif[0] https://origin]`, and `--json` adds a `frames` list (URL,
+  viewport offset, ref range). `click`, `type`, `select`, `hover`, `wait` and
+  MCP `batch` run in the owning frame: clicks go to translated top-level
+  coordinates after scrolling the iframe and element into view, and `select`
+  sets the value in the frame's JS so the native popup never opens.
 - **Downloads** land in `<profile>/downloads` (`lb downloads` lists them).
 
 ## Web UI (http://127.0.0.1:8765/ by default)

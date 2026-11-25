@@ -2,6 +2,7 @@ mod cli;
 mod client;
 mod cloak;
 mod daemon;
+mod oopif;
 mod mcp;
 mod record;
 mod screenshot;

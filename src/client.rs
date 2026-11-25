@@ -186,10 +186,17 @@ pub async fn snapshot(server: &str, passcode: Option<&str>, tab: Option<u32>, js
         let name = el.get("name").and_then(|x| x.as_str()).unwrap_or("");
         let href = el.get("href").and_then(|x| x.as_str()).unwrap_or("");
         if !full {
+            // Mark refs living in cross-origin (out-of-process) iframes.
+            let xo = el
+                .get("frame")
+                .and_then(|x| x.as_str())
+                .filter(|f| f.starts_with("oopif["))
+                .map(|f| format!("  [in {f}]"))
+                .unwrap_or_default();
             if href.is_empty() {
-                println!("[{r}] {tag} \"{name}\"");
+                println!("[{r}] {tag} \"{name}\"{xo}");
             } else {
-                println!("[{r}] {tag} \"{name}\" -- {href}");
+                println!("[{r}] {tag} \"{name}\" -- {href}{xo}");
             }
             continue;
         }
