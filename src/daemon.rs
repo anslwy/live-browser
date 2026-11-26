@@ -4503,17 +4503,66 @@ async fn api_recover(State(s): State<AppState>) -> Json<serde_json::Value> {
             &format!("recover reaped {reaped} leftover browser process(es)"),
         );
     }
-    match launch_with_page(&launch).await {
+    // A second daemon configured with the same profile keeps (re)launching
+    // its own browser on it: recover would reap it, and it would reap ours.
+    // Name it — "recover again" can't fix that, stopping one of them does.
+    let sharing = crate::webctl::daemons_sharing_profile(launch.profile.as_str(), s.port);
+    let sharing_note = if sharing.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = sharing
+            .iter()
+            .map(|(pid, port)| format!("port {port} (pid {pid})"))
+            .collect();
+        let note = format!(
+            " — warning: another lb daemon uses this same profile: {} — two daemons on one profile kill each other's browser; stop one (`lb web --port <port> stop`)",
+            list.join(", ")
+        );
+        s.push_log("browser", note.trim_start_matches(" — "));
+        note
+    };
+    let mut result = launch_with_page(&launch).await;
+    if let Err(stage) = &result {
+        // Something re-took the profile between the reap and the launch
+        // (a holder still exiting, or a sibling daemon relaunching): reap
+        // again and retry once before giving up.
+        if is_profile_locked_msg(stage) {
+            let again = crate::webctl::reap_profile_browsers(launch.profile.as_str());
+            s.push_log(
+                "browser",
+                &format!("recover: profile still locked — reaped {again} more, retrying"),
+            );
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            result = launch_with_page(&launch).await;
+        }
+    }
+    match result {
         Ok((nb, page)) => {
             let bin = launch.chrome.clone().unwrap_or_else(|| "auto-detect".into());
             install_fresh_browser(&s, &mut browser, launch.clone(), nb, page).await;
+            // Only report success once the new browser answers the same
+            // probe /api/health uses — a launch that "succeeds" but leaves
+            // the probe dead used to come back ok and the caller had no idea.
+            let alive = matches!(
+                tokio::time::timeout(TAB_PROBE_TIMEOUT, browser.pages()).await,
+                Ok(Ok(_))
+            );
+            if !alive {
+                mark_browser_dead();
+                s.push_log("browser", "recover: relaunched browser failed the health probe");
+                return err(format!(
+                    "recover relaunched the browser but it does not answer the health probe{sharing_note} — restart the daemon (`lb web --port {} restart`)",
+                    s.port
+                ));
+            }
             s.push_log("browser", &format!("recovered on {bin} (tabs reset)"));
             Json(serde_json::json!({ "ok": true,
-                "message": format!("browser relaunched on {bin} (open tabs were reset — re-open your pages)") }))
+                "browser_alive": true,
+                "message": format!("browser relaunched on {bin} (open tabs were reset — re-open your pages){sharing_note}") }))
         }
         Err(stage) => {
             mark_browser_dead();
-            err(format!("recover failed ({stage}) — try `lb web --port {} restart`", s.port))
+            err(format!("recover failed ({stage}){sharing_note} — try `lb web --port {} restart`", s.port))
         }
     }
 }

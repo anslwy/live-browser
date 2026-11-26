@@ -209,7 +209,10 @@ fn user_data_dir(args: &str) -> Option<String> {
 fn process_list() -> Vec<(u32, String)> {
     #[cfg(unix)]
     {
-        let out = Command::new("ps").args(["-eo", "pid,args"]).output();
+        // `ww`: never truncate. Chromium command lines are long and
+        // `--user-data-dir` can sit past the default column width, which
+        // made profile holders invisible to the reaper.
+        let out = Command::new("ps").args(["-ww", "-eo", "pid,args"]).output();
         let out = match out {
             Ok(o) if o.status.success() => o,
             _ => return vec![],
@@ -257,6 +260,59 @@ pub(crate) fn reap_profile_browsers(profile: &str) -> usize {
         }
     }
     killed
+}
+
+/// `(port, profile)` of an `lb web` daemon command line, `None` for anything
+/// else (browsers, `lb web … stop`/`kill`/`status` control calls, or a daemon
+/// without an explicit `--profile`).
+pub(crate) fn lb_daemon_port_profile(args: &str) -> Option<(u16, String)> {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    let bin = toks.first()?.rsplit(['/', '\\']).next()?;
+    let bin = bin.trim_end_matches(".exe");
+    if !(bin == "lb" || bin.starts_with("lb-")) {
+        return None;
+    }
+    let web = toks.iter().position(|t| *t == "web")?;
+    let rest = &toks[web + 1..];
+    if rest.iter().any(|t| matches!(*t, "stop" | "kill" | "status" | "restart")) {
+        return None;
+    }
+    let value = |flag: &str| -> Option<String> {
+        let eq = format!("{flag}=");
+        let mut it = rest.iter();
+        while let Some(t) = it.next() {
+            if let Some(v) = t.strip_prefix(eq.as_str()) {
+                return Some(v.to_string());
+            }
+            if *t == flag {
+                return it.next().map(|v| v.to_string());
+            }
+        }
+        None
+    };
+    let port = value("--port")?.parse().ok()?;
+    Some((port, value("--profile")?))
+}
+
+/// Same profile pair? (`X` and `X-cloak` belong to one daemon.)
+fn same_profile_pair(a: &str, b: &str) -> bool {
+    let norm = |p: &str| p.trim_end_matches('/').trim_end_matches("-cloak").to_string();
+    norm(a) == norm(b)
+}
+
+/// Other live `lb web` daemons (pid, port) configured with the same profile
+/// (pair) as ours. Two daemons on one profile fight over its SingletonLock:
+/// each relaunch/recover reaps the other's browser, so neither stays up.
+pub(crate) fn daemons_sharing_profile(profile: &str, my_port: u16) -> Vec<(u32, u16)> {
+    let me = std::process::id();
+    process_list()
+        .into_iter()
+        .filter(|(pid, _)| *pid != me)
+        .filter_map(|(pid, args)| {
+            let (port, prof) = lb_daemon_port_profile(&args)?;
+            (port != my_port && same_profile_pair(&prof, profile)).then_some((pid, port))
+        })
+        .collect()
 }
 
 /// Both profile dirs one daemon may own: the base and its `-cloak` sibling
@@ -705,6 +761,23 @@ pub fn start_background(args: &DaemonArgs) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn daemon_port_profile_parsing() {
+        use super::lb_daemon_port_profile as f;
+        let p = "/Users/a/Library/Caches/live-browser/profile-vicuna";
+        assert_eq!(
+            f(&format!("/App/lb-sidecar/lb-arm64 web --port 18766 --foreground --profile {p}")),
+            Some((18766, p.to_string()))
+        );
+        assert_eq!(f(&format!("lb web --port=8765 --profile={p}")), Some((8765, p.to_string())));
+        // control calls, browsers and profile-less daemons don't count
+        assert_eq!(f(&format!("lb web --port 18766 --profile {p} stop")), None);
+        assert_eq!(f(&format!("/x/Chromium --user-data-dir={p} web --port 1 --profile {p}")), None);
+        assert_eq!(f("lb web --port 8765"), None);
+        assert!(super::same_profile_pair(p, &format!("{p}-cloak")));
+        assert!(!super::same_profile_pair(p, &format!("{p}-18766")));
+    }
+
     use super::*;
 
     #[test]
