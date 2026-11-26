@@ -131,6 +131,22 @@ impl LbMcp {
     }
 }
 
+/// Combine a successful `/api/recover` reply with the follow-up health probe.
+fn recover_outcome(recover: serde_json::Value, health: serde_json::Value) -> CallToolResult {
+    let alive = health.get("browser_alive").and_then(|x| x.as_bool()) == Some(true);
+    if alive {
+        let mut v = recover;
+        v["health"] = health;
+        CallToolResult::success(vec![ContentBlock::text(pretty(&v))])
+    } else {
+        let msg = recover.get("message").and_then(|x| x.as_str()).unwrap_or("");
+        CallToolResult::error(vec![ContentBlock::text(format!(
+            "error: recover reported success but the browser is still dead (probe: {}) — {msg} — restart the daemon (`lb web --port <port> restart`, or Restart browser in the app)",
+            health.get("probe").and_then(|x| x.as_str()).unwrap_or("unknown")
+        ))])
+    }
+}
+
 fn pretty(v: &serde_json::Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
@@ -1023,7 +1039,13 @@ impl LbMcp {
         Parameters(_): Parameters<NoArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let v = self.post_json("/api/recover", serde_json::json!({})).await?;
-        Ok(Self::daemon_result(v))
+        if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+            return Ok(Self::daemon_result(v));
+        }
+        // Trust the health probe, not the recover reply: an older daemon
+        // answers ok without checking that the relaunched browser works.
+        let health = self.get_json("/api/health").await?;
+        Ok(recover_outcome(v, health))
     }
 
     #[tool(description = "Recent daemon action log (last entries).")]
@@ -1506,6 +1528,16 @@ mod screenshot_tests {
 
 #[cfg(test)]
 mod batch_tests {
+    #[test]
+    fn recover_outcome_trusts_the_health_probe() {
+        let rec = serde_json::json!({"ok": true, "message": "browser relaunched"});
+        let dead = serde_json::json!({"ok": true, "browser_alive": false, "probe": "dead"});
+        let r = super::recover_outcome(rec.clone(), dead);
+        assert_eq!(r.is_error, Some(true));
+        let alive = serde_json::json!({"ok": true, "browser_alive": true, "probe": "ok"});
+        assert_ne!(super::recover_outcome(rec, alive).is_error, Some(true));
+    }
+
     use super::*;
     use axum::{
         extract::State,
